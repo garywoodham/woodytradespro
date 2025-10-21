@@ -4,64 +4,83 @@ import numpy as np
 import utils
 
 def render_scenarios():
-    st.header("🧪 Scenarios")
-    st.caption("Simulate threshold-based entries and see hypothetical returns. Export CSV.")
+    st.title("🧠 Strategy Scenarios & Backtesting")
+    st.caption("Simulate and evaluate performance of trading signals, with risk-adjusted outcomes.")
 
-    asset = st.selectbox("Asset", list(utils.ASSET_SYMBOLS.keys()))
-    timeframe = st.selectbox("Timeframe", list(utils.INTERVALS.keys()), index=1)
-    prob_th = st.slider("Min probability to act", 0.0, 1.0, 0.6, 0.01)
-    risk = st.sidebar.selectbox("Risk (TP/SL)", list(utils.RISK_MULT.keys()), index=1)
+    asset = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()))
+    interval = st.selectbox("Select Interval", list(utils.INTERVALS.keys()), index=1)
+    risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()), index=1)
 
     symbol = utils.ASSET_SYMBOLS[asset]
-    df = utils.fetch_data(symbol, timeframe)
+
+    st.info(f"Fetching data and simulating scenarios for {asset}...")
+    df = utils.fetch_data(symbol, interval)
     if df.empty:
-        st.warning("No data loaded.")
+        st.warning(f"No data available for {asset}.")
         return
 
-    # Build ML frame and fit once
-    X, clf, pred = utils.train_and_predict(df, timeframe, risk=risk)
-    if X is None or X.empty:
-        st.warning("Not enough data to simulate.")
+    X, clf, pred = utils.train_and_predict(df, interval, risk)
+    if X is None or clf is None or X.empty:
+        st.warning("Unable to build scenario simulation. Try another interval or asset.")
         return
 
-    # For each bar, get probability of BUY/SELL and decide action if prob >= threshold
-    proba = []
-    classes = clf.classes_.tolist()
-    for i in range(len(X)):
-        p = clf.predict_proba(X.iloc[[i]][utils.FEATURES])[0]
-        p_buy = p[classes.index(1)] if 1 in classes else 0.0
-        p_sell= p[classes.index(-1)] if -1 in classes else 0.0
-        proba.append((p_buy, p_sell))
-    X["P_BUY"], X["P_SELL"] = zip(*proba)
+    # 🩺 Clean features before looping predictions
+    X_clean = X.copy()
+    X_clean = X_clean.replace([np.inf, -np.inf], np.nan).fillna(0)
+    X_clean[utils.FEATURES] = X_clean[utils.FEATURES].clip(-1e6, 1e6)
 
-    def decide(row):
-        if row["P_BUY"] >= prob_th and row["P_BUY"] > row["P_SELL"]:
-            return 1
-        if row["P_SELL"] >= prob_th and row["P_SELL"] > row["P_BUY"]:
-            return -1
-        return 0
+    # 🧮 Iterate through recent observations
+    preds, probs, timestamps = [], [], []
+    for i in range(-min(200, len(X_clean)), 0):
+        try:
+            row = X_clean.iloc[[i]][utils.FEATURES]
+            p = clf.predict_proba(row)[0]
+            classes = clf.classes_.tolist()
+            p_buy = p[classes.index(1)] if 1 in classes else 0
+            p_sell = p[classes.index(-1)] if -1 in classes else 0
+            if p_buy > max(0.5, p_sell + 0.1):
+                signal = "BUY"
+                prob = p_buy
+            elif p_sell > max(0.5, p_buy + 0.1):
+                signal = "SELL"
+                prob = p_sell
+            else:
+                signal = "HOLD"
+                prob = max(p_buy, p_sell)
+            preds.append(signal)
+            probs.append(prob)
+            timestamps.append(X_clean.index[i])
+        except Exception:
+            continue
 
-    X["Action"] = X.apply(decide, axis=1)
-    X["NextRet"] = X["Close"].pct_change().shift(-1).fillna(0)
-    X["StratRet"] = X["NextRet"] * X["Action"].shift().fillna(0)
-    eq = (1 + X["StratRet"]).cumprod()
-    total = float(eq.iloc[-1] - 1.0)
-    trades = int((X["Action"].diff().abs() > 0).sum())
-    winrate = float((X["StratRet"] > 0).sum() / max(1,(X["StratRet"] != 0).sum()))
+    hist_df = pd.DataFrame({"Timestamp": timestamps, "Signal": preds, "Prob": probs})
+    hist_df["Prob"] = (hist_df["Prob"] * 100).round(2)
 
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Total return", f"{total*100:.2f}%")
-    c2.metric("Win rate", f"{winrate*100:.1f}%")
-    c3.metric("Trades", f"{trades}")
+    st.subheader(f"📊 Historical Scenario Predictions — {asset}")
+    st.dataframe(hist_df.tail(100).sort_values(by="Timestamp", ascending=False), use_container_width=True)
 
-    st.line_chart(eq.rename("Equity"))
+    # 💹 Backtest performance
+    bt = utils.backtest_signals(X_clean)
+    equity = bt["equity_curve"]
 
-    csv = X.reset_index().rename(columns={"index":"Date"}).to_csv(index=False)
-    st.download_button("⬇️ Export Scenario (CSV)", csv, file_name=f"{symbol}_{timeframe}_scenario.csv", mime="text/csv")
+    st.subheader("💰 Strategy Backtest Results")
+    st.markdown(f"""
+    **Total Return:** {bt['total_return']*100:.2f}%  
+    **Number of Trades:** {bt['num_trades']}  
+    **Win Rate:** {bt['winrate']*100:.2f}%  
+    """)
 
-    with st.expander("Notes"):
-        st.markdown("""
-- **Action** triggers only when the model's **probability ≥ threshold**.
-- This is a simplified simulation (no fees/slippage).
-- Use the **Detailed** tab for TP/SL visualization on candles.
-""")
+    # 📈 Chart equity curve
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity Curve"))
+    fig.update_layout(
+        title="Equity Curve (Strategy Performance)",
+        height=400,
+        paper_bgcolor="#0f1116",
+        plot_bgcolor="#0f1116",
+        font=dict(color="#e6e6e6"),
+        xaxis=dict(gridcolor="#222"),
+        yaxis=dict(gridcolor="#222"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
