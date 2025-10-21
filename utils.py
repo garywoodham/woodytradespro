@@ -1,218 +1,301 @@
-import pandas as pd
-import numpy as np
-import yfinance as yf
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities: data fetch, indicators, ML predict, plotting, backtests, sentiment
+# No TensorFlow; uses scikit-learn RandomForest + technicals + (optional) news
+# ─────────────────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore")
 
+from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from joblib import Memory
+import plotly.graph_objects as go
+
+# Optional libs
+try:
+    import ta
+except:
+    ta = None
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _VADER = SentimentIntensityAnalyzer()
+except:
+    _VADER = None
+
+# ── Caching (on disk in /tmp for Streamlit Cloud) ────────────────────────────
+memory = Memory(location="/tmp/woody_cache", verbose=0)
+
+# ── Asset universe & intervals ───────────────────────────────────────────────
 ASSET_SYMBOLS = {
-    "Gold": "GC=F",
-    "Silver": "SI=F",
-    "Copper": "HG=F",
-    "US100 (Nasdaq 100)": "^NDX",
-    "S&P 500": "^GSPC",
-    "Dow Jones": "^DJI",
-    "FTSE 100": "^FTSE",
+    "Gold (GC=F)": "GC=F",
+    "Silver (SI=F)": "SI=F",
+    "Copper (HG=F)": "HG=F",
+    "US 100 (^NDX)": "^NDX",
+    "S&P 500 (^GSPC)": "^GSPC",
+    "Dow Jones (^DJI)": "^DJI",
+    "FTSE 100 (^FTSE)": "^FTSE",
 }
 
 INTERVALS = {
-    "15m": ("15m", "60d"),
-    "30m": ("30m", "60d"),
-    "1h":  ("60m", "60d"),
-    "1d":  ("1d",  "2y"),
-    "1wk": ("1wk", "5y"),
+    "15m": {"yf_interval": "15m", "yf_period": "60d", "horizon_steps": 4},   # next 1h
+    "1h":  {"yf_interval": "1h",  "yf_period": "60d", "horizon_steps": 4},   # next 4h
+    "1d":  {"yf_interval": "1d",  "yf_period": "2y",  "horizon_steps": 1},   # next 1d
 }
 
-POS_WORDS = set("surge rally gain beat strong bullish breakout rebound squeeze growth momentum upgrade profit record positive optimistic upbeat".split())
-NEG_WORDS = set("drop plunge miss weak bearish breakdown slump downgrade loss negative pessimistic bleak".split())
+RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
 
-def quick_sentiment(headlines):
-    if not headlines:
-        return 0.0, "Neutral"
-    score = 0
-    count = 0
-    for h in headlines[:20]:
-        w = h.lower().split()
-        score += sum(1 for x in w if x in POS_WORDS)
-        score -= sum(1 for x in w if x in NEG_WORDS)
-        count += 1
-    import numpy as np
-    norm = np.tanh(score / max(1, count))
-    label = "Bullish" if norm > 0.15 else "Bearish" if norm < -0.15 else "Neutral"
-    return float(norm), label
-
-def _flatten_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+# ── Fetch & clean ────────────────────────────────────────────────────────────
+@memory.cache
+def fetch_data(symbol: str, interval_key: str = "1h") -> pd.DataFrame:
+    cfg = INTERVALS[interval_key]
+    df = yf.download(
+        symbol,
+        interval=cfg["yf_interval"],
+        period=cfg["yf_period"],
+        progress=False,
+        prepost=False
+    )
     if df is None or df.empty:
-        return df
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+
+    # Flatten multiindex if needed
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].capitalize() for c in df.columns]
     else:
-        df.columns = [str(c).capitalize() for c in df.columns]
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df["Close"] = df["Adj Close"]
+        df.columns = [c.capitalize() for c in df.columns]
+
+    # Ensure necessary cols
+    for col in ["Open","High","Low","Close","Volume"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # tz-naive index
+    try:
+        df.index = pd.to_datetime(df.index).tz_convert(None)
+    except Exception:
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+
+    df = df.dropna(subset=["Open","High","Low","Close"])
     return df
 
-def safe_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def risk_tooltip_md():
-    return ("<small>Low: TP=0.6%, SL=0.3% • "
-            "Medium: TP=1.2%, SL=0.6% • "
-            "High: TP=2.0%, SL=1.0%</small>")
-
-def tp_sl_by_risk(risk: str, price: float):
-    risk = (risk or "Medium").lower()
-    if risk == "low":
-        tp_pct, sl_pct = 0.006, 0.003
-    elif risk == "high":
-        tp_pct, sl_pct = 0.020, 0.010
-    else:
-        tp_pct, sl_pct = 0.012, 0.006
-    return price * (1 + tp_pct), price * (1 - sl_pct), tp_pct, sl_pct
-
-def fetch_data(symbol: str, interval: str, period: str) -> pd.DataFrame | None:
-    yf_interval, _default = INTERVALS.get(interval, ("60m","60d"))
-    p = period or _default
-    try:
-        df = yf.download(symbol, interval=yf_interval, period=p, progress=False, prepost=False, auto_adjust=True)
-        if df is None or df.empty:
-            return None
-        df = _flatten_ohlc(df.copy())
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert(None)
-        df = df.sort_index()
-        return df
-    except Exception:
-        return None
-
+# ── Indicators ───────────────────────────────────────────────────────────────
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
     out = df.copy()
-    out["EMA_12"] = out["Close"].ewm(span=12, adjust=False).mean()
-    out["EMA_26"] = out["Close"].ewm(span=26, adjust=False).mean()
-    delta = out["Close"].diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    out["RSI_14"] = 100 - (100 / (1 + rs))
-    out["ATR_14"] = (out["High"] - out["Low"]).rolling(14).mean()
+    out["Return_1"] = out["Close"].pct_change()
+    out["Volatility_20"] = out["Return_1"].rolling(20).std()
+
+    # ATR (manual, to avoid extra deps)
+    tr = np.maximum(out["High"]-out["Low"],
+                    np.maximum((out["High"]-out["Close"].shift()).abs(),
+                               (out["Low"]-out["Close"].shift()).abs()))
+    out["ATR_14"] = pd.Series(tr).rolling(14).mean()
+
+    if ta is not None:
+        out["RSI_14"] = ta.momentum.RSIIndicator(close=out["Close"], window=14).rsi()
+        macd = ta.trend.MACD(close=out["Close"])
+        out["MACD"] = macd.macd()
+        out["MACD_Signal"] = macd.macd_signal()
+        out["EMA_20"] = ta.trend.EMAIndicator(close=out["Close"], window=20).ema_indicator()
+        bb = ta.volatility.BollingerBands(close=out["Close"], window=20, window_dev=2)
+        out["BB_W"] = bb.bollinger_wband()
+    else:
+        out["RSI_14"] = out["Return_1"].rolling(14).apply(lambda r: 50, raw=True)
+        out["MACD"] = out["Return_1"].ewm(span=12).mean() - out["Return_1"].ewm(span=26).mean()
+        out["MACD_Signal"] = out["MACD"].ewm(span=9).mean()
+        out["EMA_20"] = out["Close"].ewm(span=20).mean()
+        out["BB_W"] = (out["Close"].rolling(20).std()/out["Close"].rolling(20).mean()).fillna(0)
+
+    out["EMA_Dist"] = (out["Close"]/out["EMA_20"] - 1.0)
+    out["Volume_Change"] = out["Volume"].pct_change().fillna(0)
+    out = out.dropna()
     return out
 
-def predict_next(df: pd.DataFrame, risk: str = "Medium", news_headlines = None) -> dict:
+# ── Sentiment (optional) via Yahoo Finance news in yfinance ──────────────────
+def _news_sentiment(symbol: str, when: pd.DatetimeIndex) -> pd.Series:
+    if _VADER is None:
+        return pd.Series(0.0, index=when)  # neutral
+
+    try:
+        tk = yf.Ticker(symbol)
+        news = tk.news  # list of dicts with 'title' and 'providerPublishTime'
+        if not news:
+            return pd.Series(0.0, index=when)
+
+        rows = []
+        for n in news:
+            title = n.get("title") or ""
+            t = n.get("providerPublishTime")
+            if not title or t is None:
+                continue
+            ts = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(tz=None).date()
+            score = _VADER.polarity_scores(title)["compound"]
+            rows.append((ts, score))
+
+        if not rows:
+            return pd.Series(0.0, index=when)
+
+        s = pd.DataFrame(rows, columns=["date","score"]).groupby("date")["score"].mean()
+        idx_dates = pd.Index([d.date() for d in when], name="date")
+        aligned = s.reindex(idx_dates, method="ffill").fillna(0.0)
+        aligned.index = when
+        return aligned
+    except Exception:
+        return pd.Series(0.0, index=when)
+
+# ── Feature prep & label ─────────────────────────────────────────────────────
+FEATURES = ["Return_1","Volatility_20","ATR_14","RSI_14","MACD","MACD_Signal","EMA_Dist","BB_W","Volume_Change","Sentiment"]
+
+def prepare_ml_frame(df: pd.DataFrame, horizon_steps: int) -> pd.DataFrame:
+    X = add_indicators(df)
+    X["Sentiment"] = _news_sentiment(symbol="SPY" if len(df)>0 else "", when=X.index)  # fallback if news mapping fails
+    # Forward return label
+    X["FwdRet"] = X["Close"].pct_change(horizon_steps).shift(-horizon_steps)
+    # Class label: 1=BUY (up), -1=SELL (down), 0=HOLD (flat)
+    thresh = X["FwdRet"].abs().median() * 0.2  # small deadzone
+    X["Y"] = 0
+    X.loc[X["FwdRet"] >  thresh, "Y"] = 1
+    X.loc[X["FwdRet"] < -thresh, "Y"] = -1
+    X = X.dropna(subset=FEATURES+["Y","Close","ATR_14"])
+    return X
+
+# ── Train/predict (lightweight) ──────────────────────────────────────────────
+def train_and_predict(df: pd.DataFrame, interval_key: str, risk: str = "Medium"):
     if df is None or df.empty:
-        return {"signal":"HOLD","probability":0.0,"risk":risk,"tp":None,"sl":None}
-    x = add_indicators(df)
-    close = safe_float(x["Close"].iloc[-1])
-    ema12 = safe_float(x["EMA_12"].iloc[-1])
-    ema26 = safe_float(x["EMA_26"].iloc[-1])
-    rsi = safe_float(x["RSI_14"].iloc[-1])
-    ema_slope = safe_float(x["EMA_12"].iloc[-1] - x["EMA_12"].iloc[-3]) if len(x) > 3 else 0.0
+        return None, None, {"signal":"HOLD","prob":0.0,"risk":"Low","tp":None,"sl":None,"accuracy":None}
 
-    score = 0.0
-    if ema12 > ema26: score += 0.6
-    if rsi < 30: score += 0.4
-    if rsi > 70: score -= 0.4
-    if ema_slope > 0: score += 0.2
-    if ema_slope < 0: score -= 0.2
+    horizon = INTERVALS[interval_key]["horizon_steps"]
+    X = prepare_ml_frame(df, horizon_steps=horizon)
+    if X.empty or X.shape[0] < 200:
+        return X, None, {"signal":"HOLD","prob":0.0,"risk":"Low","tp":None,"sl":None,"accuracy":None}
 
-    sent_score, sent_label = quick_sentiment(news_headlines or [])
-    score += 0.4 * sent_score
+    X_train, X_test = train_test_split(X, test_size=0.3, shuffle=False)
+    clf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=8,
+        random_state=42,
+        class_weight="balanced_subsample",
+        n_jobs=-1
+    )
+    clf.fit(X_train[FEATURES], X_train["Y"])
+    yhat = clf.predict(X_test[FEATURES])
+    acc = accuracy_score(X_test["Y"], yhat)
 
-    prob = float(np.clip(0.5 + 0.5*np.tanh(score), 0.0, 1.0))
-    signal = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"
+    # Latest prediction + probability
+    last_row = X.iloc[[-1]]
+    proba = clf.predict_proba(last_row[FEATURES])[0]
+    classes = clf.classes_.tolist()   # e.g. [-1, 0, 1]
+    p_buy = proba[classes.index(1)] if 1 in classes else 0.0
+    p_sell= proba[classes.index(-1)] if -1 in classes else 0.0
 
-    tp, sl, tp_pct, sl_pct = tp_sl_by_risk(risk, close)
-    return {
+    if p_buy > max(0.5, p_sell + 0.1):
+        signal = "BUY"; prob = float(p_buy)
+    elif p_sell > max(0.5, p_buy + 0.1):
+        signal = "SELL"; prob = float(p_sell)
+    else:
+        signal = "HOLD"; prob = float(max(p_buy, p_sell))
+
+    # TP/SL based on ATR and risk
+    atr = float(last_row["ATR_14"].iloc[0])
+    price = float(last_row["Close"].iloc[0])
+    mult = RISK_MULT.get(risk, 1.0)
+    sl, tp = None, None
+    if signal == "BUY":
+        sl = price - mult * 1.2 * atr
+        tp = price + mult * 2.0 * atr
+    elif signal == "SELL":
+        sl = price + mult * 1.2 * atr
+        tp = price - mult * 2.0 * atr
+
+    out = {
         "signal": signal,
-        "probability": prob,
+        "prob": prob,
         "risk": risk,
-        "tp": tp if signal=="BUY" else close*(1-sl_pct),
-        "sl": sl if signal=="BUY" else close*(1+sl_pct),
-        "rsi": rsi, "ema12": ema12, "ema26": ema26,
-        "sentiment": sent_label, "sentiment_score": sent_score
+        "tp": tp,
+        "sl": sl,
+        "accuracy": float(acc)
+    }
+    return X, clf, out
+
+# ── Backtest simple strategy (marker overlay & PnL) ──────────────────────────
+def backtest_signals(X: pd.DataFrame, signal_col="Y"):
+    df = X.copy()
+    df["Signal"] = df[signal_col].replace({-1:-1, 0:0, 1:1})
+    df["NextRet"] = df["Close"].pct_change().shift(-1).fillna(0)
+    df["StrategyRet"] = df["NextRet"] * df["Signal"].shift().fillna(0)
+    equity = (1 + df["StrategyRet"]).cumprod()
+    total = float(equity.iloc[-1] - 1.0)
+    trades = (df["Signal"].diff().abs() > 0).sum()
+    winrate = float((df["StrategyRet"] > 0).sum() / max(1,(df["StrategyRet"] != 0).sum()))
+    return {
+        "total_return": total,
+        "num_trades": int(trades),
+        "winrate": winrate,
+        "equity_curve": equity
     }
 
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
-    x = add_indicators(df)
-    sig = pd.Series(index=x.index, data="HOLD")
-    buy = (x["EMA_12"].shift(1) <= x["EMA_26"].shift(1)) & (x["EMA_12"] > x["EMA_26"]) & (x["RSI_14"] < 60)
-    sell = (x["EMA_12"].shift(1) >= x["EMA_26"].shift(1)) & (x["EMA_12"] < x["EMA_26"]) & (x["RSI_14"] > 40)
-    sig[buy] = "BUY"
-    sig[sell] = "SELL"
-    out = x.copy()
-    out["Signal"] = sig
-    return out
-
-def backtest(df: pd.DataFrame, risk: str = "Medium") -> dict:
-    if df is None or df.empty:
-        return {"trades":[], "total_return":0.0, "win_rate":0.0}
-    x = generate_signals(df)
-    trades = []
-    pos = None
-    tp_mult, sl_mult = (0.012, 0.006) if risk.lower()=="medium" else (0.006, 0.003) if risk.lower()=="low" else (0.02, 0.01)
-
-    for t, row in x.iterrows():
-        if pos is None and row["Signal"] in ("BUY","SELL"):
-            direction = 1 if row["Signal"]=="BUY" else -1
-            entry = row["Close"]
-            tp = entry*(1+tp_mult*direction)
-            sl = entry*(1-sl_mult*direction)
-            pos = {"time":t,"entry":entry,"dir":direction,"tp":tp,"sl":sl}
-        elif pos is not None:
-            price = row["Close"]
-            hit_tp = price >= pos["tp"] if pos["dir"]==1 else price <= pos["tp"]
-            hit_sl = price <= pos["sl"] if pos["dir"]==1 else price >= pos["sl"]
-            exit_reason = None
-            if hit_tp: exit_reason = "TP"
-            elif hit_sl: exit_reason = "SL"
-            elif row["Signal"] in ("BUY","SELL"): exit_reason = "Flip"
-
-            if exit_reason:
-                pnl = (price - pos["entry"]) * pos["dir"]
-                trades.append({
-                    "entry_time": pos["time"],
-                    "exit_time": t,
-                    "entry": pos["entry"],
-                    "exit": price,
-                    "direction": "LONG" if pos["dir"]==1 else "SHORT",
-                    "pnl": pnl,
-                    "return_pct": pnl/pos["entry"]*100.0,
-                    "exit_reason": exit_reason
-                })
-                pos = None
-
-    if trades:
-        total_ret = sum(tr["return_pct"] for tr in trades)
-        win_rate = 100.0 * sum(1 for tr in trades if tr["pnl"]>0) / len(trades)
-    else:
-        total_ret = 0.0
-        win_rate = 0.0
-    return {"trades": trades, "total_return": total_ret, "win_rate": win_rate}
-
-import plotly.graph_objects as go
-
-def plot_candles(df: pd.DataFrame, title: str="", signals_df: pd.DataFrame | None = None, latest: dict | None = None):
+# ── Plotting ─────────────────────────────────────────────────────────────────
+def make_candles(df: pd.DataFrame, title: str, max_points: int = 500,
+                 buys: pd.Index | None = None, sells: pd.Index | None = None,
+                 sl: float | None = None, tp: float | None = None):
     if df is None or df.empty:
         return go.Figure()
-    fig = go.Figure(data=[
-        go.Candlestick(
-            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            increasing_line_color="#22c55e", decreasing_line_color="#ef4444", name="Price"
-        )
-    ])
-    if signals_df is not None and "Signal" in signals_df.columns:
-        buys = signals_df[signals_df["Signal"]=="BUY"]
-        sells = signals_df[signals_df["Signal"]=="SELL"]
-        fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers",
-                                 marker=dict(symbol="triangle-up", size=10, color="#22c55e"),
-                                 name="BUY"))
-        fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers",
-                                 marker=dict(symbol="triangle-down", size=10, color="#ef4444"),
-                                 name="SELL"))
-    if latest and latest.get("tp") and latest.get("sl"):
-        fig.add_hline(y=float(latest["tp"]), line_dash="dot", line_color="#22c55e", annotation_text="TP", annotation_position="top left")
-        fig.add_hline(y=float(latest["sl"]), line_dash="dot", line_color="#ef4444", annotation_text="SL", annotation_position="bottom left")
 
-    fig.update_layout(template="plotly_dark", title=title, margin=dict(l=10,r=10,t=40,b=10), xaxis_rangeslider_visible=False, height=520)
+    data = df.copy()
+    if len(data) > max_points:
+        data = data.iloc[-max_points:].copy()
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=data.index, open=data["Open"], high=data["High"],
+        low=data["Low"], close=data["Close"], name="Price"
+    ))
+
+    if buys is not None and len(buys)>0:
+        here = data.index.intersection(buys)
+        fig.add_trace(go.Scatter(
+            x=here, y=data.loc[here,"Close"],
+            mode="markers", marker=dict(size=8, symbol="triangle-up"),
+            name="Buy"
+        ))
+    if sells is not None and len(sells)>0:
+        here = data.index.intersection(sells)
+        fig.add_trace(go.Scatter(
+            x=here, y=data.loc[here,"Close"],
+            mode="markers", marker=dict(size=8, symbol="triangle-down"),
+            name="Sell"
+        ))
+    if tp is not None:
+        fig.add_hline(y=tp, line_dash="dot", annotation_text="TP", annotation_position="top left")
+    if sl is not None:
+        fig.add_hline(y=sl, line_dash="dot", annotation_text="SL", annotation_position="bottom left")
+
+    fig.update_layout(
+        title=title,
+        height=520,
+        margin=dict(l=10,r=10,t=35,b=10),
+        paper_bgcolor="#0f1116",
+        plot_bgcolor="#0f1116",
+        font=dict(color="#e6e6e6"),
+        xaxis=dict(gridcolor="#222"),
+        yaxis=dict(gridcolor="#222"),
+        legend=dict(orientation="h", y=1.05, x=0)
+    )
     return fig
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def fmtpct(x):
+    try:
+        return f"{float(x)*100:.2f}%"
+    except:
+        return "—"
+
+def guard_float(x):
+    try:
+        return float(x)
+    except:
+        return None
