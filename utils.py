@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # utils.py — Core analytics engine for WoodyTrades Pro
-# ML model (RandomForest), indicators, sentiment, TP/SL, candlesticks, backtests
+# Machine learning, indicators, sentiment, TP/SL, backtesting, plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
 import warnings
@@ -28,10 +28,10 @@ try:
 except ImportError:
     _VADER = None
 
-# ── Cache for Streamlit Cloud ────────────────────────────────────────────────
+# ── Cache ────────────────────────────────────────────────────────────────────
 memory = Memory(location="/tmp/woody_cache", verbose=0)
 
-# ── Assets & Intervals ───────────────────────────────────────────────────────
+# ── Assets & settings ────────────────────────────────────────────────────────
 ASSET_SYMBOLS = {
     "Gold (GC=F)": "GC=F",
     "Silver (SI=F)": "SI=F",
@@ -44,13 +44,13 @@ ASSET_SYMBOLS = {
 
 INTERVALS = {
     "15m": {"yf_interval": "15m", "yf_period": "60d", "horizon_steps": 4},
-    "1h": {"yf_interval": "1h", "yf_period": "60d", "horizon_steps": 4},
-    "1d": {"yf_interval": "1d", "yf_period": "2y", "horizon_steps": 1},
+    "1h":  {"yf_interval": "1h",  "yf_period": "60d", "horizon_steps": 4},
+    "1d":  {"yf_interval": "1d",  "yf_period": "2y",  "horizon_steps": 1},
 }
 
 RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
 
-# ── Fetch market data ────────────────────────────────────────────────────────
+# ── Fetch data ───────────────────────────────────────────────────────────────
 @memory.cache
 def fetch_data(symbol: str, interval_key: str = "1h") -> pd.DataFrame:
     cfg = INTERVALS[interval_key]
@@ -59,7 +59,7 @@ def fetch_data(symbol: str, interval_key: str = "1h") -> pd.DataFrame:
         interval=cfg["yf_interval"],
         period=cfg["yf_period"],
         progress=False,
-        prepost=False
+        prepost=False,
     )
     if df is None or df.empty:
         return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -112,7 +112,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna()
     return out
 
-# ── Sentiment (Yahoo news) ───────────────────────────────────────────────────
+# ── Sentiment ────────────────────────────────────────────────────────────────
 def _news_sentiment(symbol: str, when: pd.DatetimeIndex) -> pd.Series:
     if _VADER is None:
         return pd.Series(0.0, index=when)
@@ -144,7 +144,7 @@ def _news_sentiment(symbol: str, when: pd.DatetimeIndex) -> pd.Series:
     except Exception:
         return pd.Series(0.0, index=when)
 
-# ── ML preparation ───────────────────────────────────────────────────────────
+# ── ML prep ──────────────────────────────────────────────────────────────────
 FEATURES = [
     "Return_1", "Volatility_20", "ATR_14", "RSI_14",
     "MACD", "MACD_Signal", "EMA_Dist", "BB_W", "Volume_Change", "Sentiment"
@@ -161,19 +161,21 @@ def prepare_ml_frame(df: pd.DataFrame, horizon_steps: int) -> pd.DataFrame:
     X = X.dropna(subset=["Close", "ATR_14", "Y"])
     return X
 
-# ── Train + Predict (fixed NaN handling) ─────────────────────────────────────
+# ── Train & Predict (with NaN + Inf fix) ─────────────────────────────────────
 def train_and_predict(df: pd.DataFrame, interval_key: str, risk: str = "Medium"):
     if df is None or df.empty:
-        return None, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low", "tp": None, "sl": None, "accuracy": None}
+        return None, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low",
+                            "tp": None, "sl": None, "accuracy": None}
 
     horizon = INTERVALS[interval_key]["horizon_steps"]
     X = prepare_ml_frame(df, horizon)
     if X.empty or X.shape[0] < 200:
-        return X, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low", "tp": None, "sl": None, "accuracy": None}
+        return X, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low",
+                         "tp": None, "sl": None, "accuracy": None}
 
     X_train, X_test = train_test_split(X, test_size=0.3, shuffle=False)
 
-    # FIX: Ensure no NaN values before model fitting
+    # --- FIX 1: Ensure all features exist & fill missing ---
     for f in FEATURES:
         if f not in X_train.columns:
             X_train[f] = 0.0
@@ -181,12 +183,21 @@ def train_and_predict(df: pd.DataFrame, interval_key: str, risk: str = "Medium")
     X_train = X_train.fillna(0)
     X_test = X_test.fillna(0)
 
+    # --- FIX 2: Remove infinities or huge values ---
+    X_train = X_train.replace([np.inf, -np.inf], np.nan)
+    X_test = X_test.replace([np.inf, -np.inf], np.nan)
+    X_train = X_train.fillna(0)
+    X_test = X_test.fillna(0)
+    X_train[FEATURES] = X_train[FEATURES].clip(lower=-1e6, upper=1e6)
+    X_test[FEATURES]  = X_test[FEATURES].clip(lower=-1e6, upper=1e6)
+
+    # --- Model ---
     clf = RandomForestClassifier(
         n_estimators=300,
         max_depth=8,
         random_state=42,
         class_weight="balanced_subsample",
-        n_jobs=-1
+        n_jobs=-1,
     )
     clf.fit(X_train[FEATURES], X_train["Y"])
     yhat = clf.predict(X_test[FEATURES])
@@ -216,14 +227,8 @@ def train_and_predict(df: pd.DataFrame, interval_key: str, risk: str = "Medium")
         sl = price + mult * 1.2 * atr
         tp = price - mult * 2.0 * atr
 
-    return X, clf, {
-        "signal": signal,
-        "prob": prob,
-        "risk": risk,
-        "tp": tp,
-        "sl": sl,
-        "accuracy": float(acc)
-    }
+    return X, clf, {"signal": signal, "prob": prob, "risk": risk,
+                    "tp": tp, "sl": sl, "accuracy": float(acc)}
 
 # ── Backtest ─────────────────────────────────────────────────────────────────
 def backtest_signals(X: pd.DataFrame, signal_col="Y"):
@@ -234,10 +239,12 @@ def backtest_signals(X: pd.DataFrame, signal_col="Y"):
     equity = (1 + df["StrategyRet"]).cumprod()
     total = float(equity.iloc[-1] - 1.0)
     trades = (df["Signal"].diff().abs() > 0).sum()
-    winrate = float((df["StrategyRet"] > 0).sum() / max(1, (df["StrategyRet"] != 0).sum()))
-    return {"total_return": total, "num_trades": int(trades), "winrate": winrate, "equity_curve": equity}
+    winrate = float((df["StrategyRet"] > 0).sum() /
+                    max(1, (df["StrategyRet"] != 0).sum()))
+    return {"total_return": total, "num_trades": int(trades),
+            "winrate": winrate, "equity_curve": equity}
 
-# ── Plot ─────────────────────────────────────────────────────────────────────
+# ── Candlestick plotting ─────────────────────────────────────────────────────
 def make_candles(df: pd.DataFrame, title: str, max_points: int = 500,
                  buys: pd.Index | None = None, sells: pd.Index | None = None,
                  sl: float | None = None, tp: float | None = None):
@@ -256,16 +263,22 @@ def make_candles(df: pd.DataFrame, title: str, max_points: int = 500,
 
     if buys is not None and len(buys) > 0:
         here = data.index.intersection(buys)
-        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"], mode="markers",
-                                 marker=dict(size=8, symbol="triangle-up"), name="Buy"))
+        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"],
+                                 mode="markers",
+                                 marker=dict(size=8, symbol="triangle-up"),
+                                 name="Buy"))
     if sells is not None and len(sells) > 0:
         here = data.index.intersection(sells)
-        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"], mode="markers",
-                                 marker=dict(size=8, symbol="triangle-down"), name="Sell"))
+        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"],
+                                 mode="markers",
+                                 marker=dict(size=8, symbol="triangle-down"),
+                                 name="Sell"))
     if tp is not None:
-        fig.add_hline(y=tp, line_dash="dot", annotation_text="TP", annotation_position="top left")
+        fig.add_hline(y=tp, line_dash="dot",
+                      annotation_text="TP", annotation_position="top left")
     if sl is not None:
-        fig.add_hline(y=sl, line_dash="dot", annotation_text="SL", annotation_position="bottom left")
+        fig.add_hline(y=sl, line_dash="dot",
+                      annotation_text="SL", annotation_position="bottom left")
 
     fig.update_layout(
         title=title,
@@ -280,7 +293,7 @@ def make_candles(df: pd.DataFrame, title: str, max_points: int = 500,
     )
     return fig
 
-# ── Helper ───────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def guard_float(x):
     try:
         return float(x)
