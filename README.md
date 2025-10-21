@@ -1,16 +1,17 @@
-# WoodyTrades Pro (Live Only, Dark Mode)
+# WoodyTrades Pro (flat)
 
-Live Streamlit dashboard for multi-asset analytics (Gold, US100, S&P500, etc.).
+Dark-themed Streamlit dashboard for multi-asset analytics with:
+- Candlesticks + historical ML labels
+- BUY/SELL/HOLD predictions with probability
+- TP/SL via ATR × risk multiple (Low/Medium/High)
+- Multi-timeframe (15m/1h/1d)
+- Backtest baseline & Scenario simulation
+- Optional news sentiment (VADER on Yahoo Finance titles)
+- CSV exports
 
-- Live prices via Yahoo Finance
-- Heuristic signals (EMA crossover + RSI) + free news sentiment
-- Risk-aware TP/SL and backtests
-- Candlestick with BUY/SELL markers
-- CSV export
-- Works on Streamlit Cloud (Python 3.13, no TensorFlow)
-
-## Run locally
+## Quickstart (local)
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\Activate
 pip install -r requirements.txt
 streamlit run app.py
-```
