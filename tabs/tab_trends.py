@@ -1,61 +1,49 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import utils
 
 def render_trends():
-    st.header("📈 Trends")
-    st.caption("Multi-asset comparison by timeframe, with ML prediction & TP/SL.")
+    st.title("📊 Market Trends")
+    st.caption("Trend strength, sentiment direction, and trading opportunities based on recent model predictions.")
 
-    risk = st.sidebar.selectbox("Risk level (for TP/SL)", list(utils.RISK_MULT.keys()), index=1)
-    timeframe = st.selectbox("Select timeframe", list(utils.INTERVALS.keys()), index=1)
+    risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()), index=1)
+    interval = st.sidebar.selectbox("Select Interval", list(utils.INTERVALS.keys()), index=1)
 
-    rows = []
+    trend_data = []
     for asset, symbol in utils.ASSET_SYMBOLS.items():
-        df = utils.fetch_data(symbol, timeframe)
-        if df.empty:
-            rows.append({"Asset":asset,"Change (%)":np.nan,"Signal":"—","Prob":np.nan,"TP":np.nan,"SL":np.nan})
-            continue
+        try:
+            df = utils.fetch_data(symbol, interval)
+            if df.empty:
+                continue
 
-        chg = float((df["Close"].iloc[-1]/df["Close"].iloc[0]-1)*100) if len(df)>1 else 0.0
-        X, clf, pred = utils.train_and_predict(df, timeframe, risk=risk)
-        rows.append({
-            "Asset": asset,
-            "Change (%)": chg,
-            "Signal": pred["signal"],
-            "Prob": pred["prob"],
-            "TP": utils.guard_float(pred["tp"]),
-            "SL": utils.guard_float(pred["sl"])
-        })
+            X, clf, pred = utils.train_and_predict(df, interval, risk)
+            if pred is None:
+                continue
 
-    perf = pd.DataFrame(rows)
-    st.dataframe(
-        perf.style.format({"Change (%)":"{:.2f}","Prob":"{:.2f}","TP":"{:.2f}","SL":"{:.2f}"}),
-        use_container_width=True, hide_index=True
-    )
+            trend = df["Close"].pct_change(10).iloc[-1] * 100
+            trend_data.append({
+                "Asset": asset,
+                "Signal": pred["signal"],
+                "Trend (%)": f"{trend:.2f}",
+                "Probability": f"{pred['prob']*100:.2f}%",
+                "Risk": pred["risk"],
+                "TP": f"{pred['tp']:.2f}" if pred["tp"] else "—",
+                "SL": f"{pred['sl']:.2f}" if pred["sl"] else "—",
+                "Accuracy": f"{pred['accuracy']*100:.2f}%" if pred["accuracy"] else "—"
+            })
+        except Exception as e:
+            st.error(f"Error for {asset}: {e}")
 
-    st.markdown("—")
-    asset = st.selectbox("Show chart for", list(utils.ASSET_SYMBOLS.keys()))
-    symbol = utils.ASSET_SYMBOLS[asset]
-    df = utils.fetch_data(symbol, timeframe)
-    X, clf, pred = utils.train_and_predict(df, timeframe, risk=risk)
+    if not trend_data:
+        st.warning("No trend data available right now.")
+        return
 
-    # Build simple buy/sell markers using model's classification label on full set
-    buys, sells = pd.Index([]), pd.Index([])
-    if X is not None and not X.empty and "Y" in X.columns:
-        buys = X.index[X["Y"] == 1]
-        sells = X.index[X["Y"] == -1]
+    df_trend = pd.DataFrame(trend_data)
+    st.dataframe(df_trend.style
+        .background_gradient(subset=["Trend (%)"], cmap="RdYlGn")
+        .apply(lambda x: ["background-color:#00ff80" if v == "BUY"
+                          else "background-color:#ff6666" if v == "SELL"
+                          else "" for v in x], subset=["Signal"]),
+        use_container_width=True)
 
-    fig = utils.make_candles(
-        df, title=f"{asset} · {timeframe}",
-        max_points=500,
-        buys=buys, sells=sells,
-        sl=pred.get("sl"), tp=pred.get("tp")
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        f"**Prediction:** {pred['signal']}  |  **Prob:** {pred['prob']*100:.1f}%  |  "
-        f"**TP/SL:** {pred.get('tp') and f'{pred['tp']:.2f}'} / {pred.get('sl') and f'{pred['sl']:.2f}'}  |  "
-        f"**Risk:** {pred['risk']}"
-    )
+    st.info("✅ Tip: Green indicates strong positive trends; red shows weakening momentum.")
