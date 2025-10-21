@@ -1,301 +1,173 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# utils.py — Core analytics engine for WoodyTrades Pro
-# Machine learning, indicators, sentiment, TP/SL, backtesting, plotting
-# ─────────────────────────────────────────────────────────────────────────────
-
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings("ignore")
 
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from joblib import Memory
-import plotly.graph_objects as go
+# ==============================
+# 🔧 CONFIGURATION
+# ==============================
 
-# Optional libs
-try:
-    import ta
-except ImportError:
-    ta = None
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _VADER = SentimentIntensityAnalyzer()
-except ImportError:
-    _VADER = None
-
-# ── Cache ────────────────────────────────────────────────────────────────────
-memory = Memory(location="/tmp/woody_cache", verbose=0)
-
-# ── Assets & settings ────────────────────────────────────────────────────────
 ASSET_SYMBOLS = {
-    "Gold (GC=F)": "GC=F",
-    "Silver (SI=F)": "SI=F",
-    "Copper (HG=F)": "HG=F",
-    "US 100 (^NDX)": "^NDX",
-    "S&P 500 (^GSPC)": "^GSPC",
-    "Dow Jones (^DJI)": "^DJI",
-    "FTSE 100 (^FTSE)": "^FTSE",
+    "Gold": "GC=F",
+    "NASDAQ 100": "^NDX",
+    "S&P 500": "^GSPC",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "Crude Oil": "CL=F",
+    "Bitcoin": "BTC-USD"
 }
 
 INTERVALS = {
-    "15m": {"yf_interval": "15m", "yf_period": "60d", "horizon_steps": 4},
-    "1h":  {"yf_interval": "1h",  "yf_period": "60d", "horizon_steps": 4},
-    "1d":  {"yf_interval": "1d",  "yf_period": "2y",  "horizon_steps": 1},
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "1d": "1d",
+    "1w": "1wk"
 }
 
-RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
+RISK_MULT = {
+    "Low": 0.5,
+    "Medium": 1.0,
+    "High": 1.5
+}
 
-# ── Fetch data ───────────────────────────────────────────────────────────────
-@memory.cache
-def fetch_data(symbol: str, interval_key: str = "1h") -> pd.DataFrame:
-    cfg = INTERVALS[interval_key]
-    df = yf.download(
-        symbol,
-        interval=cfg["yf_interval"],
-        period=cfg["yf_period"],
-        progress=False,
-        prepost=False,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].capitalize() for c in df.columns]
-    else:
-        df.columns = [c.capitalize() for c in df.columns]
-
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    try:
-        df.index = pd.to_datetime(df.index).tz_convert(None)
-    except Exception:
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-    return df
-
-# ── Indicators ───────────────────────────────────────────────────────────────
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["Return_1"] = out["Close"].pct_change()
-    out["Volatility_20"] = out["Return_1"].rolling(20).std()
-
-    tr = np.maximum(out["High"] - out["Low"],
-                    np.maximum((out["High"] - out["Close"].shift()).abs(),
-                               (out["Low"] - out["Close"].shift()).abs()))
-    out["ATR_14"] = pd.Series(tr).rolling(14).mean()
-
-    if ta is not None:
-        out["RSI_14"] = ta.momentum.RSIIndicator(out["Close"], 14).rsi()
-        macd = ta.trend.MACD(out["Close"])
-        out["MACD"] = macd.macd()
-        out["MACD_Signal"] = macd.macd_signal()
-        out["EMA_20"] = ta.trend.EMAIndicator(out["Close"], 20).ema_indicator()
-        bb = ta.volatility.BollingerBands(out["Close"], 20, 2)
-        out["BB_W"] = bb.bollinger_wband()
-    else:
-        out["RSI_14"] = 50
-        out["MACD"] = out["Return_1"].ewm(span=12).mean() - out["Return_1"].ewm(span=26).mean()
-        out["MACD_Signal"] = out["MACD"].ewm(span=9).mean()
-        out["EMA_20"] = out["Close"].ewm(span=20).mean()
-        out["BB_W"] = out["Close"].rolling(20).std()
-
-    out["EMA_Dist"] = out["Close"] / out["EMA_20"] - 1
-    out["Volume_Change"] = out["Volume"].pct_change().fillna(0)
-    out = out.dropna()
-    return out
-
-# ── Sentiment ────────────────────────────────────────────────────────────────
-def _news_sentiment(symbol: str, when: pd.DatetimeIndex) -> pd.Series:
-    if _VADER is None:
-        return pd.Series(0.0, index=when)
-
-    try:
-        tk = yf.Ticker(symbol)
-        news = tk.news
-        if not news:
-            return pd.Series(0.0, index=when)
-
-        rows = []
-        for n in news:
-            title = n.get("title", "")
-            t = n.get("providerPublishTime")
-            if not title or t is None:
-                continue
-            ts = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(tz=None).date()
-            score = _VADER.polarity_scores(title)["compound"]
-            rows.append((ts, score))
-
-        if not rows:
-            return pd.Series(0.0, index=when)
-
-        s = pd.DataFrame(rows, columns=["date", "score"]).groupby("date")["score"].mean()
-        idx_dates = pd.Index([d.date() for d in when], name="date")
-        aligned = s.reindex(idx_dates, method="ffill").fillna(0.0)
-        aligned.index = when
-        return aligned
-    except Exception:
-        return pd.Series(0.0, index=when)
-
-# ── ML prep ──────────────────────────────────────────────────────────────────
 FEATURES = [
-    "Return_1", "Volatility_20", "ATR_14", "RSI_14",
-    "MACD", "MACD_Signal", "EMA_Dist", "BB_W", "Volume_Change", "Sentiment"
+    "Return", "Volatility", "RSI", "MA_Diff", "ATR",
+    "Momentum", "MACD", "MACD_Signal", "Sentiment"
 ]
 
-def prepare_ml_frame(df: pd.DataFrame, horizon_steps: int) -> pd.DataFrame:
-    X = add_indicators(df)
-    X["Sentiment"] = _news_sentiment("SPY", X.index)
-    X["FwdRet"] = X["Close"].pct_change(horizon_steps).shift(-horizon_steps)
-    thresh = X["FwdRet"].abs().median() * 0.2
-    X["Y"] = 0
-    X.loc[X["FwdRet"] > thresh, "Y"] = 1
-    X.loc[X["FwdRet"] < -thresh, "Y"] = -1
-    X = X.dropna(subset=["Close", "ATR_14", "Y"])
-    return X
+# ==============================
+# 📈 DATA FETCHING
+# ==============================
 
-# ── Train & Predict (with NaN + Inf fix) ─────────────────────────────────────
-def train_and_predict(df: pd.DataFrame, interval_key: str, risk: str = "Medium"):
-    if df is None or df.empty:
-        return None, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low",
-                            "tp": None, "sl": None, "accuracy": None}
-
-    horizon = INTERVALS[interval_key]["horizon_steps"]
-    X = prepare_ml_frame(df, horizon)
-    if X.empty or X.shape[0] < 200:
-        return X, None, {"signal": "HOLD", "prob": 0.0, "risk": "Low",
-                         "tp": None, "sl": None, "accuracy": None}
-
-    X_train, X_test = train_test_split(X, test_size=0.3, shuffle=False)
-
-    # --- FIX 1: Ensure all features exist & fill missing ---
-    for f in FEATURES:
-        if f not in X_train.columns:
-            X_train[f] = 0.0
-            X_test[f] = 0.0
-    X_train = X_train.fillna(0)
-    X_test = X_test.fillna(0)
-
-    # --- FIX 2: Remove infinities or huge values ---
-    X_train = X_train.replace([np.inf, -np.inf], np.nan)
-    X_test = X_test.replace([np.inf, -np.inf], np.nan)
-    X_train = X_train.fillna(0)
-    X_test = X_test.fillna(0)
-    X_train[FEATURES] = X_train[FEATURES].clip(lower=-1e6, upper=1e6)
-    X_test[FEATURES]  = X_test[FEATURES].clip(lower=-1e6, upper=1e6)
-
-    # --- Model ---
-    clf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=8,
-        random_state=42,
-        class_weight="balanced_subsample",
-        n_jobs=-1,
-    )
-    clf.fit(X_train[FEATURES], X_train["Y"])
-    yhat = clf.predict(X_test[FEATURES])
-    acc = accuracy_score(X_test["Y"], yhat)
-
-    last = X.iloc[[-1]]
-    proba = clf.predict_proba(last[FEATURES])[0]
-    classes = clf.classes_.tolist()
-    p_buy = proba[classes.index(1)] if 1 in classes else 0.0
-    p_sell = proba[classes.index(-1)] if -1 in classes else 0.0
-
-    if p_buy > max(0.5, p_sell + 0.1):
-        signal, prob = "BUY", float(p_buy)
-    elif p_sell > max(0.5, p_buy + 0.1):
-        signal, prob = "SELL", float(p_sell)
-    else:
-        signal, prob = "HOLD", float(max(p_buy, p_sell))
-
-    atr = float(last["ATR_14"].iloc[0])
-    price = float(last["Close"].iloc[0])
-    mult = RISK_MULT.get(risk, 1.0)
-    sl, tp = None, None
-    if signal == "BUY":
-        sl = price - mult * 1.2 * atr
-        tp = price + mult * 2.0 * atr
-    elif signal == "SELL":
-        sl = price + mult * 1.2 * atr
-        tp = price - mult * 2.0 * atr
-
-    return X, clf, {"signal": signal, "prob": prob, "risk": risk,
-                    "tp": tp, "sl": sl, "accuracy": float(acc)}
-
-# ── Backtest ─────────────────────────────────────────────────────────────────
-def backtest_signals(X: pd.DataFrame, signal_col="Y"):
-    df = X.copy()
-    df["Signal"] = df[signal_col].replace({-1: -1, 0: 0, 1: 1})
-    df["NextRet"] = df["Close"].pct_change().shift(-1).fillna(0)
-    df["StrategyRet"] = df["NextRet"] * df["Signal"].shift().fillna(0)
-    equity = (1 + df["StrategyRet"]).cumprod()
-    total = float(equity.iloc[-1] - 1.0)
-    trades = (df["Signal"].diff().abs() > 0).sum()
-    winrate = float((df["StrategyRet"] > 0).sum() /
-                    max(1, (df["StrategyRet"] != 0).sum()))
-    return {"total_return": total, "num_trades": int(trades),
-            "winrate": winrate, "equity_curve": equity}
-
-# ── Candlestick plotting ─────────────────────────────────────────────────────
-def make_candles(df: pd.DataFrame, title: str, max_points: int = 500,
-                 buys: pd.Index | None = None, sells: pd.Index | None = None,
-                 sl: float | None = None, tp: float | None = None):
-    if df is None or df.empty:
-        return go.Figure()
-
-    data = df.copy()
-    if len(data) > max_points:
-        data = data.iloc[-max_points:].copy()
-
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=data.index, open=data["Open"], high=data["High"],
-        low=data["Low"], close=data["Close"], name="Price"
-    ))
-
-    if buys is not None and len(buys) > 0:
-        here = data.index.intersection(buys)
-        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"],
-                                 mode="markers",
-                                 marker=dict(size=8, symbol="triangle-up"),
-                                 name="Buy"))
-    if sells is not None and len(sells) > 0:
-        here = data.index.intersection(sells)
-        fig.add_trace(go.Scatter(x=here, y=data.loc[here, "Close"],
-                                 mode="markers",
-                                 marker=dict(size=8, symbol="triangle-down"),
-                                 name="Sell"))
-    if tp is not None:
-        fig.add_hline(y=tp, line_dash="dot",
-                      annotation_text="TP", annotation_position="top left")
-    if sl is not None:
-        fig.add_hline(y=sl, line_dash="dot",
-                      annotation_text="SL", annotation_position="bottom left")
-
-    fig.update_layout(
-        title=title,
-        height=520,
-        margin=dict(l=10, r=10, t=35, b=10),
-        paper_bgcolor="#0f1116",
-        plot_bgcolor="#0f1116",
-        font=dict(color="#e6e6e6"),
-        xaxis=dict(gridcolor="#222"),
-        yaxis=dict(gridcolor="#222"),
-        legend=dict(orientation="h", y=1.05, x=0)
-    )
-    return fig
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def guard_float(x):
+def fetch_data(symbol, interval="1h", period="90d"):
     try:
-        return float(x)
-    except Exception:
-        return None
+        df = yf.download(symbol, interval=interval, period=period, progress=False, prepost=False)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.dropna().copy()
+        df["Return"] = df["Close"].pct_change()
+        df["Volatility"] = df["Return"].rolling(10).std()
+        df["MA50"] = df["Close"].rolling(50).mean()
+        df["MA200"] = df["Close"].rolling(200).mean()
+        df["MA_Diff"] = df["MA50"] - df["MA200"]
+        df["RSI"] = compute_rsi(df["Close"], 14)
+        df["ATR"] = compute_atr(df, 14)
+        df["Momentum"] = df["Close"] - df["Close"].shift(10)
+        df["MACD"], df["MACD_Signal"], _ = compute_macd(df["Close"])
+        df["Sentiment"] = get_sentiment_score(symbol)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df = df.dropna()
+        return df
+    except Exception as e:
+        print(f"[ERROR] fetch_data: {e}")
+        return pd.DataFrame()
+
+# ==============================
+# 📊 TECHNICAL INDICATORS
+# ==============================
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def compute_atr(df, period=14):
+    high_low = df["High"] - df["Low"]
+    high_close = np.abs(df["High"] - df["Close"].shift())
+    low_close = np.abs(df["Low"] - df["Close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def compute_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd, macd_signal, macd_hist
+
+# ==============================
+# 💬 SENTIMENT PLACEHOLDER
+# ==============================
+
+def get_sentiment_score(symbol):
+    """
+    Placeholder for sentiment data.
+    You can later enhance this using:
+    - Twitter/X sentiment APIs
+    - Financial news sentiment
+    - FinBERT sentiment analysis
+    Currently, it returns a neutral value (0.0).
+    """
+    return 0.0
+
+# ==============================
+# 🤖 MODEL TRAINING & PREDICTION
+# ==============================
+
+def train_and_predict(df, interval="1h", risk="Medium"):
+    try:
+        df = df.copy()
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df = df.dropna()
+
+        # Define target variable
+        df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
+
+        X = df[FEATURES]
+        y = df["Y"]
+
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=FEATURES, index=X.index)
+
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.25, shuffle=False)
+
+        clf = RandomForestClassifier(
+            n_estimators=150,
+            max_depth=8,
+            random_state=42,
+            class_weight="balanced_subsample"
+        )
+        clf.fit(X_train, y_train)
+
+        preds = clf.predict(X_test)
+        probs = clf.predict_proba(X_test)[:, 1]
+        acc = accuracy_score(y_test, preds)
+
+        last_prob = probs[-1]
+        signal = "BUY" if last_prob > 0.55 else "SELL" if last_prob < 0.45 else "HOLD"
+
+        result = {
+            "signal": signal,
+            "prob": float(last_prob),
+            "accuracy": float(acc),
+            "risk": risk
+        }
+
+        return X_scaled, clf, result
+
+    except Exception as e:
+        print(f"[ERROR] train_and_predict: {e}")
+        return None, None, None
+
+# ==============================
+# 🧠 UTILITY FUNCTIONS
+# ==============================
+
+def safe_mean(series):
+    """Avoids NaN or inf mean calculations"""
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    return s.mean() if not s.empty else np.nan
+
+def normalize(series):
+    """Normalize a pandas series between 0-1"""
+    return (series - series.min()) / (series.max() - series.min())
