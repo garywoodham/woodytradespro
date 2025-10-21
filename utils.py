@@ -6,11 +6,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from datetime import datetime, timedelta
-import streamlit as st
-import requests
 from bs4 import BeautifulSoup
+import requests
+import streamlit as st
 import warnings
+
 warnings.filterwarnings("ignore")
 
 # ==============================
@@ -50,12 +50,12 @@ FEATURES = [
 analyzer = SentimentIntensityAnalyzer()
 
 # ==============================
-# 📈 DATA FETCHING (with caching)
+# 📈 DATA FETCHING (CACHED)
 # ==============================
 
 @st.cache_data(ttl=3600)
 def fetch_data(symbol, interval="1h", period="90d"):
-    """Fetches data from Yahoo Finance safely and caches it for 1 hour."""
+    """Fetch market data from Yahoo Finance safely and cache for 1h."""
     try:
         if interval in ["1m", "5m", "15m", "30m", "1h"]:
             period = "60d"
@@ -63,14 +63,11 @@ def fetch_data(symbol, interval="1h", period="90d"):
         df = yf.download(symbol, interval=interval, period=period, progress=False, prepost=False)
 
         if df.empty:
-            print(f"[WARN] No data for {symbol} ({interval}, {period}) — retrying 30d fallback.")
             df = yf.download(symbol, interval=interval, period="30d", progress=False, prepost=False)
 
         if df.empty:
-            print(f"[ERROR] Still no data for {symbol}.")
             return pd.DataFrame()
 
-        # Build technical features
         df = df.dropna().copy()
         df["Return"] = df["Close"].pct_change()
         df["Volatility"] = df["Return"].rolling(10).std()
@@ -81,13 +78,11 @@ def fetch_data(symbol, interval="1h", period="90d"):
         df["ATR"] = compute_atr(df, 14)
         df["Momentum"] = df["Close"] - df["Close"].shift(10)
         df["MACD"], df["MACD_Signal"], _ = compute_macd(df["Close"])
-
         df["Sentiment"] = get_sentiment_score(symbol)
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.dropna()
 
-        print(f"[OK] Retrieved {len(df)} rows for {symbol} ({interval}, {period})")
         return df
 
     except Exception as e:
@@ -121,34 +116,28 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd, macd_signal, macd_hist
 
 # ==============================
-# 🗞️ REAL SENTIMENT ANALYSIS
+# 🗞️ SENTIMENT FETCH (Yahoo Finance Headlines)
 # ==============================
 
 def get_sentiment_score(symbol):
-    """
-    Fetches recent Yahoo Finance headlines for the asset symbol and
-    calculates an average sentiment score using VADER.
-    """
+    """Fetch sentiment from Yahoo Finance headlines using VADER."""
     try:
         url = f"https://finance.yahoo.com/quote/{symbol}?p={symbol}"
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=10)
 
-        if response.status_code != 200:
-            print(f"[WARN] Failed to fetch news for {symbol}")
+        if r.status_code != 200:
             return 0.0
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        headlines = [h.get_text() for h in soup.find_all("h3")][:10]  # Top 10 news
+        soup = BeautifulSoup(r.text, "html.parser")
+        headlines = [h.get_text() for h in soup.find_all("h3")][:10]
 
         if not headlines:
             return 0.0
 
         scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
         sentiment = np.mean(scores)
-
-        print(f"[INFO] Sentiment for {symbol}: {sentiment:.3f}")
-        return sentiment
+        return round(sentiment, 3)
 
     except Exception as e:
         print(f"[ERROR] Sentiment fetch failed for {symbol}: {e}")
@@ -159,13 +148,13 @@ def get_sentiment_score(symbol):
 # ==============================
 
 def train_and_predict(df, interval="1h", risk="Medium"):
+    """Train RandomForest model, adjust with sentiment weighting."""
     try:
         df = df.copy()
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.dropna()
 
         df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
-
         X = df[FEATURES]
         y = df["Y"]
 
@@ -187,12 +176,23 @@ def train_and_predict(df, interval="1h", risk="Medium"):
         acc = accuracy_score(y_test, preds)
 
         last_prob = probs[-1]
-        signal = "BUY" if last_prob > 0.55 else "SELL" if last_prob < 0.45 else "HOLD"
+        sentiment = df["Sentiment"].iloc[-1]
+
+        # Sentiment-weighted adjustment
+        adjusted_prob = last_prob + (sentiment * 0.15)
+        adjusted_prob = max(0, min(1, adjusted_prob))  # Clamp to [0,1]
+
+        signal = (
+            "BUY" if adjusted_prob > 0.55 else
+            "SELL" if adjusted_prob < 0.45 else
+            "HOLD"
+        )
 
         result = {
             "signal": signal,
-            "prob": float(last_prob),
-            "accuracy": float(acc),
+            "prob": round(adjusted_prob, 3),
+            "accuracy": round(acc, 3),
+            "sentiment": round(sentiment, 3),
             "risk": risk
         }
 
@@ -201,14 +201,3 @@ def train_and_predict(df, interval="1h", risk="Medium"):
     except Exception as e:
         print(f"[ERROR] train_and_predict: {e}")
         return None, None, None
-
-# ==============================
-# 🧠 UTILITIES
-# ==============================
-
-def safe_mean(series):
-    s = series.replace([np.inf, -np.inf], np.nan).dropna()
-    return s.mean() if not s.empty else np.nan
-
-def normalize(series):
-    return (series - series.min()) / (series.max() - series.min())
