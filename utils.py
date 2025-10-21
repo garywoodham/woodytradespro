@@ -11,6 +11,15 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------------------------
+# Risk Multiplier Constants
+# ---------------------------
+RISK_MULT = {
+    "low": (0.5, 0.3),
+    "medium": (1.0, 0.7),
+    "high": (1.5, 1.0)
+}
+
+# ---------------------------
 # Global Config
 # ---------------------------
 ASSET_SYMBOLS = {
