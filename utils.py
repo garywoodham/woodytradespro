@@ -1,22 +1,15 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from bs4 import BeautifulSoup
-import requests
-import streamlit as st
-import warnings
+import ta  # Technical Analysis library
 
-warnings.filterwarnings("ignore")
-
-# ==============================
-# 🔧 CONFIGURATION
-# ==============================
-
+# -------------------------------
+# 🔧 Configuration
+# -------------------------------
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
@@ -28,13 +21,10 @@ ASSET_SYMBOLS = {
     "Bitcoin": "BTC-USD"
 }
 
-INTERVALS = {
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "1d": "1d",
-    "1w": "1wk"
-}
+FEATURES = [
+    "Return", "MA_10", "MA_50", "RSI", "MACD", "Signal_Line", "ATR",
+    "Momentum", "Sentiment"
+]
 
 RISK_MULT = {
     "Low": 0.5,
@@ -42,145 +32,87 @@ RISK_MULT = {
     "High": 1.5
 }
 
-FEATURES = [
-    "Return", "Volatility", "RSI", "MA_Diff", "ATR",
-    "Momentum", "MACD", "MACD_Signal", "Sentiment"
-]
+sentiment_analyzer = SentimentIntensityAnalyzer()
 
-analyzer = SentimentIntensityAnalyzer()
 
-# ==============================
-# 📈 DATA FETCHING (CACHED)
-# ==============================
-
-@st.cache_data(ttl=3600)
-def fetch_data(symbol, interval="1h", period="90d"):
-    """Fetch market data from Yahoo Finance safely and cache for 1h."""
+# -------------------------------
+# 📥 Data Fetching
+# -------------------------------
+def fetch_data(symbol, interval="1h", period="60d"):
+    """Download data safely from Yahoo Finance."""
     try:
-        if interval in ["1m", "5m", "15m", "30m", "1h"]:
-            period = "60d"
-
-        df = yf.download(symbol, interval=interval, period=period, progress=False, prepost=False)
-
-        if df.empty:
-            df = yf.download(symbol, interval=interval, period="30d", progress=False, prepost=False)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        df = df.dropna().copy()
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
+        df.dropna(inplace=True)
         df["Return"] = df["Close"].pct_change()
-        df["Volatility"] = df["Return"].rolling(10).std()
-        df["MA50"] = df["Close"].rolling(50).mean()
-        df["MA200"] = df["Close"].rolling(200).mean()
-        df["MA_Diff"] = df["MA50"] - df["MA200"]
-        df["RSI"] = compute_rsi(df["Close"], 14)
-        df["ATR"] = compute_atr(df, 14)
-        df["Momentum"] = df["Close"] - df["Close"].shift(10)
-        df["MACD"], df["MACD_Signal"], _ = compute_macd(df["Close"])
-        df["Sentiment"] = get_sentiment_score(symbol)
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df = df.dropna()
-
+        df["MA_10"] = df["Close"].rolling(10).mean()
+        df["MA_50"] = df["Close"].rolling(50).mean()
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
+        macd = ta.trend.MACD(df["Close"])
+        df["MACD"] = macd.macd()
+        df["Signal_Line"] = macd.macd_signal()
+        df["ATR"] = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
+        df["Momentum"] = ta.momentum.ROCIndicator(df["Close"]).roc()
+        df.dropna(inplace=True)
         return df
-
     except Exception as e:
-        print(f"[ERROR] fetch_data: {e}")
+        print(f"⚠️ Error fetching {symbol}: {e}")
         return pd.DataFrame()
 
-# ==============================
-# 📊 TECHNICAL INDICATORS
-# ==============================
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def compute_atr(df, period=14):
-    high_low = df["High"] - df["Low"]
-    high_close = np.abs(df["High"] - df["Close"].shift())
-    low_close = np.abs(df["Low"] - df["Close"].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def compute_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    macd_signal = macd.ewm(span=signal, adjust=False).mean()
-    macd_hist = macd - macd_signal
-    return macd, macd_signal, macd_hist
-
-# ==============================
-# 🗞️ SENTIMENT FETCH (Yahoo Finance Headlines)
-# ==============================
-
-def get_sentiment_score(symbol):
-    """Fetch sentiment from Yahoo Finance headlines using VADER."""
+# -------------------------------
+# 🧠 Sentiment Integration
+# -------------------------------
+def get_sentiment(asset):
+    """Estimate sentiment based on asset name (placeholder for live news sentiment)."""
     try:
-        url = f"https://finance.yahoo.com/quote/{symbol}?p={symbol}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
+        text = asset.lower()
+        sentiment_score = sentiment_analyzer.polarity_scores(text)["compound"]
+        return sentiment_score
+    except Exception:
+        return 0
 
-        if r.status_code != 200:
-            return 0.0
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        headlines = [h.get_text() for h in soup.find_all("h3")][:10]
-
-        if not headlines:
-            return 0.0
-
-        scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
-        sentiment = np.mean(scores)
-        return round(sentiment, 3)
-
-    except Exception as e:
-        print(f"[ERROR] Sentiment fetch failed for {symbol}: {e}")
-        return 0.0
-
-# ==============================
-# 🤖 MODEL TRAINING & PREDICTION
-# ==============================
-
+# -------------------------------
+# 📈 Train and Predict
+# -------------------------------
 def train_and_predict(df, interval="1h", risk="Medium"):
-    """Train RandomForest model, adjust with sentiment weighting."""
+    """Train ML model (Random Forest) and generate adaptive predictions with TP/SL."""
     try:
-        df = df.copy()
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df = df.dropna()
+        if df.empty:
+            return None, None, {
+                "signal": "NO DATA",
+                "prob": 0,
+                "accuracy": 0,
+                "sentiment": 0,
+                "risk": risk,
+                "tp": 0,
+                "sl": 0
+            }
 
         df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
-        X = df[FEATURES]
-        y = df["Y"]
+        df.dropna(inplace=True)
+
+        sentiment = get_sentiment("market")
+
+        X = df[["Return", "MA_10", "MA_50", "RSI", "MACD", "Signal_Line", "ATR", "Momentum"]].copy()
+        X["Sentiment"] = sentiment
 
         scaler = StandardScaler()
-        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=FEATURES, index=X.index)
+        X_scaled = scaler.fit_transform(X)
+        X = pd.DataFrame(X_scaled, columns=FEATURES)
 
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.25, shuffle=False)
+        split = int(len(X) * 0.8)
+        X_train, X_test = X.iloc[:split], X.iloc[split:]
+        y_train, y_test = df["Y"].iloc[:split], df["Y"].iloc[split:]
 
-        clf = RandomForestClassifier(
-            n_estimators=150,
-            max_depth=8,
-            random_state=42,
-            class_weight="balanced_subsample"
-        )
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
         clf.fit(X_train, y_train)
-
         preds = clf.predict(X_test)
-        probs = clf.predict_proba(X_test)[:, 1]
         acc = accuracy_score(y_test, preds)
 
-        last_prob = probs[-1]
-        sentiment = df["Sentiment"].iloc[-1]
-
-        # Sentiment-weighted adjustment
-        adjusted_prob = last_prob + (sentiment * 0.15)
-        adjusted_prob = max(0, min(1, adjusted_prob))  # Clamp to [0,1]
+        last = X.iloc[[-1]]
+        prob = clf.predict_proba(last)[0][1]
+        adjusted_prob = prob + (sentiment * 0.05)
 
         signal = (
             "BUY" if adjusted_prob > 0.55 else
@@ -188,16 +120,104 @@ def train_and_predict(df, interval="1h", risk="Medium"):
             "HOLD"
         )
 
+        atr = df["ATR"].iloc[-1]
+        price = df["Close"].iloc[-1]
+        risk_mult = RISK_MULT.get(risk, 1.0)
+
+        # --- Adaptive Take-Profit / Stop-Loss based on volatility regime ---
+        volatility_mean = df["ATR"].rolling(50).mean().iloc[-1]
+        volatility_ratio = atr / volatility_mean if volatility_mean > 0 else 1
+
+        if volatility_ratio < 0.8:
+            tp_mult, sl_mult = 1.5, 0.8
+        elif volatility_ratio > 1.5:
+            tp_mult, sl_mult = 2.5, 1.2
+        else:
+            tp_mult, sl_mult = 2.0, 1.0
+
+        tp_mult *= risk_mult
+        sl_mult *= risk_mult
+
+        if signal == "BUY":
+            tp = price + atr * tp_mult
+            sl = price - atr * sl_mult
+        elif signal == "SELL":
+            tp = price - atr * tp_mult
+            sl = price + atr * sl_mult
+        else:
+            tp, sl = price, price
+
         result = {
             "signal": signal,
             "prob": round(adjusted_prob, 3),
             "accuracy": round(acc, 3),
             "sentiment": round(sentiment, 3),
-            "risk": risk
+            "risk": risk,
+            "tp": round(tp, 2),
+            "sl": round(sl, 2)
         }
 
-        return X_scaled, clf, result
+        return X, clf, result
 
     except Exception as e:
-        print(f"[ERROR] train_and_predict: {e}")
-        return None, None, None
+        print(f"⚠️ train_and_predict() error: {e}")
+        return None, None, {
+            "signal": "ERROR",
+            "prob": 0,
+            "accuracy": 0,
+            "sentiment": 0,
+            "risk": risk,
+            "tp": 0,
+            "sl": 0
+        }
+
+
+# -------------------------------
+# 📊 Backtesting
+# -------------------------------
+def backtest_signals(df, initial_balance=10000, fee=0.001):
+    """Simulate trades using model's BUY/SELL signals."""
+    try:
+        df = df.copy().dropna()
+        df["Signal"] = np.where(df["Return"].shift(-1) > 0, 1, -1)
+
+        balance = initial_balance
+        position = 0
+        equity_curve = []
+        trades = []
+
+        for i in range(1, len(df)):
+            signal = df["Signal"].iloc[i]
+
+            if signal == 1 and position == 0:
+                position = balance / df["Close"].iloc[i]
+                balance = 0
+                trades.append(("BUY", df.index[i], df["Close"].iloc[i]))
+
+            elif signal == -1 and position > 0:
+                balance = position * df["Close"].iloc[i] * (1 - fee)
+                position = 0
+                trades.append(("SELL", df.index[i], df["Close"].iloc[i]))
+
+            equity_curve.append(balance + position * df["Close"].iloc[i])
+
+        if position > 0:
+            balance = position * df["Close"].iloc[-1]
+            position = 0
+
+        total_return = ((equity_curve[-1] - initial_balance) / initial_balance) * 100 if equity_curve else 0
+        wins = sum(1 for t in trades if t[0] == "SELL")
+        winrate = (wins / len(trades)) * 100 if trades else 0
+
+        result = {
+            "total_return": round(total_return, 2),
+            "winrate": round(winrate, 2),
+            "trades": trades,
+            "equity_curve": pd.Series(equity_curve, index=df.index[-len(equity_curve):])
+        }
+
+        return result
+
+    except Exception as e:
+        print(f"[ERROR] backtest_signals: {e}")
+        return {"total_return": 0, "winrate": 0, "equity_curve": pd.Series()}
