@@ -5,6 +5,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+import streamlit as st
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -43,14 +44,31 @@ FEATURES = [
 ]
 
 # ==============================
-# 📈 DATA FETCHING
+# 📈 DATA FETCHING (with caching)
 # ==============================
 
+@st.cache_data(ttl=3600)
 def fetch_data(symbol, interval="1h", period="90d"):
+    """
+    Fetches market data from Yahoo Finance, automatically adjusting for limits
+    and caching results for faster reloads (1 hour cache TTL).
+    """
     try:
+        # Auto-adjust period for intraday limits
+        if interval in ["1m", "5m", "15m", "30m", "1h"]:
+            period = "60d"
+
         df = yf.download(symbol, interval=interval, period=period, progress=False, prepost=False)
+
         if df.empty:
+            print(f"[WARN] No data for {symbol} ({interval}, {period}) — retrying with 30d fallback.")
+            df = yf.download(symbol, interval=interval, period="30d", progress=False, prepost=False)
+
+        if df.empty:
+            print(f"[ERROR] Still no data available for {symbol}.")
             return pd.DataFrame()
+
+        # Build features
         df = df.dropna().copy()
         df["Return"] = df["Close"].pct_change()
         df["Volatility"] = df["Return"].rolling(10).std()
@@ -62,9 +80,13 @@ def fetch_data(symbol, interval="1h", period="90d"):
         df["Momentum"] = df["Close"] - df["Close"].shift(10)
         df["MACD"], df["MACD_Signal"], _ = compute_macd(df["Close"])
         df["Sentiment"] = get_sentiment_score(symbol)
+
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.dropna()
+
+        print(f"[OK] Retrieved {len(df)} rows for {symbol} ({interval}, {period})")
         return df
+
     except Exception as e:
         print(f"[ERROR] fetch_data: {e}")
         return pd.DataFrame()
@@ -101,12 +123,11 @@ def compute_macd(series, fast=12, slow=26, signal=9):
 
 def get_sentiment_score(symbol):
     """
-    Placeholder for sentiment data.
-    You can later enhance this using:
-    - Twitter/X sentiment APIs
-    - Financial news sentiment
-    - FinBERT sentiment analysis
-    Currently, it returns a neutral value (0.0).
+    Placeholder for future sentiment integration.
+    Replace with:
+      - Twitter/X API sentiment
+      - FinBERT or Hugging Face transformer
+      - Yahoo Finance headlines
     """
     return 0.0
 
@@ -120,7 +141,7 @@ def train_and_predict(df, interval="1h", risk="Medium"):
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.dropna()
 
-        # Define target variable
+        # Create labels for next move
         df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
 
         X = df[FEATURES]
@@ -160,14 +181,12 @@ def train_and_predict(df, interval="1h", risk="Medium"):
         return None, None, None
 
 # ==============================
-# 🧠 UTILITY FUNCTIONS
+# 🧠 UTILITIES
 # ==============================
 
 def safe_mean(series):
-    """Avoids NaN or inf mean calculations"""
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
     return s.mean() if not s.empty else np.nan
 
 def normalize(series):
-    """Normalize a pandas series between 0-1"""
     return (series - series.min()) / (series.max() - series.min())
