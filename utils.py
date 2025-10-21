@@ -5,7 +5,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from datetime import datetime, timedelta
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -43,32 +47,30 @@ FEATURES = [
     "Momentum", "MACD", "MACD_Signal", "Sentiment"
 ]
 
+analyzer = SentimentIntensityAnalyzer()
+
 # ==============================
 # 📈 DATA FETCHING (with caching)
 # ==============================
 
 @st.cache_data(ttl=3600)
 def fetch_data(symbol, interval="1h", period="90d"):
-    """
-    Fetches market data from Yahoo Finance, automatically adjusting for limits
-    and caching results for faster reloads (1 hour cache TTL).
-    """
+    """Fetches data from Yahoo Finance safely and caches it for 1 hour."""
     try:
-        # Auto-adjust period for intraday limits
         if interval in ["1m", "5m", "15m", "30m", "1h"]:
             period = "60d"
 
         df = yf.download(symbol, interval=interval, period=period, progress=False, prepost=False)
 
         if df.empty:
-            print(f"[WARN] No data for {symbol} ({interval}, {period}) — retrying with 30d fallback.")
+            print(f"[WARN] No data for {symbol} ({interval}, {period}) — retrying 30d fallback.")
             df = yf.download(symbol, interval=interval, period="30d", progress=False, prepost=False)
 
         if df.empty:
-            print(f"[ERROR] Still no data available for {symbol}.")
+            print(f"[ERROR] Still no data for {symbol}.")
             return pd.DataFrame()
 
-        # Build features
+        # Build technical features
         df = df.dropna().copy()
         df["Return"] = df["Close"].pct_change()
         df["Volatility"] = df["Return"].rolling(10).std()
@@ -79,6 +81,7 @@ def fetch_data(symbol, interval="1h", period="90d"):
         df["ATR"] = compute_atr(df, 14)
         df["Momentum"] = df["Close"] - df["Close"].shift(10)
         df["MACD"], df["MACD_Signal"], _ = compute_macd(df["Close"])
+
         df["Sentiment"] = get_sentiment_score(symbol)
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -118,18 +121,38 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd, macd_signal, macd_hist
 
 # ==============================
-# 💬 SENTIMENT PLACEHOLDER
+# 🗞️ REAL SENTIMENT ANALYSIS
 # ==============================
 
 def get_sentiment_score(symbol):
     """
-    Placeholder for future sentiment integration.
-    Replace with:
-      - Twitter/X API sentiment
-      - FinBERT or Hugging Face transformer
-      - Yahoo Finance headlines
+    Fetches recent Yahoo Finance headlines for the asset symbol and
+    calculates an average sentiment score using VADER.
     """
-    return 0.0
+    try:
+        url = f"https://finance.yahoo.com/quote/{symbol}?p={symbol}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            print(f"[WARN] Failed to fetch news for {symbol}")
+            return 0.0
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        headlines = [h.get_text() for h in soup.find_all("h3")][:10]  # Top 10 news
+
+        if not headlines:
+            return 0.0
+
+        scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
+        sentiment = np.mean(scores)
+
+        print(f"[INFO] Sentiment for {symbol}: {sentiment:.3f}")
+        return sentiment
+
+    except Exception as e:
+        print(f"[ERROR] Sentiment fetch failed for {symbol}: {e}")
+        return 0.0
 
 # ==============================
 # 🤖 MODEL TRAINING & PREDICTION
@@ -141,7 +164,6 @@ def train_and_predict(df, interval="1h", risk="Medium"):
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.dropna()
 
-        # Create labels for next move
         df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
 
         X = df[FEATURES]
