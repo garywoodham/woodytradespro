@@ -1,23 +1,29 @@
 import streamlit as st
 
 def render_help():
-    st.header("❓ Help")
+    st.title("ℹ️ Help & Interpretation Guide")
+
     st.markdown("""
-**What’s included (free & Streamlit-safe):**
-- Technical indicators (RSI, MACD, EMA, Bollinger width, ATR, Volatility)
-- RandomForest ML classification for BUY/SELL/HOLD
-- Optional news sentiment (Yahoo news via yfinance, VADER analyzer)
-- Multi-timeframe (15m / 1h / 1d)
-- Candlesticks with historical labels, probability, TP/SL
-- Backtest baseline and scenario simulator
-- CSV export
+    ### Understanding the Dashboard
+    - **Signal** → Model recommendation (`BUY`, `SELL`, or `HOLD`)
+    - **Probability** → Model confidence for its signal
+    - **TP / SL** → Suggested take-profit and stop-loss based on volatility and selected risk
+    - **Accuracy** → Historical validation accuracy of the model on similar data
+    - **Trend (%)** → 10-period price momentum percentage
 
-**Tips**
-- If charts look truncated, we cap to 500 bars for speed. Zoom with Plotly tools.
-- Change **Risk** in the sidebar to tighten/loosen TP/SL.
-- On Streamlit Cloud: no TensorFlow is used (for compatibility).
+    ### Chart Annotations
+    - **Candles:** OHLC price structure
+    - **Green triangle:** Buy signal
+    - **Red triangle:** Sell signal
+    - **Dotted lines:** Target price and stop loss zones
 
-**Disclaimers**
-- This is not financial advice. Backtests are illustrative only.
-- Data and news may be delayed; always verify before trading.
-""")
+    ### Tips for Use
+    - Always consider multiple timeframes before trading.
+    - High-risk mode widens TP/SL for volatile assets.
+    - Sentiment data comes from Yahoo Finance news when available.
+
+    ### Example Workflow
+    1. Go to **Overview** → get quick recommendations.
+    2. Visit **Trends** → confirm trend alignment.
+    3. Dive into **Detailed** → view signals and price structure.
+    """)
