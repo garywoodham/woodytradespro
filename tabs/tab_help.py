@@ -1,29 +1,20 @@
 import streamlit as st
 
 def render_help():
-    st.title("ℹ️ Help & Interpretation Guide")
-
+    st.title("ℹ️ Help & About")
     st.markdown("""
-    ### Understanding the Dashboard
-    - **Signal** → Model recommendation (`BUY`, `SELL`, or `HOLD`)
-    - **Probability** → Model confidence for its signal
-    - **TP / SL** → Suggested take-profit and stop-loss based on volatility and selected risk
-    - **Accuracy** → Historical validation accuracy of the model on similar data
-    - **Trend (%)** → 10-period price momentum percentage
+    **WoodyTradesPro**  
+    AI-enhanced trading assistant that analyzes multiple assets, generates live buy/sell signals,
+    and visualizes take-profit and stop-loss zones.
 
-    ### Chart Annotations
-    - **Candles:** OHLC price structure
-    - **Green triangle:** Buy signal
-    - **Red triangle:** Sell signal
-    - **Dotted lines:** Target price and stop loss zones
+    **Features:**
+    - 🧠 Machine Learning–based trend prediction  
+    - 💬 Sentiment and volatility integration  
+    - 🎯 Risk-adjusted trade targets  
+    - 📊 Multi-asset dashboard  
 
-    ### Tips for Use
-    - Always consider multiple timeframes before trading.
-    - High-risk mode widens TP/SL for volatile assets.
-    - Sentiment data comes from Yahoo Finance news when available.
-
-    ### Example Workflow
-    1. Go to **Overview** → get quick recommendations.
-    2. Visit **Trends** → confirm trend alignment.
-    3. Dive into **Detailed** → view signals and price structure.
+    **Tips:**
+    - Adjust the *risk level* for tighter or wider stop-losses.  
+    - Switch between *intervals* for intraday or swing views.  
+    - Check *accuracy metrics* to validate reliability.
     """)
