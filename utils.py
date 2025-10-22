@@ -31,7 +31,7 @@ RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 # HELPERS
 # ─────────────────────────────
 def _to_1d_series(x, index=None, name=None):
-    """Coerce x into a 1-D float Series (handles 2-D, object, list cells)."""
+    """Coerce x into a 1-D float Series."""
     if isinstance(x, pd.Series):
         s = x.copy()
     elif isinstance(x, pd.DataFrame):
@@ -80,11 +80,10 @@ def _normalize_ohlcv(df):
 
 
 # ─────────────────────────────
-# DATA FETCHING (with rate-limit handling + fallbacks)
+# DATA FETCHING (with retry + fallback)
 # ─────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
-    """Fetch Yahoo data with retry, backoff, and mirror fallback."""
     def _attempt(_period, _interval):
         df = yf.download(symbol, period=_period, interval=_interval,
                          progress=False, threads=False, auto_adjust=True)
@@ -106,7 +105,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
                 print(f"⚠️ Attempt {attempt} failed for {symbol}: {e}")
                 time.sleep(delay + random.random())
 
-    # Fallback to daily data
+    # fallback to daily
     try:
         df = _attempt("3mo", "1d")
         if not df.empty:
@@ -115,9 +114,8 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
     except Exception as e:
         print(f"🚫 Daily fallback failed for {symbol}: {e}")
 
-    # Mirror backup using raw API
+    # mirror backup
     try:
-        print(f"🛰 Mirror fetch for {symbol} ...")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=10)
@@ -139,13 +137,15 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
 
 
 # ─────────────────────────────
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS  (with warm-up fix)
 # ─────────────────────────────
 def add_indicators(df):
     df = _normalize_ohlcv(df)
     if df.empty:
-        return df
+        return df.copy()
+
     close = _to_1d_series(df["Close"], index=df.index, name="Close")
+
     try:
         df["EMA_20"] = EMAIndicator(close, 20).ema_indicator()
         df["EMA_50"] = EMAIndicator(close, 50).ema_indicator()
@@ -159,7 +159,12 @@ def add_indicators(df):
     except Exception as e:
         print(f"⚠️ Indicator computation failed: {e}")
         return pd.DataFrame()
-    return df.dropna()
+
+    # The previous fix: trim warm-up, fill, recalc return
+    df = df.fillna(method="ffill").fillna(method="bfill")
+    df = df.iloc[50:]  # drop warm-up rows
+    df["Return"] = df["Close"].pct_change().fillna(0)
+    return df
 
 
 # ─────────────────────────────
@@ -185,19 +190,18 @@ def apply_trading_theory(pred_label, df):
 # ─────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
     df = add_indicators(df)
-    if df.empty or len(df) < 60:
+    if df.empty or len(df) < 20:  # reduced threshold
         return None
 
     df = df.fillna(method="ffill").fillna(method="bfill")
-
     df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
     FEATURES = ["EMA_20", "EMA_50", "RSI", "MACD", "Signal_Line", "Return"]
 
     X = df[FEATURES].replace([np.inf, -np.inf], np.nan).dropna()
     y = df.loc[X.index, "Target"]
 
-    # --- Fallback if not enough data for ML ---
-    if len(X) < 30:
+    # fallback if too small
+    if len(X) < 20:
         latest = df.iloc[-1]
         trend = "buy" if latest["EMA_20"] > latest["EMA_50"] else "sell"
         atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
@@ -217,13 +221,16 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
             "df": df,
         }
 
-    clf = RandomForestClassifier(n_estimators=150, random_state=42)
-    clf.fit(X[:-1], y[:-1])
-
-    latest = X.iloc[-1:].values
-    pred_cls = clf.predict(latest)[0]
-    prob = clf.predict_proba(latest)[0][pred_cls]
-    raw_pred = "buy" if pred_cls == 1 else "sell"
+    try:
+        clf = RandomForestClassifier(n_estimators=150, random_state=42)
+        clf.fit(X[:-1], y[:-1])
+        latest = X.iloc[-1:].values
+        pred_cls = clf.predict(latest)[0]
+        prob = clf.predict_proba(latest)[0][pred_cls]
+        raw_pred = "buy" if pred_cls == 1 else "sell"
+    except Exception as e:
+        print(f"⚠️ ML training failed: {e}")
+        raw_pred, prob = "neutral", 0.5
 
     adjusted_pred, conf_adj = apply_trading_theory(raw_pred, df)
     conf = min(1.0, prob * conf_adj)
@@ -237,10 +244,10 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
     return {
         "prediction": adjusted_pred,
         "probability": conf,
-        "accuracy": clf.score(X, y),
+        "accuracy": clf.score(X, y) if "clf" in locals() else 0.0,
         "tp": tp,
         "sl": sl,
-        "model": clf,
+        "model": clf if "clf" in locals() else None,
         "features": FEATURES,
         "X": X,
         "df": df,
@@ -263,7 +270,7 @@ def backtest_signals(df, pred):
 
 
 # ─────────────────────────────
-# MULTI-ASSET SUMMARY
+# MULTI-ASSET SUMMARY (with progress logs)
 # ─────────────────────────────
 def summarize_assets():
     results = []
@@ -301,6 +308,7 @@ def summarize_assets():
             log += f"❌ Error analyzing **{asset}**: {e}\n"
             status.markdown(log)
         time.sleep(0.3)
+
     if not results:
         log += "\n🚫 No valid data fetched — showing placeholder."
         status.markdown(log)
@@ -312,6 +320,7 @@ def summarize_assets():
             "Win Rate": 0.0,
             "Return": 0.0,
         }])
+
     log += "\n🎉 Analysis complete!"
     status.markdown(log)
     progress.progress(1.0)
