@@ -29,17 +29,19 @@ RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
 
 # ───────────────────────────────
-# SAFE FETCH WRAPPER (Resilient + Fallback + Curl + Cache)
+# FETCH DATA (Resilient + Flatten Fix + Cache)
 # ───────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
-    """Fetch market data with multi-layer fallback and 1D flatten fix."""
+    """Fetch market data with retry + flatten to avoid 2D array issues."""
 
-    def _flatten(df):
-        for col in df.columns:
-            df[col] = df[col].apply(
-                lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
-            )
+    def _flatten_cols(df):
+        # force all columns into 1D numeric arrays
+        for c in df.columns:
+            vals = df[c]
+            if isinstance(vals.iloc[0], (list, np.ndarray)):
+                df[c] = [float(v[0]) if isinstance(v, (list, np.ndarray)) else float(v) for v in vals]
+            df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
 
     for attempt in range(1, retries + 1):
@@ -53,7 +55,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
                 auto_adjust=True,
             )
             if not df.empty and len(df) > 10:
-                df = _flatten(df)
+                df = _flatten_cols(df)
                 df["Return"] = df["Close"].pct_change()
                 print(f"✅ {symbol}: fetched {len(df)} rows.")
                 return df
@@ -63,26 +65,19 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
             print(f"❌ Attempt {attempt} failed for {symbol}: {e}")
         time.sleep(delay + random.random())
 
-    # Daily fallback
+    # fallback to daily
     try:
-        print(f"🔁 Trying daily fallback for {symbol}...")
-        df = yf.download(
-            symbol,
-            period="3mo",
-            interval="1d",
-            progress=False,
-            threads=False,
-            auto_adjust=True,
-        )
+        print(f"🔁 Daily fallback for {symbol}...")
+        df = yf.download(symbol, period="3mo", interval="1d", progress=False, threads=False, auto_adjust=True)
         if not df.empty:
-            df = _flatten(df)
+            df = _flatten_cols(df)
             df["Return"] = df["Close"].pct_change()
             print(f"✅ Daily fallback succeeded for {symbol}")
             return df
     except Exception as e:
         print(f"🚫 Daily fallback failed for {symbol}: {e}")
 
-    # Curl-based backup
+    # curl backup
     try:
         print(f"🛰 Curl backup for {symbol}...")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
@@ -93,6 +88,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
             df = pd.DataFrame(js["indicators"]["quote"][0])
             df["Date"] = pd.to_datetime(js["timestamp"], unit="s")
             df.set_index("Date", inplace=True)
+            df = _flatten_cols(df)
             df["Return"] = df["close"].pct_change()
             print(f"✅ Curl backup succeeded for {symbol}")
             return df
@@ -111,8 +107,9 @@ def add_indicators(df):
     for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df.dropna(inplace=True)
+
+    # Indicators
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
@@ -207,7 +204,7 @@ def backtest_signals(df, pred):
 
 
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY (Progress + Visibility + Accuracy Fix)
+# MULTI-ASSET SUMMARY (Progress + Accuracy)
 # ───────────────────────────────
 def summarize_assets():
     results = []
