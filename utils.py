@@ -181,31 +181,59 @@ def apply_trading_theory(pred_label, df):
 
 
 # ─────────────────────────────
-# MODEL TRAINING & PREDICTION
+# MODEL TRAINING & PREDICTION (with fallback)
 # ─────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
     df = add_indicators(df)
     if df.empty or len(df) < 60:
         return None
+
+    df = df.fillna(method="ffill").fillna(method="bfill")
+
     df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
     FEATURES = ["EMA_20", "EMA_50", "RSI", "MACD", "Signal_Line", "Return"]
+
     X = df[FEATURES].replace([np.inf, -np.inf], np.nan).dropna()
     y = df.loc[X.index, "Target"]
+
+    # --- Fallback if not enough data for ML ---
     if len(X) < 30:
-        return None
+        latest = df.iloc[-1]
+        trend = "buy" if latest["EMA_20"] > latest["EMA_50"] else "sell"
+        atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
+        price = df["Close"].iloc[-1]
+        mult = RISK_MULT.get(risk, 1.0)
+        tp = price + (atr * 1.5 * mult if trend == "buy" else -atr * 1.5 * mult)
+        sl = price - (atr * 1.0 * mult if trend == "buy" else -atr * 1.0 * mult)
+        return {
+            "prediction": trend,
+            "probability": 0.65,
+            "accuracy": 0.0,
+            "tp": tp,
+            "sl": sl,
+            "model": None,
+            "features": FEATURES,
+            "X": X,
+            "df": df,
+        }
+
     clf = RandomForestClassifier(n_estimators=150, random_state=42)
     clf.fit(X[:-1], y[:-1])
+
     latest = X.iloc[-1:].values
     pred_cls = clf.predict(latest)[0]
     prob = clf.predict_proba(latest)[0][pred_cls]
     raw_pred = "buy" if pred_cls == 1 else "sell"
+
     adjusted_pred, conf_adj = apply_trading_theory(raw_pred, df)
     conf = min(1.0, prob * conf_adj)
+
     atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
     mult = RISK_MULT.get(risk, 1.0)
     price = df["Close"].iloc[-1]
     tp = price + (atr * 1.5 * mult if adjusted_pred == "buy" else -atr * 1.5 * mult)
     sl = price - (atr * 1.0 * mult if adjusted_pred == "buy" else -atr * 1.0 * mult)
+
     return {
         "prediction": adjusted_pred,
         "probability": conf,
