@@ -1,5 +1,5 @@
 # ============================================================
-# WoodyTradesPro Utilities (Full Version)
+# WoodyTradesPro Utilities (FINAL VERSION - CLEANED + CACHED)
 # ============================================================
 
 import yfinance as yf
@@ -13,6 +13,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+import streamlit as st
 
 # ============================================================
 # CONFIGURATION
@@ -29,12 +30,14 @@ ASSET_SYMBOLS = {
     "Bitcoin": "BTC-USD"
 }
 
+# Risk multipliers for TP/SL calculation
 RISK_MULT = {
     "Low": 1.2,
     "Medium": 1.5,
     "High": 2.0
 }
 
+# Interval → period mapping
 INTERVALS = {
     "15m": {"period": "5d"},
     "30m": {"period": "7d"},
@@ -43,31 +46,41 @@ INTERVALS = {
     "1wk": {"period": "1y"}
 }
 
+# Feature columns used for model training
 FEATURES = [
     "Return", "MA_10", "MA_50", "RSI",
     "MACD", "Signal_Line", "ATR", "Momentum", "Sentiment"
 ]
 
 # ============================================================
-# FETCH DATA (Robust)
+# FETCH MARKET DATA
 # ============================================================
 
+@st.cache_data(show_spinner=False, ttl=1800)  # cache for 30 minutes
 def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retries: int = 3) -> pd.DataFrame:
-    """Download market data with retry and fallback handling."""
+    """Download price data with retry, fallback, and caching."""
     if period is None:
         period = INTERVALS.get(interval, {"period": "1mo"})["period"]
 
     for attempt in range(max_retries):
         try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
-            if df is None or df.empty:
-                raise ValueError("Empty data frame")
+            print(f"📊 Fetching {symbol} [{interval}] for {period}...")
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                threads=False,
+                auto_adjust=True  # prevents yfinance FutureWarning
+            )
 
-            # Flatten MultiIndex if needed
+            if df is None or df.empty:
+                raise ValueError("Empty dataframe returned")
+
+            # Flatten multi-index if exists
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # Basic cleanup
             df = df.dropna().copy()
             df["Return"] = df["Close"].pct_change()
             df["MA_10"] = df["Close"].rolling(10).mean()
@@ -78,37 +91,43 @@ def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retrie
             df["Signal_Line"] = macd.macd_signal()
             df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
             df["Momentum"] = df["Close"].diff(4)
+
+            # Replace infinities and NaNs
             df = df.replace([np.inf, -np.inf], np.nan).dropna()
 
-            # Add sentiment (simple price-based mood)
+            # Simple sentiment estimation based on returns
             df["Sentiment"] = np.where(df["Return"] > 0, 1, 0)
+
             return df
 
         except Exception as e:
             print(f"❌ Error fetching {symbol}: {e}")
             time.sleep(2 ** attempt)
+
     return pd.DataFrame()
 
 # ============================================================
-# MODEL TRAINING AND PREDICTION
+# MODEL TRAINING + PREDICTION
 # ============================================================
 
 def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium"):
-    """Train a model and return latest prediction, accuracy, and TP/SL."""
+    """Train a random forest model, return prediction + TP/SL."""
     if df.empty or len(df) < 50:
         return None
 
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES)
     df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
+
+    if df["Y"].nunique() < 2:
+        return None
+
     X = df[FEATURES]
     y = df["Y"]
-
-    if y.nunique() < 2:
-        return None
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, shuffle=False)
     clf = RandomForestClassifier(n_estimators=150, random_state=42)
     clf.fit(X_train, y_train)
+
     acc = accuracy_score(y_test, clf.predict(X_test))
 
     last = X.iloc[[-1]]
@@ -123,10 +142,10 @@ def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium
 
     return {
         "prediction": pred,
-        "probability": prob[1],
-        "accuracy": acc,
-        "tp": tp,
-        "sl": sl
+        "probability": float(prob[1]),
+        "accuracy": float(acc),
+        "tp": float(tp),
+        "sl": float(sl)
     }
 
 # ============================================================
@@ -134,28 +153,35 @@ def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium
 # ============================================================
 
 def summarize_assets():
-    """Run model across all assets and summarize results."""
+    """Fetch, train, and summarize across all assets."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
         try:
             df = fetch_data(symbol, interval="1h")
             if df.empty:
+                print(f"⚠️ No data for {asset}")
                 continue
+
             pred = train_and_predict(df, "1h", "Medium")
             if pred is None:
+                print(f"⚠️ No prediction for {asset}")
                 continue
+
             results.append({
                 "Asset": asset,
                 "Prediction": pred["prediction"],
-                "Probability": pred["probability"],
-                "Accuracy": pred["accuracy"] * 100,
-                "Take Profit": pred["tp"],
-                "Stop Loss": pred["sl"]
+                "Confidence": round(pred["probability"] * 100, 2),
+                "Accuracy": round(pred["accuracy"] * 100, 2),
+                "Take Profit": round(pred["tp"], 2),
+                "Stop Loss": round(pred["sl"], 2)
             })
+
         except Exception as e:
             print(f"⚠️ Error processing {asset}: {e}")
             continue
 
     if not results:
+        print("❌ No assets could be analyzed.")
         return pd.DataFrame()
+
     return pd.DataFrame(results)
