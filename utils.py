@@ -1,118 +1,161 @@
-# utils_fetch.py  -- drop into your utils module (replace your existing fetch_data)
+# ============================================================
+# WoodyTradesPro Utilities (Full Version)
+# ============================================================
 
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import time
-import os
-import json
-from pathlib import Path
-from typing import Optional
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import AverageTrueRange
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
-CACHE_DIR = Path(".yf_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# map intervals to max allowed period to avoid Yahoo errors
-INTERVAL_MAX_PERIOD = {
-    "1m": "7d",
-    "2m": "7d",
-    "5m": "60d",
-    "15m": "60d",
-    "30m": "60d",
-    "60m": "90d",  # usually OK
-    "90m": "90d",
-    "1h": "90d",
-    "1d": "max",   # daily can be long
-    "1wk": "max",
-    "1mo": "max"
+ASSET_SYMBOLS = {
+    "Gold": "GC=F",
+    "NASDAQ 100": "^NDX",
+    "S&P 500": "^GSPC",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "Crude Oil": "CL=F",
+    "Bitcoin": "BTC-USD"
 }
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex columns from yf.download when group_by or multiple tickers used."""
-    if isinstance(df.columns, pd.MultiIndex):
-        # if df came from yf.download with single ticker, columns might be ('Adj Close', '')
-        df.columns = ["_".join([str(i) for i in col if i and col is not None]).strip("_") for col in df.columns.values]
-        # attempt to rename common patterns back to standard
-        rename_map = {}
-        for c in df.columns:
-            low = c.lower()
-            if "open" in low:
-                rename_map[c] = "Open"
-            elif "high" in low:
-                rename_map[c] = "High"
-            elif "low" in low:
-                rename_map[c] = "Low"
-            elif "close" in low:
-                rename_map[c] = "Close"
-            elif "volume" in low:
-                rename_map[c] = "Volume"
-        df = df.rename(columns=rename_map)
-    return df
+RISK_MULT = {
+    "Low": 1.2,
+    "Medium": 1.5,
+    "High": 2.0
+}
 
-def _cache_path(symbol: str, interval: str, period: str):
-    name = f"{symbol.replace('/','_')}_{interval}_{period}.parquet"
-    return CACHE_DIR / name
+INTERVALS = {
+    "15m": {"period": "5d"},
+    "30m": {"period": "7d"},
+    "1h": {"period": "14d"},
+    "1d": {"period": "6mo"},
+    "1wk": {"period": "1y"}
+}
 
-def fetch_data(symbol: str, interval: str = "1h", period: Optional[str] = None, force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Robust fetch wrapper for yfinance with retries, period checking, caching, and fallbacks.
-    - symbol: ticker symbol for yfinance (e.g. 'GC=F')
-    - interval: '1m','15m','1h','1d', etc
-    - period: optional override like '60d','90d','max'. If None we pick a safe default.
-    """
-    # choose safe default period based on interval
+FEATURES = [
+    "Return", "MA_10", "MA_50", "RSI",
+    "MACD", "Signal_Line", "ATR", "Momentum", "Sentiment"
+]
+
+# ============================================================
+# FETCH DATA (Robust)
+# ============================================================
+
+def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retries: int = 3) -> pd.DataFrame:
+    """Download market data with retry and fallback handling."""
     if period is None:
-        maxp = INTERVAL_MAX_PERIOD.get(interval, "60d")
-        period = maxp if maxp != "max" else "5y"
+        period = INTERVALS.get(interval, {"period": "1mo"})["period"]
 
-    cache_file = _cache_path(symbol, interval, period)
-    if cache_file.exists() and not force_refresh:
+    for attempt in range(max_retries):
         try:
-            df = pd.read_parquet(cache_file)
-            return df
-        except Exception:
-            pass
-
-    # attempt several retries with backoff
-    last_exc = None
-    for attempt in range(4):
-        try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False, prepost=False, threads=False)
+            df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
             if df is None or df.empty:
-                raise ValueError("No data returned")
-            df = _normalize_columns(df)
+                raise ValueError("Empty data frame")
 
-            # ensure required columns exist
-            required = {"Open", "High", "Low", "Close"}
-            if not required.issubset(set(df.columns)):
-                # try a daily fallback (sometimes intraday not available)
-                if interval not in ("1d", "1wk", "1mo"):
-                    df2 = yf.download(symbol, period="5y", interval="1d", progress=False, prepost=False, threads=False)
-                    df2 = _normalize_columns(df2)
-                    if df2 is not None and not df2.empty:
-                        df = df2
-                    else:
-                        raise ValueError("Data missing core columns")
-                else:
-                    raise ValueError("Data missing core columns")
+            # Flatten MultiIndex if needed
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-            # compute simple indicators used by app so downstream code doesn't fail
-            if "Close" in df.columns:
-                df["MA_10"] = df["Close"].rolling(10, min_periods=1).mean()
-                df["MA_50"] = df["Close"].rolling(50, min_periods=1).mean()
+            # Basic cleanup
+            df = df.dropna().copy()
+            df["Return"] = df["Close"].pct_change()
+            df["MA_10"] = df["Close"].rolling(10).mean()
+            df["MA_50"] = df["Close"].rolling(50).mean()
+            df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
+            macd = MACD(df["Close"])
+            df["MACD"] = macd.macd()
+            df["Signal_Line"] = macd.macd_signal()
+            df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
+            df["Momentum"] = df["Close"].diff(4)
+            df = df.replace([np.inf, -np.inf], np.nan).dropna()
 
-            # persist cache
-            try:
-                df.to_parquet(cache_file)
-            except Exception:
-                pass
-
+            # Add sentiment (simple price-based mood)
+            df["Sentiment"] = np.where(df["Return"] > 0, 1, 0)
             return df
 
         except Exception as e:
-            last_exc = e
-            wait = (2 ** attempt) * 0.5
-            time.sleep(wait)
+            print(f"❌ Error fetching {symbol}: {e}")
+            time.sleep(2 ** attempt)
+    return pd.DataFrame()
+
+# ============================================================
+# MODEL TRAINING AND PREDICTION
+# ============================================================
+
+def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium"):
+    """Train a model and return latest prediction, accuracy, and TP/SL."""
+    if df.empty or len(df) < 50:
+        return None
+
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES)
+    df["Y"] = np.where(df["Return"].shift(-1) > 0, 1, 0)
+    X = df[FEATURES]
+    y = df["Y"]
+
+    if y.nunique() < 2:
+        return None
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, shuffle=False)
+    clf = RandomForestClassifier(n_estimators=150, random_state=42)
+    clf.fit(X_train, y_train)
+    acc = accuracy_score(y_test, clf.predict(X_test))
+
+    last = X.iloc[[-1]]
+    prob = clf.predict_proba(last)[0]
+    pred = "BUY" if prob[1] > 0.55 else "SELL" if prob[1] < 0.45 else "HOLD"
+
+    close = df["Close"].iloc[-1]
+    atr = df["ATR"].iloc[-1]
+    risk_mult = RISK_MULT.get(risk, 1.5)
+    tp = close + (atr * risk_mult if pred == "BUY" else -atr * risk_mult)
+    sl = close - (atr * risk_mult if pred == "BUY" else -atr * risk_mult)
+
+    return {
+        "prediction": pred,
+        "probability": prob[1],
+        "accuracy": acc,
+        "tp": tp,
+        "sl": sl
+    }
+
+# ============================================================
+# SUMMARY FOR OVERVIEW TAB
+# ============================================================
+
+def summarize_assets():
+    """Run model across all assets and summarize results."""
+    results = []
+    for asset, symbol in ASSET_SYMBOLS.items():
+        try:
+            df = fetch_data(symbol, interval="1h")
+            if df.empty:
+                continue
+            pred = train_and_predict(df, "1h", "Medium")
+            if pred is None:
+                continue
+            results.append({
+                "Asset": asset,
+                "Prediction": pred["prediction"],
+                "Probability": pred["probability"],
+                "Accuracy": pred["accuracy"] * 100,
+                "Take Profit": pred["tp"],
+                "Stop Loss": pred["sl"]
+            })
+        except Exception as e:
+            print(f"⚠️ Error processing {asset}: {e}")
             continue
 
-    # all retries failed: raise a helpful error
-    raise RuntimeError(f"Failed to fetch {symbol} (interval={interval}, period={period}): {last_exc}")
+    if not results:
+        return pd.DataFrame()
+    return pd.DataFrame(results)
