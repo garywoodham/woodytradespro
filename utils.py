@@ -10,7 +10,6 @@ import time
 import random
 import requests
 
-
 # ───────────────────────────────
 # CONFIGURATION
 # ───────────────────────────────
@@ -36,12 +35,13 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
     """Fetch market data with retry + flatten to avoid 2D array issues."""
 
     def _flatten_cols(df):
-        # force all columns into 1D numeric arrays
         for c in df.columns:
-            vals = df[c]
-            if isinstance(vals.iloc[0], (list, np.ndarray)):
-                df[c] = [float(v[0]) if isinstance(v, (list, np.ndarray)) else float(v) for v in vals]
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            s = df[c]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            if isinstance(s.iloc[0], (list, np.ndarray)):
+                s = s.apply(lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x))
+            df[c] = pd.to_numeric(s, errors="coerce")
         return df
 
     for attempt in range(1, retries + 1):
@@ -100,25 +100,36 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
 
 
 # ───────────────────────────────
-# ADD TECHNICAL INDICATORS
+# ADD TECHNICAL INDICATORS (1-D Safe)
 # ───────────────────────────────
 def add_indicators(df):
     df = df.copy()
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Flatten any (n,1) columns or list cells
+    for col in df.columns:
+        s = df[col]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        if isinstance(s.iloc[0], (list, np.ndarray)):
+            s = s.apply(lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x))
+        df[col] = pd.to_numeric(s, errors="coerce")
+
     df.dropna(inplace=True)
+    if df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
 
-    # Indicators
-    df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
-    df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
-    df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
+    close = pd.to_numeric(df["Close"], errors="coerce").astype(float)
 
-    macd = MACD(df["Close"])
+    # All indicator inputs explicitly 1-D Series
+    df["EMA_20"] = EMAIndicator(close, window=20).ema_indicator()
+    df["EMA_50"] = EMAIndicator(close, window=50).ema_indicator()
+    df["RSI"] = RSIIndicator(close, window=14).rsi()
+
+    macd = MACD(close)
     df["MACD"] = macd.macd()
     df["Signal_Line"] = macd.macd_signal()
 
-    bb = BollingerBands(df["Close"])
+    bb = BollingerBands(close)
     df["BB_High"] = bb.bollinger_hband()
     df["BB_Low"] = bb.bollinger_lband()
 
