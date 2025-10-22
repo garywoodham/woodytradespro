@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+import streamlit as st
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
@@ -10,7 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
 # ───────────────────────────────
-# Global Config
+# Global Configuration
 # ───────────────────────────────
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
@@ -29,21 +30,15 @@ INTERVALS = {
     "1d": {"interval": "1d", "period": "6mo"},
 }
 
-RISK_MULT = {
-    "Low": 0.5,
-    "Medium": 1.0,
-    "High": 1.5,
-}
+RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
 
 FEATURES = ["rsi", "macd", "bb_width", "returns"]
 
 # ───────────────────────────────
-# Fetching Market Data
+# Fetch Market Data (with timeout)
 # ───────────────────────────────
 def fetch_data(symbol, interval="1h", period="1mo", max_retries=3):
-    """
-    Download and preprocess market data with retry and timeout logic.
-    """
+    """Download and preprocess market data with timeout, retries, and sanitization."""
     print(f"📊 Fetching {symbol} [{interval}] for {period}...")
     df = pd.DataFrame()
 
@@ -56,18 +51,18 @@ def fetch_data(symbol, interval="1h", period="1mo", max_retries=3):
                 progress=False,
                 threads=False,
                 auto_adjust=False,
-                timeout=10  # prevent hang
+                timeout=10  # Explicit timeout to prevent hanging
             )
 
             if df.empty:
                 raise ValueError("Empty data returned")
 
-            # Fix for 2D array data bug (yfinance 0.2.66+)
+            # Fix for 2D array bug
             for c in df.columns:
                 if isinstance(df[c].iloc[0], (list, np.ndarray)):
                     df[c] = df[c].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
 
-            # Indicators
+            # Technical indicators
             df["rsi"] = RSIIndicator(df["Close"]).rsi()
             macd = MACD(df["Close"])
             df["macd"] = macd.macd()
@@ -89,15 +84,14 @@ def fetch_data(symbol, interval="1h", period="1mo", max_retries=3):
             else:
                 print(f"🚫 Skipping {symbol} after {max_retries} failed attempts.")
                 return pd.DataFrame()
-
     return df
 
 
 # ───────────────────────────────
-# Train Model + Predict
+# Machine Learning Model
 # ───────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train RandomForest and predict direction, accuracy, TP, SL."""
+    """Train RandomForest on indicators and predict direction."""
     if df.empty:
         return None
 
@@ -138,12 +132,20 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 
 
 # ───────────────────────────────
-# Summary for Dashboard
+# Summary (with progress display)
 # ───────────────────────────────
 def summarize_assets():
-    """Fetch all assets and return summary DataFrame."""
+    """Fetch and analyze all assets with progress bar in Streamlit."""
     results = []
-    for asset, symbol in ASSET_SYMBOLS.items():
+    total_assets = len(ASSET_SYMBOLS)
+
+    progress = st.progress(0)
+    status_text = st.empty()
+
+    for idx, (asset, symbol) in enumerate(ASSET_SYMBOLS.items(), start=1):
+        status_text.markdown(f"🔍 **Fetching and analyzing:** `{asset}` ({idx}/{total_assets}) …")
+        progress.progress(idx / total_assets)
+
         try:
             df = fetch_data(symbol, "1h", "1mo")
             if df.empty:
@@ -162,17 +164,21 @@ def summarize_assets():
                 "TP": round(pred["tp"], 2),
                 "SL": round(pred["sl"], 2),
             })
+
         except Exception as e:
             print(f"Error processing {asset}: {e}")
+
+    progress.progress(1.0)
+    status_text.markdown("✅ **Analysis complete!**")
 
     return pd.DataFrame(results)
 
 
 # ───────────────────────────────
-# Backtesting (for Scenarios)
+# Backtesting for Win Rate + Return
 # ───────────────────────────────
 def backtest_signals(df, pred):
-    """Estimate Win Rate & Total Return via simple simulated trades."""
+    """Estimate Win Rate & Total Return based on predicted trade."""
     if df is None or df.empty or not isinstance(pred, dict):
         return {"winrate": 0.0, "total_return": 0.0, "equity_curve": pd.Series(dtype=float)}
 
@@ -186,12 +192,10 @@ def backtest_signals(df, pred):
     direction = pred.get("prediction", "").lower()
 
     equity = [1.0]
-    wins = 0
-    losses = 0
+    wins, losses = 0, 0
 
     for i in range(1, len(close)):
-        prev = close[i - 1]
-        price = close[i]
+        prev, price = close[i - 1], close[i]
 
         if direction == "buy":
             if price >= tp:
