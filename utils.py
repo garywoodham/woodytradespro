@@ -9,9 +9,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# ────────────────────────────────
-# Configuration
-# ────────────────────────────────
+# ───────────────────────────────
+# Global Config
+# ───────────────────────────────
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
@@ -37,29 +37,32 @@ RISK_MULT = {
 
 FEATURES = ["rsi", "macd", "bb_width", "returns"]
 
-# ────────────────────────────────
-# Data Fetcher
-# ────────────────────────────────
-def fetch_data(symbol, interval="1h", period="1mo", max_retries=4):
-    """Download and preprocess market data with retry logic."""
+# ───────────────────────────────
+# Fetching Market Data
+# ───────────────────────────────
+def fetch_data(symbol, interval="1h", period="1mo", max_retries=3):
+    """
+    Download and preprocess market data with retry and timeout logic.
+    """
     print(f"📊 Fetching {symbol} [{interval}] for {period}...")
     df = pd.DataFrame()
 
     for attempt in range(1, max_retries + 1):
         try:
-            raw = yf.download(
+            df = yf.download(
                 symbol,
                 period=period,
                 interval=interval,
                 progress=False,
                 threads=False,
                 auto_adjust=False,
+                timeout=10  # prevent hang
             )
-            if raw.empty:
-                raise ValueError("Empty data")
 
-            df = raw.copy()
-            # Fix potential 2D columns from new yfinance
+            if df.empty:
+                raise ValueError("Empty data returned")
+
+            # Fix for 2D array data bug (yfinance 0.2.66+)
             for c in df.columns:
                 if isinstance(df[c].iloc[0], (list, np.ndarray)):
                     df[c] = df[c].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
@@ -74,26 +77,27 @@ def fetch_data(symbol, interval="1h", period="1mo", max_retries=4):
             df["volatility"] = df["returns"].rolling(20).std()
             df.dropna(inplace=True)
 
-            print(f"✅ Data fetched successfully for {symbol} ({len(df)} rows)")
+            print(f"✅ Success: {symbol} ({len(df)} rows)")
             return df
 
         except Exception as e:
-            print(f"❌ Error fetching {symbol}: {e}")
+            print(f"⚠️ Attempt {attempt}/{max_retries} failed for {symbol}: {e}")
             if attempt < max_retries:
-                wait = 3 + attempt * np.random.uniform(1.2, 2.5)
-                print(f"⏳ Waiting {wait:.1f}s before retry...")
+                wait = 2 + np.random.uniform(0.5, 2.5)
+                print(f"⏳ Retrying in {wait:.1f}s...")
                 time.sleep(wait)
             else:
-                print(f"🚫 All attempts failed for {symbol}, returning empty DataFrame.")
+                print(f"🚫 Skipping {symbol} after {max_retries} failed attempts.")
                 return pd.DataFrame()
+
     return df
 
 
-# ────────────────────────────────
-# Model Training / Prediction
-# ────────────────────────────────
+# ───────────────────────────────
+# Train Model + Predict
+# ───────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train quick RandomForest model and output predicted direction, TP, SL, accuracy."""
+    """Train RandomForest and predict direction, accuracy, TP, SL."""
     if df.empty:
         return None
 
@@ -108,18 +112,20 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
         clf = RandomForestClassifier(n_estimators=100, random_state=42)
         clf.fit(X_train, y_train)
+
         preds = clf.predict(X_test)
         acc = accuracy_score(y_test, preds)
         prob = clf.predict_proba([X.iloc[-1]])[0][1]
 
-        pred_dir = "Buy" if prob > 0.5 else "Sell"
+        direction = "Buy" if prob > 0.5 else "Sell"
         last_price = df["Close"].iloc[-1]
         mult = RISK_MULT.get(risk, 1.0)
-        tp = last_price * (1 + 0.01 * mult) if pred_dir == "Buy" else last_price * (1 - 0.01 * mult)
-        sl = last_price * (1 - 0.005 * mult) if pred_dir == "Buy" else last_price * (1 + 0.005 * mult)
+
+        tp = last_price * (1 + 0.01 * mult) if direction == "Buy" else last_price * (1 - 0.01 * mult)
+        sl = last_price * (1 - 0.005 * mult) if direction == "Buy" else last_price * (1 + 0.005 * mult)
 
         return {
-            "prediction": pred_dir,
+            "prediction": direction,
             "probability": float(prob),
             "accuracy": float(acc),
             "tp": float(tp),
@@ -131,11 +137,11 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         return None
 
 
-# ────────────────────────────────
-# Asset Summary
-# ────────────────────────────────
+# ───────────────────────────────
+# Summary for Dashboard
+# ───────────────────────────────
 def summarize_assets():
-    """Fetch all assets and return prediction summary table."""
+    """Fetch all assets and return summary DataFrame."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
         try:
@@ -157,18 +163,16 @@ def summarize_assets():
                 "SL": round(pred["sl"], 2),
             })
         except Exception as e:
-            print(f"Error summarizing {asset}: {e}")
+            print(f"Error processing {asset}: {e}")
 
     return pd.DataFrame(results)
 
 
-# ────────────────────────────────
-# Backtest for Win Rate / Returns
-# ────────────────────────────────
+# ───────────────────────────────
+# Backtesting (for Scenarios)
+# ───────────────────────────────
 def backtest_signals(df, pred):
-    """
-    Simulate simple trade backtest to estimate win rate and total return.
-    """
+    """Estimate Win Rate & Total Return via simple simulated trades."""
     if df is None or df.empty or not isinstance(pred, dict):
         return {"winrate": 0.0, "total_return": 0.0, "equity_curve": pd.Series(dtype=float)}
 
@@ -184,7 +188,6 @@ def backtest_signals(df, pred):
     equity = [1.0]
     wins = 0
     losses = 0
-    trade_returns = []
 
     for i in range(1, len(close)):
         prev = close[i - 1]
@@ -211,7 +214,6 @@ def backtest_signals(df, pred):
         else:
             r = 0
 
-        trade_returns.append(r)
         equity.append(equity[-1] * (1 + r))
 
     total_trades = max(wins + losses, 1)
