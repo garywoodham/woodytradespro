@@ -1,77 +1,66 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# tab_overview.py — Dashboard summary tab for WoodyTrades Pro
-# Shows per-asset summary: prediction, TP/SL, probability, model accuracy
-# ─────────────────────────────────────────────────────────────────────────────
-
 import streamlit as st
-import pandas as pd
+import plotly.graph_objects as go
 import utils
+import pandas as pd
 
 def render_overview():
-    st.title("📈 Market Overview")
-    st.caption("Live multi-asset predictions with machine learning and sentiment-enhanced indicators.")
+    """Dashboard Overview — asset summary and market snapshot."""
+    st.title("📊 Market Overview")
+    st.caption("AI-driven multi-asset summary with prediction accuracy and trade recommendations.")
 
-    # Sidebar risk selection
-    risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()), index=1)
+    # Risk selector (affects TP/SL levels)
+    risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()))
 
-    # Display loading message
-    st.info("Fetching live market data and running model predictions...")
+    results_df = utils.summarize_assets()
 
-    # Summary table container
-    results = []
-    charts = []
+    if results_df.empty:
+        st.warning("⚠️ No assets could be analyzed. Check your internet connection or data source.")
+        return
 
-    for asset, symbol in utils.ASSET_SYMBOLS.items():
-        try:
-            df = utils.fetch_data(symbol, "1h")
-            if df.empty:
-                st.warning(f"No data available for {asset}")
-                continue
+    st.subheader("Asset Summary")
+    st.dataframe(
+        results_df.style.format({
+            "Probability": "{:.2%}",
+            "Accuracy": "{:.2f}%",
+            "Take Profit": "{:.2f}",
+            "Stop Loss": "{:.2f}"
+        })
+        .background_gradient(cmap="RdYlGn", subset=["Accuracy"])
+    )
 
-            X, clf, pred = utils.train_and_predict(df, "1h", risk=risk)
-            if pred is None:
-                st.warning(f"Model could not generate prediction for {asset}.")
-                continue
+    # Display key insights
+    avg_acc = results_df["Accuracy"].mean()
+    buys = (results_df["Prediction"] == "BUY").sum()
+    sells = (results_df["Prediction"] == "SELL").sum()
+    holds = (results_df["Prediction"] == "HOLD").sum()
 
-            # Build summary
-            results.append({
-                "Asset": asset,
-                "Signal": pred["signal"],
-                "Probability": f"{pred['prob']*100:.2f}%",
-                "Risk": pred["risk"],
-                "TP": f"{pred['tp']:.2f}" if pred["tp"] else "—",
-                "SL": f"{pred['sl']:.2f}" if pred["sl"] else "—",
-                "Accuracy": f"{pred['accuracy']*100:.2f}%" if pred["accuracy"] else "—",
-            })
+    st.markdown("### 🔍 Summary Insights")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Avg Model Accuracy", f"{avg_acc:.2f}%")
+    col2.metric("Buy Signals", buys)
+    col3.metric("Sell Signals", sells)
+    col4.metric("Hold Signals", holds)
 
-            # Create candlestick chart for each asset
-            fig = utils.make_candles(
-                df,
-                title=f"{asset} — {pred['signal']} | Prob: {pred['prob']*100:.2f}% | Acc: {pred['accuracy']*100:.1f}%",
-                tp=pred["tp"], sl=pred["sl"]
-            )
-            charts.append((asset, fig))
+    # Accuracy distribution chart
+    st.markdown("### 🎯 Model Accuracy by Asset")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=results_df["Asset"],
+        y=results_df["Accuracy"],
+        marker_color="green"
+    ))
+    fig.update_layout(
+        xaxis_title="Asset",
+        yaxis_title="Model Accuracy (%)",
+        template="plotly_dark",
+        height=400
+    )
+    st.plotly_chart(fig, width="stretch")
 
-        except Exception as e:
-            st.error(f"⚠️ Error processing {asset}: {e}")
-
-    # Display summary dataframe
-    if results:
-        df_summary = pd.DataFrame(results)
-        df_summary = df_summary.sort_values(by="Asset").reset_index(drop=True)
-
-        # Compute overall average accuracy
-        valid_acc = [float(r["Accuracy"].replace('%','')) for r in results if r["Accuracy"] != "—"]
-        avg_acc = sum(valid_acc)/len(valid_acc) if valid_acc else 0
-
-        st.subheader("📊 Prediction Summary")
-        st.dataframe(df_summary, use_container_width=True)
-        st.success(f"📈 **Overall Model Accuracy:** {avg_acc:.2f}%")
-
-        # Display each chart in expanders
-        for asset, fig in charts:
-            with st.expander(f"🕹 {asset} — Click to view chart"):
-                st.plotly_chart(fig, use_container_width=True)
-
-    else:
-        st.warning("No assets could be analyzed at this time. Please check your internet connection or try again later.")
+    st.info(
+        "✅ **Interpretation Guide:**\n\n"
+        "- **Prediction** shows AI’s suggested trade action.\n"
+        "- **Probability** indicates confidence in that signal.\n"
+        "- **Accuracy** reflects backtested historical precision.\n"
+        "- **TP/SL** give dynamic take-profit and stop-loss levels based on risk level."
+    )
