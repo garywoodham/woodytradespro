@@ -1,48 +1,48 @@
 import streamlit as st
+import pandas as pd
 import utils
-import plotly.express as px
+import plotly.graph_objects as go
 
 def render_overview():
     st.title("📊 Market Overview")
-    st.caption("AI-driven multi-asset summary with prediction accuracy, probability, and performance insights.")
+    st.caption("AI-driven multi-asset overview — predictions, probabilities, and accuracy for all tracked instruments.")
 
-    # Risk selector (affects TP/SL levels)
     risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()))
+    st.divider()
 
-    # Fetch and summarize results
+    st.info("Fetching and analyzing market data... please wait ⏳")
     results_df = utils.summarize_assets()
 
     if results_df.empty:
-        st.warning("No assets could be analyzed. Check your internet connection or data source.")
+        st.error("No assets could be analyzed. Please check your internet connection or data source.")
         return
 
-    # Display data table
-    st.dataframe(results_df, use_container_width=True)
+    st.subheader("📈 Model Output Summary")
+    st.dataframe(results_df, width="stretch")
 
-    # Visualization: Confidence per asset
-    fig_conf = px.bar(
-        results_df,
-        x="Asset",
-        y="Confidence",
-        color="Prediction",
-        title="📈 Prediction Confidence by Asset",
-        text="Confidence",
-        height=450
+    # Plot confidence bar chart
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=results_df["Asset"],
+        y=results_df["Confidence"],
+        name="Confidence %",
+        marker_color="steelblue"
+    ))
+    fig.add_trace(go.Bar(
+        x=results_df["Asset"],
+        y=results_df["Accuracy"],
+        name="Accuracy %",
+        marker_color="lightgreen"
+    ))
+
+    fig.update_layout(
+        title="Confidence vs Accuracy by Asset",
+        barmode="group",
+        xaxis_title="Asset",
+        yaxis_title="Percentage (%)",
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
     )
-    st.plotly_chart(fig_conf, width="stretch")
 
-    # Visualization: Accuracy
-    fig_acc = px.bar(
-        results_df,
-        x="Asset",
-        y="Accuracy",
-        color="Prediction",
-        title="🎯 Model Accuracy by Asset",
-        text="Accuracy",
-        height=450
-    )
-    st.plotly_chart(fig_acc, width="stretch")
-
-    # Overall average accuracy
-    avg_acc = results_df["Accuracy"].mean()
-    st.metric("📊 Overall Model Accuracy", f"{avg_acc:.2f}%")
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    st.success("✅ Overview analysis complete.")
