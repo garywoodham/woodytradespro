@@ -2,17 +2,16 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import streamlit as st
-import time
-import random
+import time, random
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import ta
 
-# ----------------------------------------------------------------------
-# CONFIGURATION
-# ----------------------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
@@ -22,36 +21,27 @@ ASSET_SYMBOLS = {
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "JPY=X",
     "Crude Oil": "CL=F",
-    "Bitcoin": "BTC-USD"
+    "Bitcoin": "BTC-USD",
 }
 
 INTERVALS = {
     "15m": {"period": "5d"},
     "1h": {"period": "1mo"},
-    "1d": {"period": "6mo"}
+    "1d": {"period": "6mo"},
 }
 
-RISK_MULT = {
-    "Low": 0.5,
-    "Medium": 1.0,
-    "High": 1.5
-}
+RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
+FEATURES = ["return", "volatility", "rsi", "macd", "sentiment"]
 
-FEATURES = [
-    "return", "volatility", "rsi", "macd", "sentiment"
-]
-
-# For caching and sentiment analysis
 CACHE_DATA = {}
 analyzer = SentimentIntensityAnalyzer()
 
-# ----------------------------------------------------------------------
-# FETCH MARKET DATA (with retry + cache fallback)
-# ----------------------------------------------------------------------
+# ============================================================
+# FETCH DATA (robust with shape fix + fallback cache)
+# ============================================================
 
 @st.cache_data(show_spinner=False)
 def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retries: int = 4) -> pd.DataFrame:
-    """Fetch market data from Yahoo Finance with retry, backoff, and cache fallback."""
     if period is None:
         period = INTERVALS.get(interval, {"period": "1mo"})["period"]
 
@@ -65,23 +55,30 @@ def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retrie
                 progress=False,
                 threads=False,
                 auto_adjust=True,
-                timeout=30
+                timeout=30,
             )
 
             if df is None or df.empty:
                 raise ValueError("Empty dataframe returned")
 
+            # ---- FIX FOR yfinance ndarray bug ----
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+
+            # Ensure Close etc are 1-D numpy arrays, not (N,1)
+            for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                if col in df.columns and isinstance(df[col].iloc[0], (np.ndarray, list)):
+                    df[col] = df[col].astype(float).squeeze()
+
             df.dropna(inplace=True)
-            df["return"] = df["Close"].pct_change()
+            df["return"] = pd.Series(df["Close"]).pct_change()
             df["volatility"] = df["return"].rolling(10).std()
             df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
             df["macd"] = ta.trend.MACD(df["Close"]).macd()
-
-            # Sentiment proxy (you can extend this with news or social feed)
             df["sentiment"] = np.where(df["return"] > 0, 1, -1)
 
             df.dropna(inplace=True)
-            CACHE_DATA[symbol] = df  # ✅ Save to cache memory
+            CACHE_DATA[symbol] = df
             return df
 
         except Exception as e:
@@ -90,20 +87,18 @@ def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retrie
             print(f"⏳ Waiting {wait:.1f}s before retry...")
             time.sleep(wait)
 
-    # fallback if all attempts fail
     if symbol in CACHE_DATA:
-        print(f"⚠️ Using cached data for {symbol} (last successful fetch).")
+        print(f"⚠️ Using cached data for {symbol}")
         return CACHE_DATA[symbol]
 
-    print(f"🚫 All attempts failed for {symbol}, returning empty DataFrame.")
+    print(f"🚫 All attempts failed for {symbol}")
     return pd.DataFrame()
 
-# ----------------------------------------------------------------------
-# MODEL TRAINING AND PREDICTION
-# ----------------------------------------------------------------------
+# ============================================================
+# TRAIN + PREDICT
+# ============================================================
 
 def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium") -> dict:
-    """Train RandomForest model and predict direction with TP/SL."""
     try:
         df = df.copy()
         df["Y"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
@@ -112,10 +107,11 @@ def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium
         X = df[FEATURES]
         y = df["Y"]
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, shuffle=False)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, shuffle=False
+        )
         clf = RandomForestClassifier(n_estimators=120, random_state=42)
         clf.fit(X_train, y_train)
-
         y_pred = clf.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
 
@@ -138,53 +134,48 @@ def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium
             "probability": float(prob[1]),
             "accuracy": float(acc),
             "tp": float(tp),
-            "sl": float(sl)
+            "sl": float(sl),
         }
 
     except Exception as e:
         print(f"⚠️ Error in training/prediction: {e}")
         return {}
 
-# ----------------------------------------------------------------------
-# MULTI-ASSET SUMMARY
-# ----------------------------------------------------------------------
+# ============================================================
+# SUMMARY ACROSS ASSETS
+# ============================================================
 
 def summarize_assets() -> pd.DataFrame:
-    """Loop through all assets, predict, and summarize results."""
     results = []
-
     for asset, symbol in ASSET_SYMBOLS.items():
         df = fetch_data(symbol, interval="1h")
         if df.empty:
             print(f"No data available for {asset}")
             continue
-
         pred = train_and_predict(df)
         if not pred:
             print(f"Error processing {asset}")
             continue
-
-        results.append({
-            "Asset": asset,
-            "Prediction": pred["prediction"],
-            "Confidence": round(pred["probability"] * 100, 2),
-            "Accuracy": round(pred["accuracy"] * 100, 2),
-            "TP": round(pred["tp"], 2),
-            "SL": round(pred["sl"], 2)
-        })
-
-    if len(results) == 0:
-        print("🚫 No assets could be analyzed. Check data source or connection.")
+        results.append(
+            {
+                "Asset": asset,
+                "Prediction": pred["prediction"],
+                "Confidence": round(pred["probability"] * 100, 2),
+                "Accuracy": round(pred["accuracy"] * 100, 2),
+                "TP": round(pred["tp"], 2),
+                "SL": round(pred["sl"], 2),
+            }
+        )
+    if not results:
+        print("🚫 No assets could be analyzed.")
         return pd.DataFrame()
-
     return pd.DataFrame(results)
 
-# ----------------------------------------------------------------------
-# HELPER: CLEAN DATAFRAME
-# ----------------------------------------------------------------------
+# ============================================================
+# CLEAN HELPER
+# ============================================================
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove inf and NaN values."""
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna()
     return df
