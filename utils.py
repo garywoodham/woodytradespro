@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import streamlit as st
 from sklearn.ensemble import RandomForestClassifier
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
@@ -43,16 +44,13 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
             )
 
             if not df.empty:
-                # 🩹 Fix 2D columns to 1D float
                 for col in df.columns:
                     df[col] = df[col].apply(
                         lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
                     )
-
                 df.dropna(subset=["Close"], inplace=True)
                 if len(df) >= 20:
                     df["Return"] = df["Close"].pct_change()
-                    print(f"✅ Data fetched for {symbol} ({len(df)} rows)")
                     return df
 
             print(f"⚠️ Empty or insufficient data for {symbol} (Attempt {attempt})")
@@ -62,9 +60,8 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
             print(f"❌ Error fetching {symbol}: {e}")
             time.sleep(delay + random.random() * 2)
 
-    # 🔁 Fallback fetch
     try:
-        print(f"🔁 Trying fallback fetch for {symbol} using {fallback_period}...")
+        print(f"🔁 Fallback fetch for {symbol} using {fallback_period}...")
         df = yf.download(
             symbol,
             period=fallback_period,
@@ -80,10 +77,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
                 )
             df.dropna(subset=["Close"], inplace=True)
             df["Return"] = df["Close"].pct_change()
-            print(f"✅ Fallback succeeded for {symbol} ({len(df)} rows)")
             return df
-        else:
-            print(f"🚫 Fallback returned no data for {symbol}")
     except Exception as e:
         print(f"🚫 Fallback failed for {symbol}: {e}")
 
@@ -195,22 +189,34 @@ def backtest_signals(df, pred):
 
 
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY (Resilient + Failsafe)
+# MULTI-ASSET SUMMARY (Visible Progress)
 # ───────────────────────────────
 def summarize_assets():
     results = []
-    for asset, symbol in ASSET_SYMBOLS.items():
-        print(f"\n📈 Processing {asset} ({symbol})...")
-        df = fetch_data(symbol, "1h", "1mo")
+    progress = st.progress(0)
+    status = st.empty()
+    total = len(ASSET_SYMBOLS)
+    processed = 0
 
+    status_text = ""
+
+    for asset, symbol in ASSET_SYMBOLS.items():
+        processed += 1
+        status_text += f"⏳ Fetching **{asset}** ({symbol})...\n"
+        status.markdown(status_text)
+        progress.progress(processed / total)
+
+        df = fetch_data(symbol, "1h", "1mo")
         if df.empty:
-            print(f"⚠️ No data for {asset}, skipping.")
+            status_text += f"⚠️ No data for **{asset}**, skipped.\n"
+            status.markdown(status_text)
             continue
 
         try:
             pred = train_and_predict(df)
             if not pred:
-                print(f"⚠️ No prediction for {asset}.")
+                status_text += f"⚠️ Could not generate prediction for **{asset}**.\n"
+                status.markdown(status_text)
                 continue
 
             back = backtest_signals(df, pred)
@@ -221,16 +227,23 @@ def summarize_assets():
                 "Win Rate": round(back["winrate"] * 100, 2),
                 "Return": round(back["total_return"] * 100, 2),
             })
-            print(f"✅ {asset} analyzed successfully.")
+            status_text += f"✅ **{asset}** analyzed successfully.\n"
+            status.markdown(status_text)
 
         except Exception as e:
-            print(f"⚠️ Error analyzing {asset}: {e}")
+            status_text += f"❌ Error analyzing **{asset}**: {e}\n"
+            status.markdown(status_text)
 
-    # 🔒 Failsafe placeholder fix — prevents Streamlit “freeze” or empty crash
+        time.sleep(0.5)
+
     if not results:
-        print("🚫 No valid data fetched. Returning placeholder.")
+        status_text += "\n🚫 No valid data fetched for any asset — showing placeholder."
+        status.markdown(status_text)
         return pd.DataFrame([
             {"Asset": "No Data", "Prediction": "neutral", "Confidence": 0.0, "Win Rate": 0.0, "Return": 0.0}
         ])
 
+    status_text += "\n🎉 Analysis complete!"
+    status.markdown(status_text)
+    progress.progress(1.0)
     return pd.DataFrame(results)
