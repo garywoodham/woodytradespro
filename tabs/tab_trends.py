@@ -1,49 +1,47 @@
 import streamlit as st
-import pandas as pd
 import utils
+import plotly.graph_objects as go
 
 def render_trends():
-    st.title("📊 Market Trends")
-    st.caption("Trend strength, sentiment direction, and trading opportunities based on recent model predictions.")
+    st.title("📉 Market Technical Trends")
+    st.caption("Track RSI, MACD, and volatility to gauge market momentum and potential reversals.")
 
-    risk = st.sidebar.radio("Select Risk Level", list(utils.RISK_MULT.keys()), index=1)
-    interval = st.sidebar.selectbox("Select Interval", list(utils.INTERVALS.keys()), index=1)
+    asset = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()))
+    interval = st.selectbox("Select Interval", list(utils.INTERVALS.keys()))
 
-    trend_data = []
-    for asset, symbol in utils.ASSET_SYMBOLS.items():
-        try:
-            df = utils.fetch_data(symbol, interval)
-            if df.empty:
-                continue
+    symbol = utils.ASSET_SYMBOLS[asset]
+    df = utils.fetch_data(symbol, interval=interval)
 
-            X, clf, pred = utils.train_and_predict(df, interval, risk)
-            if pred is None:
-                continue
-
-            trend = df["Close"].pct_change(10).iloc[-1] * 100
-            trend_data.append({
-                "Asset": asset,
-                "Signal": pred["signal"],
-                "Trend (%)": f"{trend:.2f}",
-                "Probability": f"{pred['prob']*100:.2f}%",
-                "Risk": pred["risk"],
-                "TP": f"{pred['tp']:.2f}" if pred["tp"] else "—",
-                "SL": f"{pred['sl']:.2f}" if pred["sl"] else "—",
-                "Accuracy": f"{pred['accuracy']*100:.2f}%" if pred["accuracy"] else "—"
-            })
-        except Exception as e:
-            st.error(f"Error for {asset}: {e}")
-
-    if not trend_data:
-        st.warning("No trend data available right now.")
+    if df.empty:
+        st.warning(f"No data available for {asset}")
         return
 
-    df_trend = pd.DataFrame(trend_data)
-    st.dataframe(df_trend.style
-        .background_gradient(subset=["Trend (%)"], cmap="RdYlGn")
-        .apply(lambda x: ["background-color:#00ff80" if v == "BUY"
-                          else "background-color:#ff6666" if v == "SELL"
-                          else "" for v in x], subset=["Signal"]),
-        use_container_width=True)
+    st.subheader(f"Technical Indicators — {asset}")
 
-    st.info("✅ Tip: Green indicates strong positive trends; red shows weakening momentum.")
+    # --- Price Chart ---
+    fig_price = go.Figure()
+    fig_price.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Close Price"))
+    fig_price.update_layout(title=f"{asset} Price", height=400, template="plotly_white")
+    st.plotly_chart(fig_price, width="stretch", config={"displayModeBar": False})
+
+    # --- RSI ---
+    fig_rsi = go.Figure()
+    fig_rsi.add_trace(go.Scatter(x=df.index, y=df["rsi"], mode="lines", name="RSI", line=dict(color="orange")))
+    fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"))
+    fig_rsi.add_hline(y=30, line=dict(color="green", dash="dash"))
+    fig_rsi.update_layout(title="RSI (Relative Strength Index)", height=300, template="plotly_white")
+    st.plotly_chart(fig_rsi, width="stretch", config={"displayModeBar": False})
+
+    # --- MACD ---
+    fig_macd = go.Figure()
+    fig_macd.add_trace(go.Scatter(x=df.index, y=df["macd"], mode="lines", name="MACD", line=dict(color="blue")))
+    fig_macd.update_layout(title="MACD Indicator", height=300, template="plotly_white")
+    st.plotly_chart(fig_macd, width="stretch", config={"displayModeBar": False})
+
+    # --- Volatility ---
+    fig_vol = go.Figure()
+    fig_vol.add_trace(go.Scatter(x=df.index, y=df["volatility"], mode="lines", name="Volatility", line=dict(color="purple")))
+    fig_vol.update_layout(title="Rolling Volatility", height=300, template="plotly_white")
+    st.plotly_chart(fig_vol, width="stretch", config={"displayModeBar": False})
+
+    st.caption("Indicators auto-update based on interval and asset selection.")
