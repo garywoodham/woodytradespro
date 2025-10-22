@@ -28,17 +28,13 @@ INTERVALS = {
     "1d": {"interval": "1d", "period": "6mo"},
 }
 
-RISK_MULT = {
-    "Low": 0.5,
-    "Medium": 1.0,
-    "High": 1.8
-}
+RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
 # ───────────────────────────────
-# FETCH DATA (with fixes for YFinance)
+# FETCH DATA (with 1D fix + retries)
 # ───────────────────────────────
 def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
-    """Fetch OHLCV data with retry logic and dimension fix."""
+    """Fetch OHLCV data from Yahoo Finance with retry logic and dimension fix."""
     for attempt in range(1, retries + 1):
         try:
             print(f"📊 Fetching {symbol} [{interval}] for {period} (Attempt {attempt})...")
@@ -48,17 +44,17 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
                 interval=interval,
                 progress=False,
                 threads=False,
-                auto_adjust=True
+                auto_adjust=True,
             )
-
-            # Fix: Yahoo returns 2D arrays for single columns sometimes
-            for col in df.columns:
-                if isinstance(df[col].iloc[0], (np.ndarray, list)):
-                    df[col] = [float(x[0]) for x in df[col]]
 
             if df.empty or len(df) < 20:
                 raise ValueError("No data returned or too few rows")
 
+            # 🩹 FIX: Flatten 2D columns to 1D float
+            for col in df.columns:
+                df[col] = df[col].apply(lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x))
+
+            # Compute returns
             df = df.dropna()
             df["Return"] = df["Close"].pct_change()
             return df
@@ -75,6 +71,15 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
 # ADD TECHNICAL INDICATORS
 # ───────────────────────────────
 def add_indicators(df):
+    """Safely add EMA, RSI, MACD, Bollinger Bands indicators."""
+    df = df.copy()
+
+    # Ensure numeric type
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(inplace=True)
+
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
@@ -84,8 +89,8 @@ def add_indicators(df):
     bb = BollingerBands(df["Close"])
     df["BB_High"] = bb.bollinger_hband()
     df["BB_Low"] = bb.bollinger_lband()
-    df = df.dropna()
-    return df
+
+    return df.dropna()
 
 # ───────────────────────────────
 # TRADING THEORY OVERLAY
@@ -98,6 +103,7 @@ def apply_trading_theory(pred, df):
     bb_breakout = latest["Close"] > latest["BB_High"] or latest["Close"] < latest["BB_Low"]
 
     score = sum([ema_trend, rsi_ok, macd_conf, bb_breakout])
+
     if pred == "buy" and score >= 2:
         return "buy", 0.95
     elif pred == "sell" and not ema_trend and score >= 2:
@@ -109,6 +115,7 @@ def apply_trading_theory(pred, df):
 # MODEL TRAINING & PREDICTION
 # ───────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
+    """Train model, apply theory overlay, and generate TP/SL."""
     df = add_indicators(df)
     if len(df) < 60:
         return None
@@ -120,14 +127,17 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 
     model = RandomForestClassifier(n_estimators=150, random_state=42)
     model.fit(X[:-1], y[:-1])
+
     latest = X.iloc[-1:].values
     pred = model.predict(latest)[0]
     prob = model.predict_proba(latest)[0][pred]
-    raw = "buy" if pred == 1 else "sell"
+    raw_pred = "buy" if pred == 1 else "sell"
 
-    adjusted_pred, conf_adj = apply_trading_theory(raw, df)
+    # Apply theory overlay
+    adjusted_pred, conf_adj = apply_trading_theory(raw_pred, df)
     conf = min(1.0, prob * conf_adj)
 
+    # Compute TP/SL
     atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
     mult = RISK_MULT.get(risk, 1.0)
     price = df["Close"].iloc[-1]
@@ -140,13 +150,14 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         "probability": conf,
         "accuracy": model.score(X, y),
         "tp": tp,
-        "sl": sl
+        "sl": sl,
     }
 
 # ───────────────────────────────
 # BACKTESTING ENGINE
 # ───────────────────────────────
 def backtest_signals(df, pred):
+    """Simulate performance of buy/sell signals."""
     if df is None or df.empty or pred is None:
         return {"winrate": 0, "total_return": 0, "equity_curve": pd.Series(dtype=float)}
 
@@ -155,29 +166,35 @@ def backtest_signals(df, pred):
     df["Signal"] = sig
     df["Strat_Return"] = df["Signal"].shift(1) * df["Return"]
     df["Equity"] = (1 + df["Strat_Return"]).cumprod()
+
     winrate = (df["Strat_Return"] > 0).sum() / max(1, len(df))
     total_ret = df["Equity"].iloc[-1] - 1
+
     return {"winrate": winrate, "total_return": total_ret, "equity_curve": df["Equity"]}
 
 # ───────────────────────────────
 # MULTI-ASSET SUMMARY
 # ───────────────────────────────
 def summarize_assets():
+    """Iterate through assets, train models, and summarize."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
         df = fetch_data(symbol, "1h", "1mo")
         if df.empty:
             print(f"⚠️ Skipping {asset} (no data)")
             continue
-        pred = train_and_predict(df)
-        if not pred:
-            continue
-        back = backtest_signals(df, pred)
-        results.append({
-            "Asset": asset,
-            "Prediction": pred["prediction"],
-            "Confidence": round(pred["probability"] * 100, 2),
-            "Win Rate": round(back["winrate"] * 100, 2),
-            "Return": round(back["total_return"] * 100, 2)
-        })
+        try:
+            pred = train_and_predict(df)
+            if not pred:
+                continue
+            back = backtest_signals(df, pred)
+            results.append({
+                "Asset": asset,
+                "Prediction": pred["prediction"],
+                "Confidence": round(pred["probability"] * 100, 2),
+                "Win Rate": round(back["winrate"] * 100, 2),
+                "Return": round(back["total_return"] * 100, 2),
+            })
+        except Exception as e:
+            print(f"⚠️ Error processing {asset}: {e}")
     return pd.DataFrame(results)
