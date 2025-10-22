@@ -8,6 +8,7 @@ from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands
 import time
 import random
+import requests
 
 # ───────────────────────────────
 # CONFIGURATION
@@ -27,13 +28,19 @@ RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
 
 # ───────────────────────────────
-# FETCH DATA (Resilient + Fallback + 1D Fix)
+# SAFE FETCH WRAPPER (Resilient + Fallback + Curl)
 # ───────────────────────────────
-def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
-    fallback_period = "5d" if period != "5d" else "1mo"
+def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
+    """Fetches market data with multiple fallback layers and flatten fix."""
+    def _flatten(df):
+        for col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
+            )
+        return df
+
     for attempt in range(1, retries + 1):
         try:
-            print(f"📊 Fetching {symbol} [{interval}] for {period} (Attempt {attempt})...")
             df = yf.download(
                 symbol,
                 period=period,
@@ -43,44 +50,54 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
                 auto_adjust=True,
             )
 
-            if not df.empty:
-                for col in df.columns:
-                    df[col] = df[col].apply(
-                        lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
-                    )
-                df.dropna(subset=["Close"], inplace=True)
-                if len(df) >= 20:
-                    df["Return"] = df["Close"].pct_change()
-                    return df
-
-            print(f"⚠️ Empty or insufficient data for {symbol} (Attempt {attempt})")
-            time.sleep(delay + random.random() * 2)
-
+            if not df.empty and len(df) > 10:
+                df = _flatten(df)
+                df["Return"] = df["Close"].pct_change()
+                print(f"✅ {symbol}: fetched {len(df)} rows.")
+                return df
+            else:
+                print(f"⚠️ Attempt {attempt}: empty for {symbol}")
         except Exception as e:
-            print(f"❌ Error fetching {symbol}: {e}")
-            time.sleep(delay + random.random() * 2)
+            print(f"❌ Attempt {attempt} failed for {symbol}: {e}")
+        time.sleep(delay + random.random())
 
+    # Try daily fallback
     try:
-        print(f"🔁 Fallback fetch for {symbol} using {fallback_period}...")
+        print(f"🔁 Trying daily fallback for {symbol}...")
         df = yf.download(
             symbol,
-            period=fallback_period,
-            interval=interval,
+            period="3mo",
+            interval="1d",
             progress=False,
             threads=False,
             auto_adjust=True,
         )
         if not df.empty:
-            for col in df.columns:
-                df[col] = df[col].apply(
-                    lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
-                )
-            df.dropna(subset=["Close"], inplace=True)
+            df = _flatten(df)
             df["Return"] = df["Close"].pct_change()
+            print(f"✅ Daily fallback succeeded for {symbol}")
             return df
     except Exception as e:
-        print(f"🚫 Fallback failed for {symbol}: {e}")
+        print(f"🚫 Daily fallback failed for {symbol}: {e}")
 
+    # Curl-cffi emergency backup
+    try:
+        print(f"🛰 Curl backup for {symbol}...")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            js = r.json()["chart"]["result"][0]
+            df = pd.DataFrame(js["indicators"]["quote"][0])
+            df["Date"] = pd.to_datetime(js["timestamp"], unit="s")
+            df.set_index("Date", inplace=True)
+            df["Return"] = df["close"].pct_change()
+            print(f"✅ Curl backup succeeded for {symbol}")
+            return df
+    except Exception as e:
+        print(f"🚫 Curl backup failed for {symbol}: {e}")
+
+    print(f"🚫 All fetch attempts failed for {symbol}. Returning empty DataFrame.")
     return pd.DataFrame()
 
 
@@ -197,7 +214,6 @@ def summarize_assets():
     status = st.empty()
     total = len(ASSET_SYMBOLS)
     processed = 0
-
     status_text = ""
 
     for asset, symbol in ASSET_SYMBOLS.items():
@@ -237,7 +253,7 @@ def summarize_assets():
         time.sleep(0.5)
 
     if not results:
-        status_text += "\n🚫 No valid data fetched for any asset — showing placeholder."
+        status_text += "\n🚫 No valid data fetched — showing placeholder."
         status.markdown(status_text)
         return pd.DataFrame([
             {"Asset": "No Data", "Prediction": "neutral", "Confidence": 0.0, "Win Rate": 0.0, "Return": 0.0}
