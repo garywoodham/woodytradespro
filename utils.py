@@ -23,6 +23,13 @@ ASSET_SYMBOLS = {
     "Bitcoin": "BTC-USD"
 }
 
+INTERVALS = {
+    "15m": "Last 60 days",
+    "1h": "Last 90 days",
+    "1d": "Last 1 year",
+    "1wk": "Last 2 years"
+}
+
 FEATURES = [
     "Return", "MA_10", "MA_50", "RSI", "MACD", "Signal_Line",
     "ATR", "Momentum", "Sentiment"
@@ -39,10 +46,7 @@ RISK_MULT = {
 # DATA FETCHING
 # ==============================
 def fetch_data(symbol, interval="1h", period=None):
-    """
-    Robust data fetcher for Yahoo Finance with auto-fallback logic.
-    Tries intraday → daily → weekly and keeps feature consistency.
-    """
+    """Robust data fetcher for Yahoo Finance with auto-fallback logic."""
     try:
         if period is None:
             if interval in ["1m", "5m", "15m", "30m", "1h"]:
@@ -50,29 +54,22 @@ def fetch_data(symbol, interval="1h", period=None):
             else:
                 period = "1y"
 
-        # --- Try intraday first ---
         print(f"📊 Fetching {symbol} [{interval}] for {period}...")
         df = yf.download(
             symbol, period=period, interval=interval,
             progress=False, auto_adjust=True, threads=False
         )
 
-        # --- Fallback to daily if intraday fails ---
         if df.empty:
             print(f"⚠️ {symbol}: No {interval} data — retrying with 1d.")
-            df = yf.download(
-                symbol, period="6mo", interval="1d",
-                progress=False, auto_adjust=True, threads=False
-            )
+            df = yf.download(symbol, period="6mo", interval="1d",
+                             progress=False, auto_adjust=True, threads=False)
             df.attrs["data_source"] = "1d"
 
-        # --- Fallback to weekly if daily fails ---
         if df.empty:
             print(f"⚠️ {symbol}: No 1d data — retrying with 1wk.")
-            df = yf.download(
-                symbol, period="2y", interval="1wk",
-                progress=False, auto_adjust=True, threads=False
-            )
+            df = yf.download(symbol, period="2y", interval="1wk",
+                             progress=False, auto_adjust=True, threads=False)
             df.attrs["data_source"] = "1wk"
 
         if df.empty:
@@ -86,19 +83,20 @@ def fetch_data(symbol, interval="1h", period=None):
         df["Return"] = df["Close"].pct_change()
         df["MA_10"] = df["Close"].rolling(10).mean()
         df["MA_50"] = df["Close"].rolling(50).mean()
-        df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
+
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi().values.flatten()
 
         macd = ta.trend.MACD(df["Close"])
-        df["MACD"] = macd.macd()
-        df["Signal_Line"] = macd.macd_signal()
+        df["MACD"] = macd.macd().values.flatten()
+        df["Signal_Line"] = macd.macd_signal().values.flatten()
 
         df["ATR"] = ta.volatility.AverageTrueRange(
             df["High"], df["Low"], df["Close"]
-        ).average_true_range()
+        ).average_true_range().values.flatten()
 
-        df["Momentum"] = ta.momentum.ROCIndicator(df["Close"]).roc()
+        df["Momentum"] = ta.momentum.ROCIndicator(df["Close"]).roc().values.flatten()
 
-        # --- Add Sentiment (placeholder using random noise) ---
+        # --- Sentiment (placeholder random) ---
         df["Sentiment"] = np.random.uniform(-1, 1, len(df))
 
         df.dropna(inplace=True)
@@ -114,20 +112,17 @@ def fetch_data(symbol, interval="1h", period=None):
 # STATUS MESSAGE
 # ==============================
 def get_data_status_message(symbol, df):
-    """Generate friendly UI message about data status."""
+    """Readable message about data source."""
     if df.empty:
-        return f"❌ No data available for {symbol}"
-    source = df.attrs.get("data_source", "unknown")
-    if len(df) < 50:
-        return f"⚠️ Limited {source} data for {symbol} ({len(df)} candles)"
-    return f"✅ Loaded {symbol} ({source}, {len(df)} candles)"
+        return f"❌ No data for {symbol}"
+    src = df.attrs.get("data_source", "unknown")
+    return f"✅ {symbol} ({src}, {len(df)} candles)"
 
 
 # ==============================
 # MODEL TRAINING & PREDICTION
 # ==============================
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train ML model and return predictions + metrics."""
     df = df.copy()
     df["Y"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
     df.dropna(inplace=True)
@@ -141,15 +136,17 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 
     preds = clf.predict(X_test)
     acc = accuracy_score(y_test, preds)
-    winrate = np.mean(preds == y_test)
+    winrate = (preds == y_test).mean()
 
-    latest_features = X.iloc[-1:].values
-    next_pred = clf.predict(latest_features)[0]
-    prob = clf.predict_proba(latest_features)[0][int(next_pred)]
+    latest = X.iloc[-1:].values
+    next_pred = clf.predict(latest)[0]
+    prob = clf.predict_proba(latest)[0][int(next_pred)]
 
     signal = "BUY" if next_pred == 1 else "SELL"
-    tp = df["Close"].iloc[-1] * (1 + 0.02 * RISK_MULT[risk]) if signal == "BUY" else df["Close"].iloc[-1] * (1 - 0.02 * RISK_MULT[risk])
-    sl = df["Close"].iloc[-1] * (1 - 0.01 * RISK_MULT[risk]) if signal == "BUY" else df["Close"].iloc[-1] * (1 + 0.01 * RISK_MULT[risk])
+    current_price = df["Close"].iloc[-1]
+
+    tp = current_price * (1 + 0.02 * RISK_MULT[risk]) if signal == "BUY" else current_price * (1 - 0.02 * RISK_MULT[risk])
+    sl = current_price * (1 - 0.01 * RISK_MULT[risk]) if signal == "BUY" else current_price * (1 + 0.01 * RISK_MULT[risk])
 
     prediction = {
         "signal": signal,
@@ -167,7 +164,7 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 # BACKTEST SIMULATION
 # ==============================
 def backtest_signals(df, signal_col="Y"):
-    """Simple backtest engine for signal performance."""
+    """Simple backtest for signals."""
     try:
         df = df.copy()
         df["Position"] = np.where(df[signal_col] == 1, 1, -1)
