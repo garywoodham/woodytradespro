@@ -10,6 +10,7 @@ import time
 import random
 import requests
 
+
 # ───────────────────────────────
 # CONFIGURATION
 # ───────────────────────────────
@@ -28,10 +29,12 @@ RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
 
 # ───────────────────────────────
-# SAFE FETCH WRAPPER (Resilient + Fallback + Curl)
+# SAFE FETCH WRAPPER (Resilient + Fallback + Curl + Cache)
 # ───────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
-    """Fetches market data with multiple fallback layers and flatten fix."""
+    """Fetch market data with multi-layer fallback and 1D flatten fix."""
+
     def _flatten(df):
         for col in df.columns:
             df[col] = df[col].apply(
@@ -49,7 +52,6 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
                 threads=False,
                 auto_adjust=True,
             )
-
             if not df.empty and len(df) > 10:
                 df = _flatten(df)
                 df["Return"] = df["Close"].pct_change()
@@ -61,7 +63,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
             print(f"❌ Attempt {attempt} failed for {symbol}: {e}")
         time.sleep(delay + random.random())
 
-    # Try daily fallback
+    # Daily fallback
     try:
         print(f"🔁 Trying daily fallback for {symbol}...")
         df = yf.download(
@@ -80,7 +82,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=3, delay=3):
     except Exception as e:
         print(f"🚫 Daily fallback failed for {symbol}: {e}")
 
-    # Curl-cffi emergency backup
+    # Curl-based backup
     try:
         print(f"🛰 Curl backup for {symbol}...")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
@@ -111,7 +113,6 @@ def add_indicators(df):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.dropna(inplace=True)
-
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
@@ -206,7 +207,7 @@ def backtest_signals(df, pred):
 
 
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY (Visible Progress)
+# MULTI-ASSET SUMMARY (Progress + Visibility)
 # ───────────────────────────────
 def summarize_assets():
     results = []
