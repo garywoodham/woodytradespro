@@ -9,7 +9,7 @@ import time
 import random
 
 # ───────────────────────────────
-# GLOBAL CONFIGURATION
+# CONFIGURATION
 # ───────────────────────────────
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
@@ -22,26 +22,13 @@ ASSET_SYMBOLS = {
     "Bitcoin": "BTC-USD",
 }
 
-INTERVALS = {
-    "15m": {"interval": "15m", "period": "5d"},
-    "1h": {"interval": "1h", "period": "1mo"},
-    "1d": {"interval": "1d", "period": "6mo"},
-}
-
 RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
 
 # ───────────────────────────────
-# FETCH DATA (Resilient version with fallbacks)
+# FETCH DATA (Resilient + Fallback + 1D Fix)
 # ───────────────────────────────
 def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
-    """
-    Fetch OHLCV data from Yahoo Finance with:
-      - retry logic
-      - automatic fallback period
-      - 1D flattening fix
-      - safe empty handling
-    """
     fallback_period = "5d" if period != "5d" else "1mo"
     for attempt in range(1, retries + 1):
         try:
@@ -56,13 +43,13 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
             )
 
             if not df.empty:
-                # 🩹 Fix 2D columns → 1D float
+                # 🩹 Fix 2D columns to 1D float
                 for col in df.columns:
                     df[col] = df[col].apply(
                         lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
                     )
 
-                df = df.dropna(subset=["Close"])
+                df.dropna(subset=["Close"], inplace=True)
                 if len(df) >= 20:
                     df["Return"] = df["Close"].pct_change()
                     print(f"✅ Data fetched for {symbol} ({len(df)} rows)")
@@ -91,7 +78,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
                 df[col] = df[col].apply(
                     lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
                 )
-            df = df.dropna(subset=["Close"])
+            df.dropna(subset=["Close"], inplace=True)
             df["Return"] = df["Close"].pct_change()
             print(f"✅ Fallback succeeded for {symbol} ({len(df)} rows)")
             return df
@@ -107,17 +94,13 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
 # ADD TECHNICAL INDICATORS
 # ───────────────────────────────
 def add_indicators(df):
-    """Add EMA, RSI, MACD, and Bollinger Bands indicators safely."""
     df = df.copy()
-
-    # Ensure numeric columns
     for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.dropna(inplace=True)
 
-    # Technical indicators
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
@@ -137,13 +120,11 @@ def add_indicators(df):
 # TRADING THEORY OVERLAY
 # ───────────────────────────────
 def apply_trading_theory(pred, df):
-    """Overlay classical trading logic for confirmation and confidence boost."""
     latest = df.iloc[-1]
     ema_trend = latest["EMA_20"] > latest["EMA_50"]
     rsi_ok = 40 < latest["RSI"] < 70
     macd_conf = latest["MACD"] > latest["Signal_Line"]
     bb_breakout = latest["Close"] > latest["BB_High"] or latest["Close"] < latest["BB_Low"]
-
     score = sum([ema_trend, rsi_ok, macd_conf, bb_breakout])
 
     if pred == "buy" and score >= 2:
@@ -158,7 +139,6 @@ def apply_trading_theory(pred, df):
 # MODEL TRAINING & PREDICTION
 # ───────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train ML model and compute prediction + TP/SL levels."""
     df = add_indicators(df)
     if len(df) < 60:
         return None
@@ -176,11 +156,9 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
     prob = model.predict_proba(latest)[0][pred]
     raw_pred = "buy" if pred == 1 else "sell"
 
-    # Apply trading theory overlay
     adjusted_pred, conf_adj = apply_trading_theory(raw_pred, df)
     conf = min(1.0, prob * conf_adj)
 
-    # Compute TP/SL
     atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
     mult = RISK_MULT.get(risk, 1.0)
     price = df["Close"].iloc[-1]
@@ -201,7 +179,6 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 # BACKTESTING ENGINE
 # ───────────────────────────────
 def backtest_signals(df, pred):
-    """Simulate a simple strategy following last prediction signal."""
     if df is None or df.empty or pred is None:
         return {"winrate": 0, "total_return": 0, "equity_curve": pd.Series(dtype=float)}
 
@@ -218,10 +195,9 @@ def backtest_signals(df, pred):
 
 
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY (Resilient)
+# MULTI-ASSET SUMMARY (Resilient + Failsafe)
 # ───────────────────────────────
 def summarize_assets():
-    """Fetch, analyze, and summarize predictions across all assets."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
         print(f"\n📈 Processing {asset} ({symbol})...")
@@ -250,8 +226,11 @@ def summarize_assets():
         except Exception as e:
             print(f"⚠️ Error analyzing {asset}: {e}")
 
+    # 🔒 Failsafe placeholder fix — prevents Streamlit “freeze” or empty crash
     if not results:
-        print("🚫 No valid data fetched for any asset.")
-        return pd.DataFrame()
+        print("🚫 No valid data fetched. Returning placeholder.")
+        return pd.DataFrame([
+            {"Asset": "No Data", "Prediction": "neutral", "Confidence": 0.0, "Win Rate": 0.0, "Return": 0.0}
+        ])
 
     return pd.DataFrame(results)
