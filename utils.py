@@ -30,11 +30,19 @@ INTERVALS = {
 
 RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.8}
 
+
 # ───────────────────────────────
-# FETCH DATA (with 1D fix + retries)
+# FETCH DATA (Resilient version with fallbacks)
 # ───────────────────────────────
 def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
-    """Fetch OHLCV data from Yahoo Finance with retry logic and dimension fix."""
+    """
+    Fetch OHLCV data from Yahoo Finance with:
+      - retry logic
+      - automatic fallback period
+      - 1D flattening fix
+      - safe empty handling
+    """
+    fallback_period = "5d" if period != "5d" else "1mo"
     for attempt in range(1, retries + 1):
         try:
             print(f"📊 Fetching {symbol} [{interval}] for {period} (Attempt {attempt})...")
@@ -47,55 +55,89 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, delay=4):
                 auto_adjust=True,
             )
 
-            if df.empty or len(df) < 20:
-                raise ValueError("No data returned or too few rows")
+            if not df.empty:
+                # 🩹 Fix 2D columns → 1D float
+                for col in df.columns:
+                    df[col] = df[col].apply(
+                        lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
+                    )
 
-            # 🩹 FIX: Flatten 2D columns to 1D float
-            for col in df.columns:
-                df[col] = df[col].apply(lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x))
+                df = df.dropna(subset=["Close"])
+                if len(df) >= 20:
+                    df["Return"] = df["Close"].pct_change()
+                    print(f"✅ Data fetched for {symbol} ({len(df)} rows)")
+                    return df
 
-            # Compute returns
-            df = df.dropna()
-            df["Return"] = df["Close"].pct_change()
-            return df
+            print(f"⚠️ Empty or insufficient data for {symbol} (Attempt {attempt})")
+            time.sleep(delay + random.random() * 2)
 
         except Exception as e:
             print(f"❌ Error fetching {symbol}: {e}")
-            if attempt < retries:
-                time.sleep(delay + random.random() * 3)
-            else:
-                print(f"🚫 All retries failed for {symbol}. Returning empty DataFrame.")
-                return pd.DataFrame()
+            time.sleep(delay + random.random() * 2)
+
+    # 🔁 Fallback fetch
+    try:
+        print(f"🔁 Trying fallback fetch for {symbol} using {fallback_period}...")
+        df = yf.download(
+            symbol,
+            period=fallback_period,
+            interval=interval,
+            progress=False,
+            threads=False,
+            auto_adjust=True,
+        )
+        if not df.empty:
+            for col in df.columns:
+                df[col] = df[col].apply(
+                    lambda x: float(x[0]) if isinstance(x, (list, np.ndarray)) else float(x)
+                )
+            df = df.dropna(subset=["Close"])
+            df["Return"] = df["Close"].pct_change()
+            print(f"✅ Fallback succeeded for {symbol} ({len(df)} rows)")
+            return df
+        else:
+            print(f"🚫 Fallback returned no data for {symbol}")
+    except Exception as e:
+        print(f"🚫 Fallback failed for {symbol}: {e}")
+
+    return pd.DataFrame()
+
 
 # ───────────────────────────────
 # ADD TECHNICAL INDICATORS
 # ───────────────────────────────
 def add_indicators(df):
-    """Safely add EMA, RSI, MACD, Bollinger Bands indicators."""
+    """Add EMA, RSI, MACD, and Bollinger Bands indicators safely."""
     df = df.copy()
 
-    # Ensure numeric type
+    # Ensure numeric columns
     for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df.dropna(inplace=True)
 
+    # Technical indicators
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
+
     macd = MACD(df["Close"])
     df["MACD"] = macd.macd()
     df["Signal_Line"] = macd.macd_signal()
+
     bb = BollingerBands(df["Close"])
     df["BB_High"] = bb.bollinger_hband()
     df["BB_Low"] = bb.bollinger_lband()
 
     return df.dropna()
 
+
 # ───────────────────────────────
 # TRADING THEORY OVERLAY
 # ───────────────────────────────
 def apply_trading_theory(pred, df):
+    """Overlay classical trading logic for confirmation and confidence boost."""
     latest = df.iloc[-1]
     ema_trend = latest["EMA_20"] > latest["EMA_50"]
     rsi_ok = 40 < latest["RSI"] < 70
@@ -111,11 +153,12 @@ def apply_trading_theory(pred, df):
     else:
         return "neutral", 0.6
 
+
 # ───────────────────────────────
 # MODEL TRAINING & PREDICTION
 # ───────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train model, apply theory overlay, and generate TP/SL."""
+    """Train ML model and compute prediction + TP/SL levels."""
     df = add_indicators(df)
     if len(df) < 60:
         return None
@@ -133,7 +176,7 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
     prob = model.predict_proba(latest)[0][pred]
     raw_pred = "buy" if pred == 1 else "sell"
 
-    # Apply theory overlay
+    # Apply trading theory overlay
     adjusted_pred, conf_adj = apply_trading_theory(raw_pred, df)
     conf = min(1.0, prob * conf_adj)
 
@@ -153,11 +196,12 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         "sl": sl,
     }
 
+
 # ───────────────────────────────
 # BACKTESTING ENGINE
 # ───────────────────────────────
 def backtest_signals(df, pred):
-    """Simulate performance of buy/sell signals."""
+    """Simulate a simple strategy following last prediction signal."""
     if df is None or df.empty or pred is None:
         return {"winrate": 0, "total_return": 0, "equity_curve": pd.Series(dtype=float)}
 
@@ -172,21 +216,27 @@ def backtest_signals(df, pred):
 
     return {"winrate": winrate, "total_return": total_ret, "equity_curve": df["Equity"]}
 
+
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY
+# MULTI-ASSET SUMMARY (Resilient)
 # ───────────────────────────────
 def summarize_assets():
-    """Iterate through assets, train models, and summarize."""
+    """Fetch, analyze, and summarize predictions across all assets."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
+        print(f"\n📈 Processing {asset} ({symbol})...")
         df = fetch_data(symbol, "1h", "1mo")
+
         if df.empty:
-            print(f"⚠️ Skipping {asset} (no data)")
+            print(f"⚠️ No data for {asset}, skipping.")
             continue
+
         try:
             pred = train_and_predict(df)
             if not pred:
+                print(f"⚠️ No prediction for {asset}.")
                 continue
+
             back = backtest_signals(df, pred)
             results.append({
                 "Asset": asset,
@@ -195,6 +245,13 @@ def summarize_assets():
                 "Win Rate": round(back["winrate"] * 100, 2),
                 "Return": round(back["total_return"] * 100, 2),
             })
+            print(f"✅ {asset} analyzed successfully.")
+
         except Exception as e:
-            print(f"⚠️ Error processing {asset}: {e}")
+            print(f"⚠️ Error analyzing {asset}: {e}")
+
+    if not results:
+        print("🚫 No valid data fetched for any asset.")
+        return pd.DataFrame()
+
     return pd.DataFrame(results)
