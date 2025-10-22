@@ -1,198 +1,164 @@
 import streamlit as st
-import utils
 import pandas as pd
 import plotly.graph_objects as go
+import utils
+import numpy as np
+import time
 
+# ───────────────────────────────
+# Render Scenarios Tab
+# ───────────────────────────────
 def render_scenarios():
-    st.title("🎯 Scenario Analysis")
-    st.caption(
-        "Simulate and compare trade performance across different **risk levels**, "
-        "including Take Profit (TP), Stop Loss (SL), Accuracy, and Win Rate."
-    )
+    st.title("📊 Trade Scenarios & Model Simulation")
+    st.caption("Simulate trading outcomes for each asset under different risk levels.")
 
-    # --- User input ---
-    asset = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()))
-    interval = st.selectbox("Select Interval", list(utils.INTERVALS.keys()))
+    # Select asset and interval
+    asset_name = st.selectbox("Choose Asset", list(utils.ASSET_SYMBOLS.keys()), index=0)
+    interval_choice = st.selectbox("Select Timeframe", ["15m", "1h", "1d"], index=1)
+    asset_symbol = utils.ASSET_SYMBOLS[asset_name]
+    risk_levels = list(utils.RISK_MULT.keys())
 
-    symbol = utils.ASSET_SYMBOLS[asset]
-    df = utils.fetch_data(symbol, interval=interval)
+    st.info(f"Fetching and analyzing **{asset_name} ({asset_symbol})**... please wait ⏳")
+    df = utils.fetch_data(asset_symbol, utils.INTERVALS[interval_choice]["interval"], utils.INTERVALS[interval_choice]["period"])
 
     if df.empty:
-        st.warning(f"No data available for {asset}")
+        st.error(f"No data available for {asset_name}. Please try again later.")
         return
 
-    st.divider()
-    st.info("Running backtests across all risk levels... please wait ⏳")
+    st.success(f"Data loaded successfully for {asset_name} ({len(df)} candles).")
 
-    scenario_results = []
+    # ───────────────────────────────
+    # Run model predictions for each risk level
+    # ───────────────────────────────
+    results = []
+    progress = st.progress(0)
+    status = st.empty()
 
-    for risk in utils.RISK_MULT.keys():
+    for i, risk in enumerate(risk_levels, 1):
+        status.markdown(f"🔍 Evaluating **{risk} Risk Strategy** ({i}/{len(risk_levels)})...")
+        progress.progress(i / len(risk_levels))
+
         try:
-            pred = utils.train_and_predict(df, horizon=interval, risk=risk)
-            bt = utils.backtest_signals(df, pred)  # backtest for winrate and performance
+            pred = utils.train_and_predict(df, horizon=interval_choice, risk=risk)
+            backtest = utils.backtest_signals(df, pred)
 
-            if not pred or bt is None:
-                continue
-
-            scenario_results.append({
-                "Risk": risk,
-                "Prediction": pred["prediction"],
-                "Confidence": f"{pred['probability']*100:.2f}%",
-                "Accuracy": f"{pred['accuracy']*100:.2f}%",
-                "Win Rate": f"{bt.get('winrate', 0)*100:.2f}%",
-                "TP": round(pred["tp"], 2),
-                "SL": round(pred["sl"], 2),
-                "Total Return": f"{bt.get('total_return', 0)*100:.2f}%"
-            })
+            if pred:
+                results.append({
+                    "Risk": risk,
+                    "Prediction": pred["prediction"],
+                    "Confidence": round(pred["probability"] * 100, 2),
+                    "Accuracy": round(pred["accuracy"] * 100, 2),
+                    "Win Rate": round(backtest["winrate"] * 100, 2),
+                    "Total Return": round(backtest["total_return"] * 100, 2),
+                    "TP": round(pred["tp"], 4),
+                    "SL": round(pred["sl"], 4)
+                })
         except Exception as e:
             st.warning(f"⚠️ Error processing {risk} risk: {e}")
 
-    if not scenario_results:
+        time.sleep(0.8)
+
+    progress.progress(1.0)
+    status.markdown("✅ Completed scenario simulations.")
+
+    if not results:
         st.error("Unable to simulate scenarios for this asset.")
         return
 
-    # --- Dataframe view ---
-    scenario_df = pd.DataFrame(scenario_results)
-    st.subheader(f"📊 {asset} Scenario Outcomes")
-    st.dataframe(scenario_df, width="stretch")
+    results_df = pd.DataFrame(results)
+    st.subheader("📈 Scenario Comparison")
+    st.dataframe(results_df, use_container_width=True)
 
-    # --- Visualization: TP/SL comparison ---
-    fig_tp_sl = go.Figure()
-    for s in scenario_results:
-        fig_tp_sl.add_trace(go.Bar(
-            x=["Take Profit", "Stop Loss"],
-            y=[s["TP"], s["SL"]],
-            name=f"{s['Risk']} Risk"
+    # ───────────────────────────────
+    # Interactive Trade Visualization for Current Risk (default Medium)
+    # ───────────────────────────────
+    st.divider()
+    st.subheader("🎯 Model Trade Visualization")
+
+    selected_risk = st.radio("Select Risk Level to Visualize", risk_levels, index=1)
+    selected_pred = utils.train_and_predict(df, horizon=interval_choice, risk=selected_risk)
+    selected_backtest = utils.backtest_signals(df, selected_pred)
+
+    if selected_pred and not df.empty:
+        # Build price chart
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df["Close"],
+            mode="lines",
+            name="Price",
+            line=dict(width=1.8, color="black")
         ))
-    fig_tp_sl.update_layout(
-        title=f"{asset} — TP/SL Levels by Risk",
-        barmode="group",
-        height=450,
-        xaxis_title="Level Type",
-        yaxis_title="Price"
-    )
-    st.plotly_chart(fig_tp_sl, width="stretch", config={"displayModeBar": False})
 
-    # --- Visualization: Accuracy vs Win Rate ---
-    fig_acc_wr = go.Figure()
-    fig_acc_wr.add_trace(go.Bar(
-        x=[s["Risk"] for s in scenario_results],
-        y=[float(s["Accuracy"].replace('%', '')) for s in scenario_results],
-        name="Accuracy %",
-        marker_color="lightgreen"
-    ))
-    fig_acc_wr.add_trace(go.Bar(
-        x=[s["Risk"] for s in scenario_results],
-        y=[float(s["Win Rate"].replace('%', '')) for s in scenario_results],
-        name="Win Rate %",
-        marker_color="steelblue"
-    ))
-    fig_acc_wr.update_layout(
-        title=f"{asset} — Accuracy vs Win Rate by Risk",
-        barmode="group",
-        height=450,
-        xaxis_title="Risk Level",
-        yaxis_title="Percentage (%)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig_acc_wr, width="stretch", config={"displayModeBar": False})
+        # Identify Buy/Sell points
+        signals = []
+        for i in range(1, len(df)):
+            if selected_pred["prediction"].lower() == "buy" and df["Close"].iloc[i] > df["Close"].iloc[i - 1]:
+                signals.append((df.index[i], df["Close"].iloc[i], "Buy"))
+            elif selected_pred["prediction"].lower() == "sell" and df["Close"].iloc[i] < df["Close"].iloc[i - 1]:
+                signals.append((df.index[i], df["Close"].iloc[i], "Sell"))
 
-    st.caption(
-        "📘 *Accuracy* measures prediction correctness, while *Win Rate* reflects successful trade outcomes "
-        "from the backtest simulation."
-    )
-    import plotly.graph_objects as go
-import numpy as np
-import pandas as pd
-import streamlit as st
-import utils
+        if signals:
+            buy_points = [s for s in signals if s[2] == "Buy"]
+            sell_points = [s for s in signals if s[2] == "Sell"]
 
-# Assuming you already have `df` (asset data) and `pred` (model prediction)
+            if buy_points:
+                fig.add_trace(go.Scatter(
+                    x=[s[0] for s in buy_points],
+                    y=[s[1] for s in buy_points],
+                    mode="markers",
+                    name="Buy Signal",
+                    marker=dict(color="green", size=8, symbol="triangle-up")
+                ))
 
-if df is not None and not df.empty and pred:
-    st.subheader("📊 Model Trade Visualization")
+            if sell_points:
+                fig.add_trace(go.Scatter(
+                    x=[s[0] for s in sell_points],
+                    y=[s[1] for s in sell_points],
+                    mode="markers",
+                    name="Sell Signal",
+                    marker=dict(color="red", size=8, symbol="triangle-down")
+                ))
 
-    # Recompute or reuse backtest results
-    backtest = utils.backtest_signals(df, pred)
-    equity = backtest["equity_curve"]
-    winrate = backtest["winrate"]
-    total_return = backtest["total_return"]
-
-    # Build base price chart
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df.index,
-        y=df["Close"],
-        mode="lines",
-        name="Price",
-        line=dict(width=1.8)
-    ))
-
-    # Find Buy/Sell points for visual markers
-    signals = []
-    for i in range(1, len(df)):
-        if pred["prediction"].lower() == "buy" and df["Close"].iloc[i] > df["Close"].iloc[i - 1]:
-            signals.append((df.index[i], df["Close"].iloc[i], "Buy"))
-        elif pred["prediction"].lower() == "sell" and df["Close"].iloc[i] < df["Close"].iloc[i - 1]:
-            signals.append((df.index[i], df["Close"].iloc[i], "Sell"))
-
-    if signals:
-        buy_points = [s for s in signals if s[2] == "Buy"]
-        sell_points = [s for s in signals if s[2] == "Sell"]
-
-        if buy_points:
+        # Add equity curve overlay
+        equity = selected_backtest["equity_curve"]
+        if not equity.empty:
             fig.add_trace(go.Scatter(
-                x=[s[0] for s in buy_points],
-                y=[s[1] for s in buy_points],
-                mode="markers",
-                name="Buy Signal",
-                marker=dict(color="green", size=8, symbol="triangle-up")
+                x=equity.index,
+                y=df["Close"].iloc[0] * (1 + equity - 1),
+                mode="lines",
+                name="Equity (Simulated)",
+                line=dict(dash="dot", width=1.2, color="royalblue"),
+                opacity=0.6
             ))
 
-        if sell_points:
-            fig.add_trace(go.Scatter(
-                x=[s[0] for s in sell_points],
-                y=[s[1] for s in sell_points],
-                mode="markers",
-                name="Sell Signal",
-                marker=dict(color="red", size=8, symbol="triangle-down")
-            ))
+        # Layout updates
+        fig.update_layout(
+            title=f"{asset_name} — {selected_pred['prediction']} Signal Overview ({selected_risk} Risk)",
+            yaxis_title="Price",
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
 
-    # Optional: overlay equity curve
-    fig.add_trace(go.Scatter(
-        x=equity.index,
-        y=df["Close"].iloc[0] * (1 + equity - 1),  # scaled equity overlay
-        mode="lines",
-        name="Equity (simulated)",
-        line=dict(dash="dot", width=1.3, color="royalblue"),
-        opacity=0.5
-    ))
+        st.plotly_chart(fig, width="stretch")
 
-    fig.update_layout(
-        title=f"{asset_name} — {pred['prediction']} Recommendation Chart",
-        yaxis_title="Price",
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
+        # ───────────────────────────────
+        # Summary of Impact
+        # ───────────────────────────────
+        winrate = selected_backtest["winrate"] * 100
+        total_return = selected_backtest["total_return"] * 100
+        confidence = selected_pred["probability"] * 100
 
-    st.plotly_chart(fig, width="stretch")
+        st.markdown(f"""
+        ### 📊 Strategy Summary
+        **Prediction:** {selected_pred['prediction']}  
+        **Model Confidence:** {confidence:.2f}%  
+        **Historical Win Rate:** {winrate:.2f}%  
+        **Estimated Total Return:** {total_return:.2f}%  
+        **TP:** {selected_pred['tp']:.4f} | **SL:** {selected_pred['sl']:.4f}  
+        **Data Points Used:** {len(df):,}  
 
-    # Summarize impact if followed
-    st.markdown(f"""
-    **📈 Trade Simulation Summary**
-    - **Prediction:** {pred['prediction']}
-    - **Model Confidence:** {pred['probability'] * 100:.2f}%
-    - **Historical Win Rate:** {winrate * 100:.2f}%
-    - **Estimated Total Return:** {total_return * 100:.2f}%
-    - **Number of Trades Simulated:** {len(df)}
-
-    _If this strategy had been followed historically, 
-    the equity curve above shows the growth trajectory relative to price._ ⚙️
-    """)
-else:
-    st.warning("No data available to visualize trades.")
-    
-    
-    
-    
-    
+        _If this model's recommendations were followed historically, the simulated equity curve (dotted blue line) shows the performance relative to price._
+        """)
+    else:
+        st.warning("No sufficient data available to visualize model predictions.")
