@@ -1,10 +1,11 @@
 import streamlit as st
-import plotly.graph_objects as go
 import utils
+import plotly.graph_objects as go
+import numpy as np
 
 def render_detailed():
-    st.title("📈 Detailed Analysis")
-    st.caption("Combines AI predictions, overlays, and sentiment-driven entry/exit targeting.")
+    st.title("📈 Detailed Asset Analysis")
+    st.caption("Interactive charting, AI signals, and entry/exit target levels for each selected market.")
 
     asset = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()))
     interval = st.selectbox("Select Interval", list(utils.INTERVALS.keys()))
@@ -17,31 +18,47 @@ def render_detailed():
         st.warning(f"No data available for {asset}")
         return
 
-    pred = utils.train_and_predict(df, horizon=interval, risk=risk)
-    if not pred:
-        st.error(f"Unable to generate prediction for {asset}")
+    prediction = utils.train_and_predict(df, horizon=interval, risk=risk)
+    if not prediction:
+        st.warning("Could not generate prediction for this asset.")
         return
 
-    st.subheader(f"{asset} | {pred['prediction']} Signal ({pred['probability']*100:.1f}% Confidence)")
-    st.write(f"🎯 Accuracy: **{pred['accuracy']*100:.2f}%**")
+    st.divider()
+    st.subheader(f"🔍 {asset} ({interval}) — Signal Summary")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Prediction", prediction["prediction"])
+    with col2:
+        st.metric("Confidence", f"{prediction['probability']*100:.2f}%")
+    with col3:
+        st.metric("Model Accuracy", f"{prediction['accuracy']*100:.2f}%")
 
-    # Plot candlestick with TP/SL
-    fig = go.Figure(data=[go.Candlestick(
+    st.write(f"**Take Profit:** {prediction['tp']:.2f}")
+    st.write(f"**Stop Loss:** {prediction['sl']:.2f}")
+
+    # --- Price Chart with Overlay ---
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
         x=df.index,
         open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name=asset
-    )])
+        name="Price"
+    ))
 
-    fig.add_hline(y=pred["tp"], line=dict(color="green", width=2, dash="dash"), name="Take Profit")
-    fig.add_hline(y=pred["sl"], line=dict(color="red", width=2, dash="dash"), name="Stop Loss")
+    # Overlay TP and SL lines
+    last_close = df["Close"].iloc[-1]
+    fig.add_hline(y=prediction["tp"], line=dict(color="green", dash="dash"), annotation_text="TP", annotation_position="bottom right")
+    fig.add_hline(y=prediction["sl"], line=dict(color="red", dash="dash"), annotation_text="SL", annotation_position="top right")
 
     fig.update_layout(
         title=f"{asset} Price Chart ({interval})",
         yaxis_title="Price",
         xaxis_title="Date",
-        template="plotly_dark",
-        height=600
+        template="plotly_white",
+        height=600,
     )
-    st.plotly_chart(fig, width="stretch")
 
-    st.info(f"💡 Suggested Trade: **{pred['prediction']}** | TP: {pred['tp']:.2f} | SL: {pred['sl']:.2f}")
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+    st.divider()
+    st.caption("Note: The TP/SL lines reflect the current risk multiplier setting.")
