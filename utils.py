@@ -207,7 +207,7 @@ def backtest_signals(df, pred):
 
 
 # ───────────────────────────────
-# MULTI-ASSET SUMMARY (Progress + Visibility)
+# MULTI-ASSET SUMMARY (Progress + Visibility + Accuracy Fix)
 # ───────────────────────────────
 def summarize_assets():
     results = []
@@ -241,6 +241,7 @@ def summarize_assets():
                 "Asset": asset,
                 "Prediction": pred["prediction"],
                 "Confidence": round(pred["probability"] * 100, 2),
+                "Accuracy": round(pred["accuracy"] * 100, 2),
                 "Win Rate": round(back["winrate"] * 100, 2),
                 "Return": round(back["total_return"] * 100, 2),
             })
@@ -257,7 +258,7 @@ def summarize_assets():
         status_text += "\n🚫 No valid data fetched — showing placeholder."
         status.markdown(status_text)
         return pd.DataFrame([
-            {"Asset": "No Data", "Prediction": "neutral", "Confidence": 0.0, "Win Rate": 0.0, "Return": 0.0}
+            {"Asset": "No Data", "Prediction": "neutral", "Confidence": 0.0, "Accuracy": 0.0, "Win Rate": 0.0, "Return": 0.0}
         ])
 
     status_text += "\n🎉 Analysis complete!"
