@@ -1,18 +1,17 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import streamlit as st
-import time, random
+import time
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import BollingerBands
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import ta
 
-# ============================================================
-# CONFIG
-# ============================================================
-
+# ────────────────────────────────
+# Configuration
+# ────────────────────────────────
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
@@ -25,157 +24,202 @@ ASSET_SYMBOLS = {
 }
 
 INTERVALS = {
-    "15m": {"period": "5d"},
-    "1h": {"period": "1mo"},
-    "1d": {"period": "6mo"},
+    "15m": {"interval": "15m", "period": "5d"},
+    "1h": {"interval": "1h", "period": "1mo"},
+    "1d": {"interval": "1d", "period": "6mo"},
 }
 
-RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
-FEATURES = ["return", "volatility", "rsi", "macd", "sentiment"]
+RISK_MULT = {
+    "Low": 0.5,
+    "Medium": 1.0,
+    "High": 1.5,
+}
 
-CACHE_DATA = {}
-analyzer = SentimentIntensityAnalyzer()
+FEATURES = ["rsi", "macd", "bb_width", "returns"]
 
-# ============================================================
-# FETCH DATA (robust with shape fix + fallback cache)
-# ============================================================
+# ────────────────────────────────
+# Data Fetcher
+# ────────────────────────────────
+def fetch_data(symbol, interval="1h", period="1mo", max_retries=4):
+    """Download and preprocess market data with retry logic."""
+    print(f"📊 Fetching {symbol} [{interval}] for {period}...")
+    df = pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
-def fetch_data(symbol: str, interval: str = "1h", period: str = None, max_retries: int = 4) -> pd.DataFrame:
-    if period is None:
-        period = INTERVALS.get(interval, {"period": "1mo"})["period"]
-
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
-            print(f"📊 Fetching {symbol} [{interval}] for {period} (Attempt {attempt+1})...")
-            df = yf.download(
+            raw = yf.download(
                 symbol,
                 period=period,
                 interval=interval,
                 progress=False,
                 threads=False,
-                auto_adjust=True,
-                timeout=30,
+                auto_adjust=False,
             )
+            if raw.empty:
+                raise ValueError("Empty data")
 
-            if df is None or df.empty:
-                raise ValueError("Empty dataframe returned")
+            df = raw.copy()
+            # Fix potential 2D columns from new yfinance
+            for c in df.columns:
+                if isinstance(df[c].iloc[0], (list, np.ndarray)):
+                    df[c] = df[c].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) else x)
 
-            # ---- FIX FOR yfinance ndarray bug ----
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-
-            # Ensure Close etc are 1-D numpy arrays, not (N,1)
-            for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-                if col in df.columns and isinstance(df[col].iloc[0], (np.ndarray, list)):
-                    df[col] = df[col].astype(float).squeeze()
-
+            # Indicators
+            df["rsi"] = RSIIndicator(df["Close"]).rsi()
+            macd = MACD(df["Close"])
+            df["macd"] = macd.macd()
+            bb = BollingerBands(df["Close"])
+            df["bb_width"] = bb.bollinger_wband()
+            df["returns"] = df["Close"].pct_change()
+            df["volatility"] = df["returns"].rolling(20).std()
             df.dropna(inplace=True)
-            df["return"] = pd.Series(df["Close"]).pct_change()
-            df["volatility"] = df["return"].rolling(10).std()
-            df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
-            df["macd"] = ta.trend.MACD(df["Close"]).macd()
-            df["sentiment"] = np.where(df["return"] > 0, 1, -1)
 
-            df.dropna(inplace=True)
-            CACHE_DATA[symbol] = df
+            print(f"✅ Data fetched successfully for {symbol} ({len(df)} rows)")
             return df
 
         except Exception as e:
             print(f"❌ Error fetching {symbol}: {e}")
-            wait = random.uniform(2.5, 5.5) * (attempt + 1)
-            print(f"⏳ Waiting {wait:.1f}s before retry...")
-            time.sleep(wait)
+            if attempt < max_retries:
+                wait = 3 + attempt * np.random.uniform(1.2, 2.5)
+                print(f"⏳ Waiting {wait:.1f}s before retry...")
+                time.sleep(wait)
+            else:
+                print(f"🚫 All attempts failed for {symbol}, returning empty DataFrame.")
+                return pd.DataFrame()
+    return df
 
-    if symbol in CACHE_DATA:
-        print(f"⚠️ Using cached data for {symbol}")
-        return CACHE_DATA[symbol]
 
-    print(f"🚫 All attempts failed for {symbol}")
-    return pd.DataFrame()
+# ────────────────────────────────
+# Model Training / Prediction
+# ────────────────────────────────
+def train_and_predict(df, horizon="1h", risk="Medium"):
+    """Train quick RandomForest model and output predicted direction, TP, SL, accuracy."""
+    if df.empty:
+        return None
 
-# ============================================================
-# TRAIN + PREDICT
-# ============================================================
+    df = df.copy()
+    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    df.dropna(inplace=True)
 
-def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk: str = "Medium") -> dict:
+    X = df[FEATURES]
+    y = df["target"]
+
     try:
-        df = df.copy()
-        df["Y"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
-        df.dropna(inplace=True)
-
-        X = df[FEATURES]
-        y = df["Y"]
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.25, shuffle=False
-        )
-        clf = RandomForestClassifier(n_estimators=120, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        clf = RandomForestClassifier(n_estimators=100, random_state=42)
         clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
+        preds = clf.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+        prob = clf.predict_proba([X.iloc[-1]])[0][1]
 
-        prob = clf.predict_proba(X.iloc[[-1]])[0]
-        pred = "Buy" if prob[1] > 0.55 else "Sell"
-
+        pred_dir = "Buy" if prob > 0.5 else "Sell"
         last_price = df["Close"].iloc[-1]
-        vol = df["volatility"].iloc[-1] or 0.002
         mult = RISK_MULT.get(risk, 1.0)
-
-        if pred == "Buy":
-            tp = last_price * (1 + vol * 10 * mult)
-            sl = last_price * (1 - vol * 5 * mult)
-        else:
-            tp = last_price * (1 - vol * 10 * mult)
-            sl = last_price * (1 + vol * 5 * mult)
+        tp = last_price * (1 + 0.01 * mult) if pred_dir == "Buy" else last_price * (1 - 0.01 * mult)
+        sl = last_price * (1 - 0.005 * mult) if pred_dir == "Buy" else last_price * (1 + 0.005 * mult)
 
         return {
-            "prediction": pred,
-            "probability": float(prob[1]),
+            "prediction": pred_dir,
+            "probability": float(prob),
             "accuracy": float(acc),
             "tp": float(tp),
             "sl": float(sl),
         }
 
     except Exception as e:
-        print(f"⚠️ Error in training/prediction: {e}")
-        return {}
+        print(f"Model error: {e}")
+        return None
 
-# ============================================================
-# SUMMARY ACROSS ASSETS
-# ============================================================
 
-def summarize_assets() -> pd.DataFrame:
+# ────────────────────────────────
+# Asset Summary
+# ────────────────────────────────
+def summarize_assets():
+    """Fetch all assets and return prediction summary table."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
-        df = fetch_data(symbol, interval="1h")
-        if df.empty:
-            print(f"No data available for {asset}")
-            continue
-        pred = train_and_predict(df)
-        if not pred:
-            print(f"Error processing {asset}")
-            continue
-        results.append(
-            {
+        try:
+            df = fetch_data(symbol, "1h", "1mo")
+            if df.empty:
+                print(f"No data available for {asset}")
+                continue
+
+            pred = train_and_predict(df, "1h", "Medium")
+            if not pred:
+                continue
+
+            results.append({
                 "Asset": asset,
                 "Prediction": pred["prediction"],
                 "Confidence": round(pred["probability"] * 100, 2),
                 "Accuracy": round(pred["accuracy"] * 100, 2),
                 "TP": round(pred["tp"], 2),
                 "SL": round(pred["sl"], 2),
-            }
-        )
-    if not results:
-        print("🚫 No assets could be analyzed.")
-        return pd.DataFrame()
+            })
+        except Exception as e:
+            print(f"Error summarizing {asset}: {e}")
+
     return pd.DataFrame(results)
 
-# ============================================================
-# CLEAN HELPER
-# ============================================================
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna()
-    return df
+# ────────────────────────────────
+# Backtest for Win Rate / Returns
+# ────────────────────────────────
+def backtest_signals(df, pred):
+    """
+    Simulate simple trade backtest to estimate win rate and total return.
+    """
+    if df is None or df.empty or not isinstance(pred, dict):
+        return {"winrate": 0.0, "total_return": 0.0, "equity_curve": pd.Series(dtype=float)}
+
+    if "Close" not in df.columns:
+        return {"winrate": 0.0, "total_return": 0.0, "equity_curve": pd.Series(dtype=float)}
+
+    df = df.copy()
+    close = df["Close"].values
+    tp = pred.get("tp")
+    sl = pred.get("sl")
+    direction = pred.get("prediction", "").lower()
+
+    equity = [1.0]
+    wins = 0
+    losses = 0
+    trade_returns = []
+
+    for i in range(1, len(close)):
+        prev = close[i - 1]
+        price = close[i]
+
+        if direction == "buy":
+            if price >= tp:
+                r = (tp - prev) / prev
+                wins += 1
+            elif price <= sl:
+                r = (sl - prev) / prev
+                losses += 1
+            else:
+                r = (price - prev) / prev
+        elif direction == "sell":
+            if price <= tp:
+                r = (prev - tp) / prev
+                wins += 1
+            elif price >= sl:
+                r = (prev - sl) / prev
+                losses += 1
+            else:
+                r = (prev - price) / prev
+        else:
+            r = 0
+
+        trade_returns.append(r)
+        equity.append(equity[-1] * (1 + r))
+
+    total_trades = max(wins + losses, 1)
+    winrate = wins / total_trades
+    total_return = equity[-1] - 1.0
+
+    return {
+        "winrate": float(winrate),
+        "total_return": float(total_return),
+        "equity_curve": pd.Series(equity, index=df.index[: len(equity)]),
+    }
