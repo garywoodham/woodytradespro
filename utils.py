@@ -1,27 +1,17 @@
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import ta
-import joblib
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.metrics import accuracy_score
 import warnings
+warnings.filterwarnings("ignore")
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# ---------------------------
-# Risk Multiplier Constants
-# ---------------------------
-RISK_MULT = {
-    "low": (0.5, 0.3),
-    "medium": (1.0, 0.7),
-    "high": (1.5, 1.0)
-}
-
-# ---------------------------
-# Global Config
-# ---------------------------
+# ==============================
+# CONFIGURATION
+# ==============================
 ASSET_SYMBOLS = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
@@ -34,32 +24,62 @@ ASSET_SYMBOLS = {
 }
 
 FEATURES = [
-    "Return", "MA_10", "MA_50", "RSI", "MACD", "Signal_Line", "ATR", "Momentum", "Sentiment"
+    "Return", "MA_10", "MA_50", "RSI", "MACD", "Signal_Line",
+    "ATR", "Momentum", "Sentiment"
 ]
 
-# ---------------------------
-# Data Fetching
-# ---------------------------
+RISK_MULT = {
+    "Low": 0.5,
+    "Medium": 1.0,
+    "High": 1.5
+}
+
+
+# ==============================
+# DATA FETCHING
+# ==============================
 def fetch_data(symbol, interval="1h", period=None):
-    """Download data safely from Yahoo Finance with interval-aware limits."""
+    """
+    Robust data fetcher for Yahoo Finance with auto-fallback logic.
+    Tries intraday → daily → weekly and keeps feature consistency.
+    """
     try:
         if period is None:
             if interval in ["1m", "5m", "15m", "30m", "1h"]:
-                period = "30d"  # Yahoo limit for intraday
+                period = "30d"
             else:
                 period = "1y"
 
+        # --- Try intraday first ---
+        print(f"📊 Fetching {symbol} [{interval}] for {period}...")
         df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=True,
-            threads=False
+            symbol, period=period, interval=interval,
+            progress=False, auto_adjust=True, threads=False
         )
 
+        # --- Fallback to daily if intraday fails ---
         if df.empty:
-            raise ValueError("No data returned from Yahoo")
+            print(f"⚠️ {symbol}: No {interval} data — retrying with 1d.")
+            df = yf.download(
+                symbol, period="6mo", interval="1d",
+                progress=False, auto_adjust=True, threads=False
+            )
+            df.attrs["data_source"] = "1d"
+
+        # --- Fallback to weekly if daily fails ---
+        if df.empty:
+            print(f"⚠️ {symbol}: No 1d data — retrying with 1wk.")
+            df = yf.download(
+                symbol, period="2y", interval="1wk",
+                progress=False, auto_adjust=True, threads=False
+            )
+            df.attrs["data_source"] = "1wk"
+
+        if df.empty:
+            print(f"❌ {symbol}: No data available at any interval.")
+            return pd.DataFrame()
+
+        df.attrs["data_source"] = df.attrs.get("data_source", interval)
 
         # --- Feature Engineering ---
         df.dropna(inplace=True)
@@ -67,110 +87,102 @@ def fetch_data(symbol, interval="1h", period=None):
         df["MA_10"] = df["Close"].rolling(10).mean()
         df["MA_50"] = df["Close"].rolling(50).mean()
         df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
+
         macd = ta.trend.MACD(df["Close"])
         df["MACD"] = macd.macd()
         df["Signal_Line"] = macd.macd_signal()
+
         df["ATR"] = ta.volatility.AverageTrueRange(
             df["High"], df["Low"], df["Close"]
         ).average_true_range()
+
         df["Momentum"] = ta.momentum.ROCIndicator(df["Close"]).roc()
 
-        # Sentiment (synthetic for now — could be replaced by real feed)
-        analyzer = SentimentIntensityAnalyzer()
-        df["Sentiment"] = np.random.uniform(-1, 1, len(df))  # placeholder random sentiment
+        # --- Add Sentiment (placeholder using random noise) ---
+        df["Sentiment"] = np.random.uniform(-1, 1, len(df))
 
         df.dropna(inplace=True)
+        print(f"✅ {symbol}: Loaded {len(df)} rows ({df.index[0].date()} → {df.index[-1].date()})")
         return df
 
     except Exception as e:
-        print(f"⚠️ Error fetching {symbol}: {e}")
+        print(f"❌ Error fetching {symbol}: {e}")
         return pd.DataFrame()
 
-# ---------------------------
-# ML Training + Prediction
-# ---------------------------
-def train_and_predict(df, interval="1h", risk="medium"):
-    """Train predictive model and make signal."""
+
+# ==============================
+# STATUS MESSAGE
+# ==============================
+def get_data_status_message(symbol, df):
+    """Generate friendly UI message about data status."""
+    if df.empty:
+        return f"❌ No data available for {symbol}"
+    source = df.attrs.get("data_source", "unknown")
+    if len(df) < 50:
+        return f"⚠️ Limited {source} data for {symbol} ({len(df)} candles)"
+    return f"✅ Loaded {symbol} ({source}, {len(df)} candles)"
+
+
+# ==============================
+# MODEL TRAINING & PREDICTION
+# ==============================
+def train_and_predict(df, horizon="1h", risk="Medium"):
+    """Train ML model and return predictions + metrics."""
+    df = df.copy()
+    df["Y"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    df.dropna(inplace=True)
+
+    X = df[FEATURES]
+    y = df["Y"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    clf = RandomForestClassifier(n_estimators=150, random_state=42)
+    clf.fit(X_train, y_train)
+
+    preds = clf.predict(X_test)
+    acc = accuracy_score(y_test, preds)
+    winrate = np.mean(preds == y_test)
+
+    latest_features = X.iloc[-1:].values
+    next_pred = clf.predict(latest_features)[0]
+    prob = clf.predict_proba(latest_features)[0][int(next_pred)]
+
+    signal = "BUY" if next_pred == 1 else "SELL"
+    tp = df["Close"].iloc[-1] * (1 + 0.02 * RISK_MULT[risk]) if signal == "BUY" else df["Close"].iloc[-1] * (1 - 0.02 * RISK_MULT[risk])
+    sl = df["Close"].iloc[-1] * (1 - 0.01 * RISK_MULT[risk]) if signal == "BUY" else df["Close"].iloc[-1] * (1 + 0.01 * RISK_MULT[risk])
+
+    prediction = {
+        "signal": signal,
+        "prob": round(float(prob), 3),
+        "accuracy": round(acc, 3),
+        "winrate": round(winrate, 3),
+        "tp": round(float(tp), 3),
+        "sl": round(float(sl), 3)
+    }
+
+    return X, clf, prediction
+
+
+# ==============================
+# BACKTEST SIMULATION
+# ==============================
+def backtest_signals(df, signal_col="Y"):
+    """Simple backtest engine for signal performance."""
     try:
-        if df.empty or len(df) < 50:
-            return None, None, {"signal": "HOLD", "prob": 0, "tp": 0, "sl": 0}
+        df = df.copy()
+        df["Position"] = np.where(df[signal_col] == 1, 1, -1)
+        df["Strategy_Return"] = df["Return"] * df["Position"].shift(1)
+        df["Equity_Curve"] = (1 + df["Strategy_Return"]).cumprod()
 
-        df["Y"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
-        df.dropna(inplace=True)
-
-        X = df[FEATURES]
-        y = df["Y"]
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-        clf = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42)
-        clf.fit(X_train, y_train)
-
-        prob = clf.predict_proba(X.tail(1))[0][1]
-        signal = "BUY" if prob > 0.55 else "SELL" if prob < 0.45 else "HOLD"
-
-        # Take Profit / Stop Loss logic
-        atr = df["ATR"].iloc[-1]
-        if risk == "low":
-            tp_mult, sl_mult = 0.5, 0.3
-        elif risk == "high":
-            tp_mult, sl_mult = 1.5, 1.0
-        else:
-            tp_mult, sl_mult = 1.0, 0.7
-
-        close = df["Close"].iloc[-1]
-        tp = close + atr * tp_mult if signal == "BUY" else close - atr * tp_mult
-        sl = close - atr * sl_mult if signal == "BUY" else close + atr * sl_mult
-
-        return X, clf, {"signal": signal, "prob": round(prob * 100, 2), "tp": tp, "sl": sl}
-
-    except Exception as e:
-        print(f"⚠️ Prediction error: {e}")
-        return None, None, {"signal": "HOLD", "prob": 0, "tp": 0, "sl": 0}
-
-# ---------------------------
-# Backtesting Simulation
-# ---------------------------
-def backtest_signals(df, threshold_buy=0.55, threshold_sell=0.45):
-    """Simulate performance using predicted probabilities."""
-    try:
-        if df.empty:
-            return {"equity_curve": [], "winrate": 0, "total_return": 0}
-
-        df["pred_prob"] = np.random.uniform(0, 1, len(df))  # placeholder prediction
-        df["signal"] = np.where(df["pred_prob"] > threshold_buy, 1,
-                         np.where(df["pred_prob"] < threshold_sell, -1, 0))
-
-        df["strategy_return"] = df["signal"].shift(1) * df["Return"]
-        df["equity_curve"] = (1 + df["strategy_return"]).cumprod()
-
-        wins = len(df[df["strategy_return"] > 0])
-        total = len(df[df["signal"] != 0])
-        winrate = round((wins / total) * 100, 2) if total > 0 else 0
-        total_return = round((df["equity_curve"].iloc[-1] - 1) * 100, 2)
+        total_return = df["Equity_Curve"].iloc[-1] - 1
+        winrate = (df["Strategy_Return"] > 0).mean()
 
         return {
-            "equity_curve": df["equity_curve"],
-            "winrate": winrate,
-            "total_return": total_return
+            "equity_curve": df["Equity_Curve"],
+            "total_return": round(float(total_return), 3),
+            "winrate": round(float(winrate), 3)
         }
 
     except Exception as e:
         print(f"⚠️ Backtest error: {e}")
-        return {"equity_curve": [], "winrate": 0, "total_return": 0}
-
-# ---------------------------
-# Helper: Overall Accuracy
-# ---------------------------
-def calculate_model_accuracy(df, clf):
-    """Compute model accuracy for display."""
-    try:
-        if df.empty or clf is None:
-            return 0.0
-
-        df["Y"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
-        X = df[FEATURES]
-        y = df["Y"]
-        acc = clf.score(X, y)
-        return round(acc * 100, 2)
-    except Exception:
-        return 0.0
+        return {"equity_curve": pd.Series(dtype=float), "total_return": 0, "winrate": 0}
