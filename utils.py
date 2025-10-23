@@ -43,29 +43,25 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # INTERNAL HELPERS
 # ───────────────────────────────────────────────
 def _normalize(df):
-    """
-    Normalize and clean an OHLCV dataframe.
-    Handles tuple MultiIndex columns from yfinance safely.
-    """
+    """Normalize and clean an OHLCV dataframe."""
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Flatten multi-index if present
+    # Flatten multi-index (from yfinance)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
 
-    # Capitalize single-level names safely
+    # Capitalize single columns
     df.columns = [str(c).capitalize() for c in df.columns]
 
-    # Replace infinities and fill missing
+    # Replace infinities and fill missing values
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
-    # Keep only valid price columns
     keep = ["Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in keep if c in df.columns]
     df = df[keep].dropna(how="any")
 
-    # Ensure numeric
+    # Ensure numeric types
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -73,9 +69,7 @@ def _normalize(df):
 
 
 def _mirror_fetch(symbol):
-    """
-    Secondary API to retrieve market data if Yahoo blocks direct calls.
-    """
+    """Fetch from Yahoo API directly (mirror) if blocked."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -92,7 +86,7 @@ def _mirror_fetch(symbol):
     return pd.DataFrame()
 
 # ───────────────────────────────────────────────
-# DATA FETCHING (CACHED)
+# FETCH DATA WITH CACHE & RETRIES
 # ───────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=False):
@@ -102,7 +96,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
     fname = f"{symbol.replace('^','').replace('=','_')}_{interval}.csv"
     fpath = os.path.join(DATA_DIR, fname)
 
-    # 1️⃣ Cached version if recent
+    # Try cached version if recent (<24h)
     if not force_refresh and os.path.exists(fpath):
         age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(fpath))
         if age < timedelta(hours=24):
@@ -114,8 +108,9 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
             except Exception as e:
                 st.warning(f"⚠️ Cache read failed for {symbol}: {e}")
 
-    # 2️⃣ Attempt Yahoo direct fetch
     df = pd.DataFrame()
+
+    # Retry loop for fetching from Yahoo
     for attempt in range(1, retries + 1):
         try:
             st.write(f"⏳ Attempt {attempt}: Fetching {symbol} from Yahoo...")
@@ -129,12 +124,12 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
             )
             df = _normalize(data)
 
-            # ✅ FIXED LOGIC: only retry if empty or too small
-            if df.empty or len(df) < 40:
-                st.write(f"⚠️ {symbol}: got {len(df)} rows, retrying...")
-            else:
-                st.write(f"✅ {symbol}: fetched {len(df)} rows.")
+            # ✅ Accept valid data (>=100 rows typical)
+            if df is not None and not df.empty and len(df) >= 100:
+                st.write(f"✅ {symbol}: fetched {len(df)} rows successfully.")
                 break
+            else:
+                st.write(f"⚠️ {symbol}: insufficient data ({len(df)} rows), retrying...")
 
         except Exception as e:
             if "Too Many Requests" in str(e):
@@ -145,7 +140,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
                 st.warning(f"⚠️ {symbol}: fetch error {e}")
         time.sleep(1 + random.random())
 
-    # 3️⃣ Mirror fallback
+    # Fallback: mirror API
     if df.empty:
         st.info(f"🪞 Attempting mirror fetch for {symbol}...")
         df = _mirror_fetch(symbol)
@@ -154,20 +149,21 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
         else:
             st.error(f"🚫 All fetch attempts failed for {symbol}.")
 
-    # 4️⃣ Save to cache
+    # Save cache
     if not df.empty:
         try:
             df.to_csv(fpath)
             st.write(f"💾 Cached {symbol} data → {fpath}")
         except Exception as e:
-            st.warning(f"⚠️ Could not save cache: {e}")
+            st.warning(f"⚠️ Could not save cache for {symbol}: {e}")
+
     return df
 
 # ───────────────────────────────────────────────
 # INDICATORS
 # ───────────────────────────────────────────────
 def add_indicators(df):
-    """Add EMA, RSI, MACD, and crossover logic."""
+    """Add EMA, RSI, MACD, and EMA cross features."""
     if df.empty:
         return df
 
@@ -179,16 +175,15 @@ def add_indicators(df):
     df["MACD"] = macd.macd()
     df["Signal"] = macd.macd_signal()
     df["EMA_Cross"] = np.where(df["EMA_20"] > df["EMA_50"], 1, 0)
-
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
     return df
 
 # ───────────────────────────────────────────────
-# TRADING THEORY OVERLAY
+# TRADING THEORY
 # ───────────────────────────────────────────────
 def apply_trading_theory(pred, df):
     """
-    Adjust model prediction confidence using EMA trend + RSI bias.
+    Adjust model confidence using EMA trend + RSI signals.
     """
     if df.empty:
         return pred, 1.0
@@ -207,13 +202,12 @@ def apply_trading_theory(pred, df):
 # ───────────────────────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
     """
-    Train Random Forest model to predict next move and compute TP/SL.
+    Train RandomForest model and generate buy/sell prediction with TP/SL.
     """
     df = add_indicators(df)
     if len(df) < 50:
         return None
 
-    # Target = next candle up or down
     df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
@@ -223,7 +217,6 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 
     X = df[feats].dropna()
     y = df.loc[X.index, "Target"]
-
     if len(X) < 40:
         return None
 
@@ -235,14 +228,13 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         prob = clf.predict_proba(X.iloc[[-1]])[0][cls]
         pred = "buy" if cls == 1 else "sell"
     except Exception as e:
-        st.warning(f"⚠️ Model failed: {e}")
+        st.warning(f"⚠️ Model failed for this asset: {e}")
         return None
 
-    # Apply trading theory adjustments
+    # Trading theory overlay
     pred, conf_adj = apply_trading_theory(pred, df)
     conf = min(1.0, prob * conf_adj)
 
-    # Compute ATR-like target zones
     atr = (df["High"] - df["Low"]).rolling(14).mean().iloc[-1]
     price = df["Close"].iloc[-1]
     mult = RISK_MULT.get(risk, 1.0)
@@ -261,9 +253,7 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 # BACKTESTING
 # ───────────────────────────────────────────────
 def backtest_signals(df, model_output):
-    """
-    Simple backtest based on EMA cross and model direction.
-    """
+    """Basic backtest using EMA crossover."""
     if df.empty or not model_output:
         return 0.0
 
@@ -275,12 +265,10 @@ def backtest_signals(df, model_output):
     return round(((df["Strategy"] + 1).prod() - 1) * 100, 2)
 
 # ───────────────────────────────────────────────
-# SUMMARY FUNCTION
+# AGGREGATE SUMMARY
 # ───────────────────────────────────────────────
 def summarize_assets(force_refresh=False):
-    """
-    Fetch, analyze, predict, and summarize all tracked assets.
-    """
+    """Fetch, analyze, predict, and summarize all assets."""
     results = []
     st.info("Fetching and analyzing market data... please wait ⏳")
 
