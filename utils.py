@@ -1,47 +1,53 @@
-# utils.py
+# utils.py  —  full module
 # --------------------------------------------------------------------------------------
-# WoodyTrades Pro - Utilities
-# Full version with:
-# - Robust data fetch (retries, mirror, caching)
-# - Intervals: 15m, 1h, 4h, 1d, 1w
-# - Indicators (RSI, MACD, EMA20/50) with lowercase aliases for safety
-# - ATR-based TP/SL with risk profiles
-# - ML trend model (Logistic Regression) + accuracy
-# - Backtesting helpers (win rate, expectancy, equity curve)
-# - Scenario helpers (backtest_signals, position sizing, trade plan)
-# - Asset summary builder for Overview tab
-# - Model signal + performance helpers for new summary tab
-#
-# Nothing removed; only additive fixes.
-# --------------------------------------------------------------------------------------
+# Robust data fetch, caching, indicators, signal engine (BUY/SELL/HOLD),
+# backtesting (win rate & total return), asset summarization for all tabs.
+# Safe against yfinance API quirks and pandas shape issues.
+
+from __future__ import annotations
 
 import os
 import time
-import json
 import math
-import warnings
-from dataclasses import dataclass
+import json
+from pathlib import Path
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
+
 import yfinance as yf
 
-from ta.momentum import RSIIndicator
+# Technical indicators (ta)
 from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-
 # --------------------------------------------------------------------------------------
-# Directories / Constants
+# CONSTANTS & CONFIG
 # --------------------------------------------------------------------------------------
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
 
-ASSET_SYMBOLS = {
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+# Restored all intervals (including 15m and 1wk) with sensible default periods and row targets
+INTERVALS: Dict[str, Dict[str, object]] = {
+    "15m": {"interval": "15m", "period": "5d", "min_rows": 150},
+    "1h":  {"interval": "60m", "period": "1mo", "min_rows": 300},
+    "4h":  {"interval": "240m", "period": "3mo", "min_rows": 250},
+    "1d":  {"interval": "1d", "period": "1y", "min_rows": 200},
+    "1wk": {"interval": "1wk", "period": "5y", "min_rows": 150},
+}
+
+# Risk multipliers for TP/SL (percent of ATR)
+RISK_MULT: Dict[str, Dict[str, float]] = {
+    "Low":    {"tp_atr": 1.0, "sl_atr": 1.5},
+    "Medium": {"tp_atr": 1.5, "sl_atr": 1.0},
+    "High":   {"tp_atr": 2.0, "sl_atr": 0.8},
+}
+
+# Asset map (kept as-is and widely used across tabs)
+ASSET_SYMBOLS: Dict[str, str] = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
     "S&P 500": "^GSPC",
@@ -52,471 +58,617 @@ ASSET_SYMBOLS = {
     "Bitcoin": "BTC-USD",
 }
 
-# Intervals config (kept exactly as requested)
-INTERVALS = {
-    "15m": {"interval": "15m", "period": "7d", "min_rows": 200},
-    "1h": {"interval": "1h", "period": "60d", "min_rows": 300},
-    "4h": {"interval": "4h", "period": "720d", "min_rows": 200},
-    "1d": {"interval": "1d", "period": "5y", "min_rows": 250},
-    "1w": {"interval": "1wk", "period": "10y", "min_rows": 150},
-}
-
-# Risk profiles (used by tabs and scenarios)
-RISK_MULT = {"Low": 0.75, "Medium": 1.0, "High": 1.5}
-
-# Default train interval used in summarize (can be overridden by tabs)
-DEFAULT_INTERVAL_KEY = "1h"
-
 # --------------------------------------------------------------------------------------
-# Helpers
+# HELPERS: Safe prints for Streamlit console visibility (tabs show what's happening)
 # --------------------------------------------------------------------------------------
-def cache_path(symbol: str, interval_key: str) -> str:
-    safe_symbol = symbol.replace("=", "_").replace("^", "")
-    return os.path.join(DATA_DIR, f"{safe_symbol}_{interval_key}.csv")
 
-
-def _safe_fill(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    return (
-        df.replace([np.inf, -np.inf], np.nan)
-          .ffill()
-          .bfill()
-    )
-
-
-def _has_ohlc(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-    needed = {"Open", "High", "Low", "Close"}
-    return needed.issubset(set(df.columns))
-
-
-def get_interval_params(interval_key: str):
-    return INTERVALS.get(interval_key, INTERVALS[DEFAULT_INTERVAL_KEY])
-
-
-# --------------------------------------------------------------------------------------
-# Data Fetching (retries + mirror + caching)
-# --------------------------------------------------------------------------------------
-def fetch_data(symbol: str, interval_key: str = DEFAULT_INTERVAL_KEY, max_retries: int = 4) -> pd.DataFrame:
-    """
-    Fetch market data with retry, caching, and mirror fallback.
-    Prints progress messages so the UI can echo them.
-    """
-    params = get_interval_params(interval_key)
-    period = params["period"]
-    interval = params["interval"]
-    min_rows = params["min_rows"]
-    path = cache_path(symbol, interval_key)
-
-    print(f"⏳ Fetching {symbol} ({interval})...")
-
-    # Load cache quickly if present and sufficient
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path, index_col=0, parse_dates=True)
-            if not df.empty and len(df) >= min_rows and _has_ohlc(df):
-                print(f"💾 Loaded cached {symbol} ({len(df)} rows)")
-                return _safe_fill(df)
-        except Exception:
-            pass
-
-    # Primary fetch with retries
-    for attempt in range(1, max_retries + 1):
-        print(f"⏳ Attempt {attempt}: Fetching {symbol} from Yahoo...")
-        try:
-            # yfinance Ticker.history avoids deprecation warnings about use of download kwargs
-            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
-            if isinstance(df, tuple) or df is None:
-                raise ValueError("Invalid data type returned")
-            if df.empty or len(df) < min_rows:
-                print(f"⚠️ {symbol}: invalid or insufficient data ({type(df)} with {len(df)} rows), retrying...")
-                time.sleep(2.0 + attempt)
-                continue
-            if not _has_ohlc(df):
-                print(f"⚠️ {symbol}: missing OHLC columns, retrying...")
-                time.sleep(1.5)
-                continue
-            df = _safe_fill(df)
-            df.to_csv(path)
-            print(f"💾 Cached {symbol} data → {path}")
-            return df
-        except Exception as e:
-            print(f"⚠️ {symbol}: fetch error {e}")
-            time.sleep(2.0 + attempt)
-
-    # Mirror fallback
-    print(f"🪞 Attempting mirror fetch for {symbol}...")
+def _log(msg: str) -> None:
+    # Print-only logging that is always visible in Streamlit terminal logs
     try:
-        df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
-        if not df.empty and _has_ohlc(df):
-            df = _safe_fill(df)
-            df.to_csv(path)
-            print(f"✅ Mirror fetch succeeded for {symbol}.")
-            return df
-    except Exception as e:
-        print(f"❌ Mirror fetch failed for {symbol}: {e}")
+        print(msg, flush=True)
+    except Exception:
+        pass
 
-    # Last-resort: return cache even if older/short
-    if os.path.exists(path):
+# --------------------------------------------------------------------------------------
+# DATA FETCH & CACHE
+# --------------------------------------------------------------------------------------
+
+def _cache_path(symbol: str, interval_key: str) -> Path:
+    safe_sym = symbol.replace("^", "").replace("=", "_").replace("/", "_").replace("-", "_")
+    return DATA_DIR / f"{safe_sym}_{interval_key}.csv"
+
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure we return a clean OHLCV DataFrame with DatetimeIndex and 1-D columns.
+    Fixes for:
+      - MultiIndex columns from yfinance
+      - ndarray shape (n,1) -> Series
+      - Mixed dtypes & NaNs
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    # If MultiIndex (columns like ('Open','GC=F')) -> take level 0
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Keep only known OHLCV columns if present
+    keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    if not keep:
+        # some indices come as 'close' lowercase from alternative sources
+        # standardize common variants
+        rename_map = {c: c.capitalize() for c in df.columns}
+        df = df.rename(columns=rename_map)
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+
+    df = df[keep].copy()
+
+    # Make sure index is datetime and sorted
+    if not isinstance(df.index, pd.DatetimeIndex):
         try:
-            df = pd.read_csv(path, index_col=0, parse_dates=True)
-            if not df.empty and _has_ohlc(df):
-                print(f"⚠️ Using last cached {symbol} (may be stale/short).")
-                return _safe_fill(df)
+            df.index = pd.to_datetime(df.index)
         except Exception:
             pass
+    df = df.sort_index()
 
-    print(f"🚫 No valid data fetched for {symbol}. Returning empty DataFrame.")
+    # Ensure each column is 1-D numeric where needed
+    for col in df.columns:
+        val = df[col].values
+        if isinstance(val, np.ndarray) and getattr(val, "ndim", 1) > 1:
+            df[col] = pd.Series(val.ravel(), index=df.index)
+        # force numeric for prices/volume except where it's clearly not numeric
+        if col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Drop rows with all-NaN and forward/back fill small gaps
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.ffill().bfill()
+    df = df.dropna(how="all")
+    return df
+
+def _yahoo_try_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """
+    Primary yahoo fetch using yf.download (robust to params). Avoids threads for stability.
+    """
+    try:
+        # yfinance can be finicky: disable threads and progress, let auto_adjust default be True (new default)
+        raw = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            threads=False,
+        )
+        return _normalize_ohlcv(raw)
+    except Exception as e:
+        _log(f"⚠️ {symbol}: fetch error {e}")
+        return pd.DataFrame()
+
+def _yahoo_mirror_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """
+    Mirror attempt using Ticker.history with a couple of parameter variants,
+    which often succeeds after rate-limit / CDN quirks.
+    """
+    try:
+        tk = yf.Ticker(symbol)
+        raw = tk.history(period=period, interval=interval, auto_adjust=True, prepost=False)
+        df = _normalize_ohlcv(raw)
+        if not df.empty:
+            return df
+        # variant: auto_adjust False
+        raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
+        return _normalize_ohlcv(raw2)
+    except Exception as e:
+        _log(f"⚠️ Mirror history error for {symbol}: {e}")
+        return pd.DataFrame()
+
+def fetch_data(
+    symbol: str,
+    interval_key: str = "1h",
+    use_cache: bool = True,
+    max_retries: int = 4,
+    backoff_range: Tuple[float, float] = (3.5, 12.5),
+) -> pd.DataFrame:
+    """
+    Unified fetch that:
+      1) uses cache if available and fresh enough to meet min_rows
+      2) tries Yahoo (retries) then mirror
+      3) writes CSV cache when successful
+    """
+    if interval_key not in INTERVALS:
+        raise KeyError(f"Unknown interval_key '{interval_key}'. Known: {list(INTERVALS.keys())}")
+
+    interval = str(INTERVALS[interval_key]["interval"])
+    period   = str(INTERVALS[interval_key]["period"])
+    min_rows = int(INTERVALS[interval_key]["min_rows"])
+
+    _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
+
+    cache_fp = _cache_path(symbol, interval_key)
+
+    # 1) Try cache
+    if use_cache and cache_fp.exists():
+        try:
+            cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
+            cached = _normalize_ohlcv(cached)
+            if len(cached) >= min_rows:
+                _log(f"✅ Using cached {symbol} ({len(cached)} rows).")
+                return cached
+            else:
+                _log(f"ℹ️ Cache exists for {symbol} but only {len(cached)} rows; needs {min_rows}.")
+        except Exception as e:
+            _log(f"⚠️ Cache read failed for {symbol}: {e}")
+
+    # 2) Live fetch with retry backoff
+    for attempt in range(1, max_retries + 1):
+        _log(f"⏳ Attempt {attempt}: Fetching {symbol} from Yahoo...")
+        df = _yahoo_try_download(symbol, interval, period)
+        if not df.empty and len(df) >= min_rows:
+            _log(f"✅ {symbol}: fetched {len(df)} rows.")
+            try:
+                df.to_csv(cache_fp)
+                _log(f"💾 Cached {symbol} data → {cache_fp}")
+            except Exception as e:
+                _log(f"⚠️ Cache write failed for {symbol}: {e}")
+            return df
+
+        got = len(df) if isinstance(df, pd.DataFrame) else "N/A"
+        _log(f"⚠️ {symbol}: invalid or insufficient data ({type(df)} with {got} rows), retrying...")
+        # backoff
+        low, high = backoff_range
+        time.sleep(np.random.uniform(low, high))
+
+    # 3) Mirror fallback
+    _log(f"🪞 Attempting mirror fetch for {symbol}...")
+    df = _yahoo_mirror_history(symbol, interval, period)
+    if not df.empty and len(df) >= min_rows:
+        _log(f"✅ Mirror fetch succeeded for {symbol}.")
+        try:
+            df.to_csv(cache_fp)
+            _log(f"💾 Cached {symbol} data → {cache_fp}")
+        except Exception as e:
+            _log(f"⚠️ Cache write failed for {symbol}: {e}")
+        return df
+
+    _log(f"🚫 All attempts failed for {symbol}, returning empty DataFrame.")
     return pd.DataFrame()
 
+# --------------------------------------------------------------------------------------
+# INDICATORS
+# --------------------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------------------
-# Indicators
-# --------------------------------------------------------------------------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add RSI, MACD (and signal), EMA_20, EMA_50, ATR (14).
-    Also provides lowercase aliases to prevent KeyErrors in plotting tabs.
+    Adds EMA20, EMA50, RSI(14), MACD(12,26,9), ATR(14).
+    Exposes both 'RSI' and 'rsi' to be compatible with Trends tab.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    if not _has_ohlc(df):
-        return df
-
     df = df.copy()
-    df = _safe_fill(df)
 
+    # Guarantee close/high/low are 1-D and numeric
+    for col in ["Close", "High", "Low"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+        vals = df[col].values
+        if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
+            df[col] = pd.Series(vals.ravel(), index=df.index)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # EMA
     try:
-        # Core indicators
-        df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
-        df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
-        df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
-        macd_calc = MACD(df["Close"])
-        df["MACD"] = macd_calc.macd()
-        df["Signal"] = macd_calc.macd_signal()
-        df["ATR_14"] = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+        df["ema20"] = EMAIndicator(close=df["Close"], window=20).ema_indicator()
+        df["ema50"] = EMAIndicator(close=df["Close"], window=50).ema_indicator()
+    except Exception:
+        # fallbacks if ta hiccups
+        df["ema20"] = df["Close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-        # Lowercase aliases (tabs sometimes reference lowercase)
-        df["rsi"] = df["RSI"]
-        df["ema20"] = df["EMA_20"]
-        df["ema50"] = df["EMA_50"]
-        df["macd"] = df["MACD"]
-        df["signal"] = df["Signal"]
-        df["atr"] = df["ATR_14"]
-    except Exception as e:
-        print(f"⚠️ Indicator calculation failed: {e}")
-
-    return _safe_fill(df)
-
-
-# --------------------------------------------------------------------------------------
-# TP/SL computation (ATR-based) + Trading Theory helpers
-# --------------------------------------------------------------------------------------
-def compute_tp_sl(close: float, atr: float, direction: str, risk_level: str = "Medium", tp_mult: float = 2.0):
-    """
-    ATR-based TP/SL with risk multiplier.
-    """
-    mult = RISK_MULT.get(risk_level, 1.0)
-    # Protect against zero/NaN ATR
-    if atr is None or np.isnan(atr) or atr <= 0:
-        atr = close * 0.005  # fallback ~0.5%
-
-    sl_dist = atr * mult
-    tp_dist = atr * mult * tp_mult
-
-    if direction == "Buy":
-        tp = close + tp_dist
-        sl = close - sl_dist
-    elif direction == "Sell":
-        tp = close - tp_dist
-        sl = close + sl_dist
-    else:
-        tp, sl = close, close
-    return tp, sl
-
-
-@dataclass
-class TradePlan:
-    direction: str
-    confidence: float
-    entry: float
-    tp: float
-    sl: float
-    rr: float
-    risk_level: str
-
-
-def build_trade_plan(df: pd.DataFrame, direction: str, risk_level: str = "Medium", tp_mult: float = 2.0) -> TradePlan:
-    df = add_indicators(df)
-    if df.empty or "Close" not in df:
-        return TradePlan("Hold", 0, 0, 0, 0, 0, risk_level)
-    close = float(df["Close"].iloc[-1])
-    atr = float(df["atr"].iloc[-1]) if "atr" in df else np.nan
-    tp, sl = compute_tp_sl(close, atr, direction, risk_level, tp_mult=tp_mult)
-    rr = abs((tp - close) / (close - sl)) if sl != close else 0
-    confidence = 0.0
-    if "macd" in df and "signal" in df:
-        diff = float(df["macd"].iloc[-1] - df["signal"].iloc[-1])
-        confidence = min(abs(diff) * 100, 100)
-    return TradePlan(direction, confidence, close, tp, sl, rr, risk_level)
-
-
-# --------------------------------------------------------------------------------------
-# ML Model (Logistic Regression trend predictor)
-# --------------------------------------------------------------------------------------
-def train_and_predict(df: pd.DataFrame, horizon: str = "1h", risk_level: str = "Medium"):
-    """
-    Train LR on indicators to predict next-bar direction.
-    Returns a dict with: 'signal', 'accuracy', 'tp', 'sl'
-    """
-    result = {"signal": None, "accuracy": 0.0, "tp": None, "sl": None}
-    if df is None or df.empty:
-        return result
-
-    df = add_indicators(df)
-    if df.empty:
-        return result
-
-    # Define target: next close up/down
+    # RSI
     try:
-        df["Target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-        features = ["RSI", "EMA_20", "EMA_50", "MACD", "Signal"]
-        df = df.dropna(subset=features + ["Target"])
-        if len(df) < 150:
-            return result
+        rsi_series = RSIIndicator(close=df["Close"], window=14).rsi()
+    except Exception:
+        # naive RSI fallback
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi_series = 100 - (100 / (1 + rs))
 
-        X = df[features].values
-        y = df["Target"].values
+    df["RSI"] = rsi_series
+    df["rsi"] = df["RSI"]  # ensure Trends tab never KeyError('rsi')
 
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
+    # MACD
+    try:
+        macd = MACD(close=df["Close"])
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        df["macd_hist"] = macd.macd_diff()
+    except Exception:
+        # fallback simple MACD
+        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+        df["macd"] = ema12 - ema26
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-        split = int(len(Xs) * 0.8)
-        X_train, X_test = Xs[:split], Xs[split:]
-        y_train, y_test = y[:split], y[split:]
+    # ATR
+    try:
+        atr = AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14)
+        df["atr"] = atr.average_true_range()
+    except Exception:
+        tr1 = (df["High"] - df["Low"]).abs()
+        tr2 = (df["High"] - df["Close"].shift(1)).abs()
+        tr3 = (df["Low"] - df["Close"].shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df["atr"] = tr.rolling(14).mean()
 
-        model = LogisticRegression(max_iter=300)
-        model.fit(X_train, y_train)
-        acc = float(model.score(X_test, y_test))
-
-        last_pred = int(model.predict(Xs[-1].reshape(1, -1))[0])
-        direction = "Buy" if last_pred == 1 else "Sell"
-
-        # TP/SL from ATR theory
-        close = float(df["Close"].iloc[-1])
-        atr = float(df["ATR_14"].iloc[-1]) if "ATR_14" in df else np.nan
-        tp, sl = compute_tp_sl(close, atr, direction, risk_level, tp_mult=2.0)
-
-        result.update({"signal": direction, "accuracy": acc * 100.0, "tp": tp, "sl": sl})
-    except Exception as e:
-        print(f"⚠️ Prediction error: {e}")
-
-    return result
-
+    # Clean edges
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+    return df
 
 # --------------------------------------------------------------------------------------
-# Backtesting / Scenarios
+# SIGNAL ENGINE (BUY/SELL/HOLD) + TP/SL
 # --------------------------------------------------------------------------------------
-def backtest_signals(df: pd.DataFrame, rule: str = "macd_cross", hold_period: int = 1):
-    """
-    Simple backtest engine.
-    rule:
-      - 'macd_cross': long when MACD>Signal, short when MACD<Signal
-      - 'ema_trend': long when EMA20>EMA50, short when EMA20<EMA50
-    hold_period: number of bars to hold each signal (if not flipped earlier)
-    Returns dict with win_rate, expectancy, total_return, n_trades, and per-trade series.
-    """
-    out = {"win_rate": 0.0, "expectancy": 0.0, "total_return": 0.0, "n_trades": 0, "equity_curve": None}
-    if df is None or df.empty:
-        return out
 
-    df = add_indicators(df)
-    if df.empty:
-        return out
+def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
+    """
+    Rule-based ensemble:
+      - EMA cross: ema20 above ema50 => bullish bias, below => bearish bias
+      - RSI: <30 oversold (bullish), >70 overbought (bearish)
+      - MACD cross up/down supports trend
+    Result: ('Buy' | 'Sell' | 'Hold', probability 0..1)
+    """
+    score = 0.0
+    votes = 0
 
-    df = df.copy()
-    df["signal_num"] = 0
-    if rule == "macd_cross" and "macd" in df and "signal" in df:
-        df.loc[df["macd"] > df["signal"], "signal_num"] = 1
-        df.loc[df["macd"] < df["signal"], "signal_num"] = -1
-    elif rule == "ema_trend" and "ema20" in df and "ema50" in df:
-        df.loc[df["ema20"] > df["ema50"], "signal_num"] = 1
-        df.loc[df["ema20"] < df["ema50"], "signal_num"] = -1
+    # EMA trend
+    if pd.notna(row["ema20"]) and pd.notna(row["ema50"]):
+        votes += 1
+        if row["ema20"] > row["ema50"]:
+            score += 1.0
+        elif row["ema20"] < row["ema50"]:
+            score -= 1.0
+
+    # RSI context
+    if pd.notna(row["RSI"]):
+        votes += 1
+        if row["RSI"] < 30:
+            score += 1.0
+        elif row["RSI"] > 70:
+            score -= 1.0
+
+    # MACD cross
+    if pd.notna(row["macd"]) and pd.notna(row["macd_signal"]) and pd.notna(row_prev["macd"]) and pd.notna(row_prev["macd_signal"]):
+        votes += 1
+        crossed_up = (row_prev["macd"] <= row_prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
+        crossed_dn = (row_prev["macd"] >= row_prev["macd_signal"]) and (row["macd"] < row["macd_signal"])
+        if crossed_up:
+            score += 1.0
+        elif crossed_dn:
+            score -= 1.0
+
+    # Normalize confidence
+    conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
+
+    # Decision with HOLD buffer (don’t force trades)
+    if score >= 0.67 * votes:
+        return "Buy", conf
+    elif score <= -0.67 * votes:
+        return "Sell", conf
     else:
-        return out
+        return "Hold", 1.0 - conf  # low conviction -> Hold
 
-    # Strategy returns: position * next-bar return
-    df["future_ret"] = df["Close"].pct_change().shift(-1)
-    df["strat_ret"] = df["signal_num"] * df["future_ret"]
-    # Optionally enforce hold period by rolling but keep it simple as cross flips anyway
+def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
+    """
+    Price-based TP/SL using ATR and risk multipliers.
+    """
+    m = RISK_MULT.get(risk, RISK_MULT["Medium"])
+    tp_k = float(m["tp_atr"])
+    sl_k = float(m["sl_atr"])
+    tp = price + tp_k * atr if side == "Buy" else price - tp_k * atr
+    sl = price - sl_k * atr if side == "Buy" else price + sl_k * atr
+    return float(tp), float(sl)
 
-    # Trade stats
-    rets = df["strat_ret"].dropna()
-    if rets.empty:
-        return out
-    wins = (rets > 0).sum()
-    n = len(rets)
-    win_rate = (wins / n) * 100.0
-    expectancy = rets.mean() * 100.0
-    equity = (1 + rets.fillna(0)).cumprod()
+def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[str, object]]:
+    """
+    Compute the latest signal/TP/SL based on the last 2 rows (needs indicators).
+    """
+    if df is None or df.empty or len(df) < 60:
+        return None
+    df = add_indicators(df)
+    if df.empty or len(df) < 60:
+        return None
 
-    out.update(
-        {
-            "win_rate": win_rate,
-            "expectancy": expectancy,
-            "total_return": (equity.iloc[-1] - 1.0) * 100.0,
-            "n_trades": int(n),
-            "equity_curve": equity,
+    row_prev = df.iloc[-2]
+    row = df.iloc[-1]
+    side, prob = compute_signal_row(row_prev, row)
+
+    if side == "Hold":
+        return {
+            "side": "Hold",
+            "prob": prob,
+            "price": float(row["Close"]),
+            "tp": None,
+            "sl": None,
+            "atr": float(row["atr"]) if pd.notna(row["atr"]) else None,
         }
-    )
+
+    atr_val = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].iloc[-14:].mean())
+    tp, sl = compute_tp_sl(price=float(row["Close"]), atr=atr_val, side=side, risk=risk)
+
+    return {
+        "side": side,
+        "prob": prob,
+        "price": float(row["Close"]),
+        "tp": tp,
+        "sl": sl,
+        "atr": atr_val,
+    }
+
+# --------------------------------------------------------------------------------------
+# BACKTEST
+# --------------------------------------------------------------------------------------
+
+def backtest_signals(
+    df: pd.DataFrame,
+    risk: str = "Medium",
+    hold_allowed: bool = True,
+) -> Dict[str, object]:
+    """
+    Simple sequential backtest:
+      - Enter when signal flips from Hold/flat to Buy or Sell
+      - Exit at TP or SL (simulated on future bars) or when opposite signal appears
+      - Reports win rate, total return (%), #trades and trade list
+    """
+    out = {
+        "win_rate": None,
+        "total_return_pct": None,
+        "n_trades": 0,
+        "trades": [],
+    }
+
+    if df is None or df.empty or len(df) < 120:
+        return out
+
+    df = add_indicators(df)
+    if df.empty:
+        return out
+
+    # Build signals per-bar
+    signals: List[Tuple[pd.Timestamp, str, float, float, float]] = []  # (ts, side, conf, tp, sl)
+    prev = df.iloc[0]
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        side, conf = compute_signal_row(prev, row)
+        if side == "Hold" and hold_allowed:
+            signals.append((row.name, "Hold", conf, np.nan, np.nan))
+        else:
+            atr_here = row["atr"] if pd.notna(row["atr"]) else df["atr"].iloc[max(0, i-14):i+1].mean()
+            tp, sl = compute_tp_sl(row["Close"], atr_here, side, risk)
+            signals.append((row.name, side, conf, tp, sl))
+        prev = row
+
+    # Walk forward: enter on Buy/Sell when flat or switching direction
+    position = None  # None | ("Buy"|"Sell", entry_px, tp, sl, entry_time)
+    eq_curve = 0.0
+    wins = 0
+    trades = []
+
+    # Using next bars to detect TP/SL hits
+    for idx in range(1, len(df)):
+        ts, side, conf, tp, sl = signals[idx]
+        price = float(df["Close"].iloc[idx])
+
+        if position is None:
+            if side in ("Buy", "Sell"):
+                position = (side, price, tp, sl, ts)
+        else:
+            pos_side, entry_px, pos_tp, pos_sl, entry_ts = position
+            high = float(df["High"].iloc[idx])
+            low = float(df["Low"].iloc[idx])
+
+            exit_reason = None
+            exit_px = price
+
+            if pos_side == "Buy":
+                # hit TP/SL?
+                if not np.isnan(pos_tp) and high >= pos_tp:
+                    exit_reason = "TP"
+                    exit_px = pos_tp
+                elif not np.isnan(pos_sl) and low <= pos_sl:
+                    exit_reason = "SL"
+                    exit_px = pos_sl
+                elif side == "Sell":  # opposite signal
+                    exit_reason = "Flip"
+            else:  # Sell
+                if not np.isnan(pos_tp) and low <= pos_tp:
+                    exit_reason = "TP"
+                    exit_px = pos_tp
+                elif not np.isnan(pos_sl) and high >= pos_sl:
+                    exit_reason = "SL"
+                    exit_px = pos_sl
+                elif side == "Buy":
+                    exit_reason = "Flip"
+
+            if exit_reason:
+                ret = (exit_px - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
+                eq_curve += ret
+                wins += 1 if ret > 0 else 0
+                trades.append({
+                    "entry_time": entry_ts,
+                    "exit_time": ts,
+                    "side": pos_side,
+                    "entry": entry_px,
+                    "exit": exit_px,
+                    "reason": exit_reason,
+                    "return_pct": ret * 100.0,
+                })
+                position = None
+
+                # If flip, immediately enter new
+                if exit_reason == "Flip" and side in ("Buy", "Sell"):
+                    position = (side, price, tp, sl, ts)
+
+    n = len(trades)
+    out["n_trades"] = n
+    if n > 0:
+        out["win_rate"] = 100.0 * (wins / n)
+        out["total_return_pct"] = 100.0 * eq_curve
+    else:
+        out["win_rate"] = 0.0
+        out["total_return_pct"] = 0.0
+    out["trades"] = trades
     return out
 
-
-def simulate_position_size(balance: float, risk_pct: float, entry: float, sl: float, contract_size: float = 1.0):
-    """
-    Basic position sizing using fixed % risk of balance and distance to SL.
-    """
-    if entry <= 0 or sl <= 0 or balance <= 0 or risk_pct <= 0:
-        return 0.0, 0.0
-    risk_amt = balance * risk_pct
-    stop_dist = abs(entry - sl)
-    if stop_dist <= 0:
-        return 0.0, 0.0
-    units = (risk_amt / stop_dist) / contract_size
-    return units, risk_amt
-
-
 # --------------------------------------------------------------------------------------
-# Overview / Summary helpers
+# PIPELINES FOR TABS
 # --------------------------------------------------------------------------------------
-def summarize_assets(interval_key: str = DEFAULT_INTERVAL_KEY, risk_level: str = "Medium") -> pd.DataFrame:
+
+def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache: bool = True) -> Optional[Dict[str, object]]:
     """
-    Iterate assets, fetch data, run ML prediction, run short backtest, return tidy DataFrame.
-    Columns: Asset, Symbol, Price, Signal, Accuracy, TP, SL, WinRate, Expectancy, NTrades
+    Full pipeline for a single asset:
+      - fetch (cache+retry+mirror)
+      - indicators
+      - latest signal & TP/SL
+      - backtest stats (win rate, total return)
+    """
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
+    if df.empty:
+        return None
+
+    # Indicators
+    df = add_indicators(df)
+    if df.empty:
+        return None
+
+    # Latest prediction
+    pred = latest_prediction(df, risk=risk)
+    if pred is None:
+        return None
+
+    # Backtest (on the fetched window)
+    bt = backtest_signals(df, risk=risk, hold_allowed=True)
+
+    out = {
+        "symbol": symbol,
+        "interval_key": interval_key,
+        "risk": risk,
+        "last_price": float(df["Close"].iloc[-1]),
+        "signal": pred["side"],
+        "probability": float(round(pred["prob"] * 100.0, 2)),
+        "tp": pred["tp"],
+        "sl": pred["sl"],
+        "atr": pred["atr"],
+        "win_rate": bt.get("win_rate", None),
+        "total_return_pct": bt.get("total_return_pct", None),
+        "n_trades": bt.get("n_trades", 0),
+        "df": df,               # for charts in tabs
+        "trades": bt["trades"], # for scenario tab table/chart
+    }
+    return out
+
+def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache: bool = True) -> pd.DataFrame:
+    """
+    Iterate across ASSET_SYMBOLS and return a tidy summary DataFrame used in Overview/Insights/Summary tabs.
+    Also prints progress lines exactly like you asked (kept behavior).
     """
     rows = []
+    _log("Fetching and analyzing market data... please wait ⏳")
     for asset, symbol in ASSET_SYMBOLS.items():
+        _log(f"⏳ Fetching {asset} ({symbol})...")
         try:
-            print(f"⏳ Processing {asset} ({symbol}) ...")
-            df = fetch_data(symbol, interval_key=interval_key)
-            if df.empty:
-                print(f"⚠️ Skipping {asset} (no data)")
+            res = analyze_asset(symbol, interval_key=interval_key, risk=risk, use_cache=use_cache)
+            if res is None:
+                _log(f"⚠️ Could not analyze {asset}.")
                 continue
 
-            pred = train_and_predict(df, horizon=interval_key, risk_level=risk_level)
-            if not pred["signal"]:
-                print(f"⚠️ Could not predict {asset}.")
-                continue
-
-            back = backtest_signals(df, rule="macd_cross")
-            rows.append(
-                {
-                    "Asset": asset,
-                    "Symbol": symbol,
-                    "Price": float(df["Close"].iloc[-1]),
-                    "Signal": pred["signal"],
-                    "Accuracy": round(pred["accuracy"], 2),
-                    "TP": round(pred["tp"], 5) if pred["tp"] else None,
-                    "SL": round(pred["sl"], 5) if pred["sl"] else None,
-                    "WinRate": round(back["win_rate"], 2) if back else 0.0,
-                    "Expectancy(%)": round(back["expectancy"], 3) if back else 0.0,
-                    "Trades": int(back["n_trades"]) if back else 0,
-                }
-            )
+            rows.append({
+                "Asset": asset,
+                "Symbol": symbol,
+                "Interval": interval_key,
+                "Price": res["last_price"],
+                "Signal": res["signal"],
+                "Probability_%": res["probability"],
+                "TP": res["tp"],
+                "SL": res["sl"],
+                "WinRate_%": res["win_rate"],
+                "BacktestReturn_%": res["total_return_pct"],
+                "Trades": res["n_trades"],
+            })
         except Exception as e:
-            print(f"⚠️ Error processing {asset}: {e}")
-            continue
+            _log(f"❌ Error analyzing {asset}: {e}")
 
     if not rows:
+        _log("No assets could be analyzed. Please check your internet connection or data source.")
         return pd.DataFrame()
 
-    df_out = pd.DataFrame(rows)
-    return df_out.sort_values(by=["Accuracy", "WinRate", "Expectancy(%)"], ascending=False).reset_index(drop=True)
-
+    df = pd.DataFrame(rows)
+    # Order columns nicely
+    cols = [
+        "Asset", "Symbol", "Interval", "Price",
+        "Signal", "Probability_%", "TP", "SL",
+        "WinRate_%", "BacktestReturn_%", "Trades"
+    ]
+    df = df[[c for c in cols if c in df.columns]]
+    return df
 
 # --------------------------------------------------------------------------------------
-# New summary-tab helpers (explicit, for one-page view)
+# Utilities for tabs to pull a single asset (used by Detailed/Trends/Scenarios)
 # --------------------------------------------------------------------------------------
-def get_model_signal(df: pd.DataFrame):
+
+def load_asset_with_indicators(asset: str, interval_key: str, use_cache: bool = True) -> Tuple[str, pd.DataFrame]:
     """
-    Return current model recommendation, confidence, and TP/SL from MACD + ATR.
+    Given display asset name (e.g., 'Gold'), fetch symbol and return (symbol, df_with_indicators)
     """
+    if asset not in ASSET_SYMBOLS:
+        raise KeyError(f"Unknown asset '{asset}'")
+    symbol = ASSET_SYMBOLS[asset]
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     df = add_indicators(df)
-    if df.empty or "macd" not in df or "signal" not in df or "Close" not in df:
-        return "Hold", 0.0, None, None
+    return symbol, df
 
-    macd_val = float(df["macd"].iloc[-1])
-    sig_val = float(df["signal"].iloc[-1])
-    close = float(df["Close"].iloc[-1])
-    diff = macd_val - sig_val
-    confidence = min(abs(diff) * 100, 100)
-
-    if diff > 0:
-        direction = "Buy"
-    elif diff < 0:
-        direction = "Sell"
-    else:
-        direction = "Hold"
-
-    atr = float(df["atr"].iloc[-1]) if "atr" in df else np.nan
-    tp, sl = compute_tp_sl(close, atr, direction, "Medium", tp_mult=2.0)
-    return direction, confidence, tp, sl
-
-
-def calculate_model_performance(df: pd.DataFrame):
+def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache: bool = True) -> Tuple[Optional[Dict[str, object]], pd.DataFrame]:
     """
-    Backtest MACD strategy for win rate, expectancy and equity curve (for summary tab).
+    Helper for Scenarios/Trends tabs: returns (prediction dict, df_with_indicators) for selected asset.
     """
+    symbol = ASSET_SYMBOLS.get(asset)
+    if not symbol:
+        return None, pd.DataFrame()
+
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
+    if df.empty:
+        return None, pd.DataFrame()
     df = add_indicators(df)
-    out = {"win_rate": 0.0, "avg_return": 0.0, "equity_curve": None}
-    if df.empty or "macd" not in df or "signal" not in df:
-        return out
+    if df.empty:
+        return None, pd.DataFrame()
 
-    df["signal_num"] = 0
-    df.loc[df["macd"] > df["signal"], "signal_num"] = 1
-    df.loc[df["macd"] < df["signal"], "signal_num"] = -1
-    df["future_ret"] = df["Close"].pct_change().shift(-1)
-    df["strat_ret"] = df["signal_num"] * df["future_ret"]
-    rets = df["strat_ret"].dropna()
-    if rets.empty:
-        return out
+    pred = latest_prediction(df, risk=risk)
+    bt = backtest_signals(df, risk=risk, hold_allowed=True)
 
-    out["win_rate"] = float((rets > 0).mean() * 100)
-    out["avg_return"] = float(rets.mean() * 100)
-    out["equity_curve"] = (1 + rets.fillna(0)).cumprod()
-    return out
+    if pred is None:
+        return None, df
 
-
-# --------------------------------------------------------------------------------------
-# Convenience: fetch one fully-prepped dataset for a tab
-# --------------------------------------------------------------------------------------
-def get_prepared_data(symbol: str, interval_key: str) -> pd.DataFrame:
-    df = fetch_data(symbol, interval_key=interval_key)
-    return add_indicators(df)
-
-
-# --------------------------------------------------------------------------------------
-# Quick CSV export utility (optional use in tabs)
-# --------------------------------------------------------------------------------------
-def export_dataframe_csv(df: pd.DataFrame, filename: str) -> str:
-    """
-    Save DataFrame to /data and return path (for Streamlit download button).
-    """
-    if df is None or df.empty:
-        return ""
-    path = os.path.join(DATA_DIR, filename)
-    df.to_csv(path, index=True)
-    return path
-
+    pred_out = {
+        "asset": asset,
+        "symbol": symbol,
+        "interval": interval_key,
+        "price": float(df["Close"].iloc[-1]),
+        "side": pred["side"],
+        "probability": float(round(pred["prob"] * 100.0, 2)),
+        "tp": pred["tp"],
+        "sl": pred["sl"],
+        "atr": pred["atr"],
+        "win_rate": bt.get("win_rate", None),
+        "backtest_return_pct": bt.get("total_return_pct", None),
+        "n_trades": bt.get("n_trades", 0),
+        "trades": bt.get("trades", []),
+    }
+    return pred_out, df
 
 # --------------------------------------------------------------------------------------
-# Diagnostics (kept for visibility)
+# END OF MODULE
 # --------------------------------------------------------------------------------------
-def diagnostics(df: pd.DataFrame) -> dict:
-    if df is None or df.empty:
-        return {"rows": 0, "has_ohlc": False, "has_indicators": False}
-    has_ind = all(col in df.columns for col in ["RSI", "EMA_20", "EMA_50", "MACD", "Signal", "ATR_14"])
-    return {"rows": len(df), "has_ohlc": _has_ohlc(df), "has_indicators": has_ind}
