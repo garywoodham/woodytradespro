@@ -120,7 +120,7 @@ def render_scenarios():
     else:
         st.info("ℹ️ MACD data not available for this timeframe.")
 
-    # --- Scenario summary (AI-style placeholder, can be replaced with real model) ---
+    # --- Scenario summary ---
     st.subheader("📊 Market Scenario Summary")
     st.markdown(
         f"""
@@ -131,3 +131,57 @@ def render_scenarios():
         - **MACD Signal:** {'Bullish' if macd_col and df[macd_col].iloc[-1] > df[signal_col].iloc[-1] else 'Bearish' if macd_col else 'N/A'}
         """
     )
+
+    # --- Simulated win rate & returns ---
+    st.subheader("💰 Strategy Performance Simulation")
+
+    close = df[get_col(df, "Close")].dropna()
+
+    if macd_col and signal_col and len(close) > 50:
+        df["signal"] = 0
+        df.loc[df[macd_col] > df[signal_col], "signal"] = 1  # Buy
+        df.loc[df[macd_col] < df[signal_col], "signal"] = -1  # Sell
+
+        # shift to simulate signal before next price change
+        df["future_return"] = close.pct_change().shift(-1)
+        df["strategy_return"] = df["signal"] * df["future_return"]
+
+        total_return = (df["strategy_return"] + 1).prod() - 1
+        win_rate = (df["strategy_return"] > 0).mean() * 100
+
+        st.write(
+            f"""
+            **Simulated Results (MACD-based strategy):**  
+            - ✅ **Win Rate:** {win_rate:.2f}%  
+            - 💹 **Cumulative Return:** {total_return * 100:.2f}%  
+            - 📈 **Holding Period:** {len(df)} data points  
+            """
+        )
+
+        # Chart: cumulative performance
+        fig_perf = go.Figure()
+        fig_perf.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=(1 + df["strategy_return"].fillna(0)).cumprod(),
+                mode="lines",
+                name="Strategy Equity Curve",
+            )
+        )
+        fig_perf.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=(close / close.iloc[0]),
+                mode="lines",
+                name="Buy & Hold",
+            )
+        )
+        fig_perf.update_layout(
+            title="Simulated Performance vs Buy & Hold",
+            yaxis_title="Equity Growth (normalized)",
+            height=400,
+        )
+        st.plotly_chart(fig_perf, use_container_width=True, config={"displaylogo": False})
+
+    else:
+        st.info("ℹ️ Not enough MACD data to simulate performance for this timeframe.")
