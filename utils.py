@@ -43,15 +43,22 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # INTERNAL HELPERS
 # ───────────────────────────────────────────────
 def _normalize(df):
-    """Standardize OHLCV dataframe."""
+    """Standardize OHLCV dataframe safely (handles tuples)."""
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.copy()
-    df.columns = [c.capitalize() for c in df.columns]
+
+    # If MultiIndex columns (tuple), flatten them
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
+
+    # Now safely capitalize simple column names
+    df.columns = [str(c).capitalize() for c in df.columns]
+
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    keep = ["Open", "High", "Low", "Close", "Volume"]
-    df = df[[c for c in keep if c in df.columns]]
-    return df.dropna(how="any")
+
+    # Keep core OHLCV columns if present
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    return df[keep].dropna(how="any")
 
 
 def _mirror_fetch(symbol):
@@ -70,7 +77,6 @@ def _mirror_fetch(symbol):
         print(f"🚫 Mirror fetch failed for {symbol}: {e}")
     return pd.DataFrame()
 
-
 # ───────────────────────────────────────────────
 # DATA FETCHING (CACHED)
 # ───────────────────────────────────────────────
@@ -80,7 +86,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
     fname = f"{symbol.replace('^','').replace('=','_')}_{interval}.csv"
     fpath = os.path.join(DATA_DIR, fname)
 
-    # 1️⃣ Use cached version if valid
+    # Use cache if valid
     if not force_refresh and os.path.exists(fpath):
         age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(fpath))
         if age < timedelta(hours=24):
@@ -92,7 +98,6 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
             except Exception as e:
                 st.warning(f"⚠️ Cache read failed for {symbol}: {e}")
 
-    # 2️⃣ Try Yahoo Finance directly
     df = pd.DataFrame()
     for attempt in range(1, retries + 1):
         try:
@@ -120,7 +125,6 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
                 st.warning(f"⚠️ {symbol}: fetch error {e}")
         time.sleep(1 + random.random())
 
-    # 3️⃣ Mirror fallback
     if df.empty:
         st.info(f"🪞 Attempting mirror fetch for {symbol}...")
         df = _mirror_fetch(symbol)
@@ -129,7 +133,6 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
         else:
             st.error(f"🚫 All fetch attempts failed for {symbol}.")
 
-    # 4️⃣ Cache to disk
     if not df.empty:
         try:
             df.to_csv(fpath)
@@ -138,12 +141,10 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
             st.warning(f"⚠️ Could not save cache: {e}")
     return df
 
-
 # ───────────────────────────────────────────────
 # INDICATORS
 # ───────────────────────────────────────────────
 def add_indicators(df):
-    """Add EMA, RSI, MACD, crossover signals."""
     if df.empty:
         return df
     df = df.copy()
@@ -156,12 +157,10 @@ def add_indicators(df):
     df["EMA_Cross"] = np.where(df["EMA_20"] > df["EMA_50"], 1, 0)
     return df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
-
 # ───────────────────────────────────────────────
 # TRADING THEORY OVERLAY
 # ───────────────────────────────────────────────
 def apply_trading_theory(pred, df):
-    """Overlay RSI and trend to adjust confidence."""
     if df.empty:
         return pred, 1.0
     try:
@@ -174,12 +173,10 @@ def apply_trading_theory(pred, df):
     except Exception:
         return pred, 1.0
 
-
 # ───────────────────────────────────────────────
 # MODEL TRAINING & PREDICTION
 # ───────────────────────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """Train a simple RF classifier and generate TP/SL."""
     df = add_indicators(df)
     if len(df) < 50:
         return None
@@ -221,12 +218,10 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         "sl": float(sl),
     }
 
-
 # ───────────────────────────────────────────────
 # BACKTEST
 # ───────────────────────────────────────────────
 def backtest_signals(df, model_output):
-    """EMA crossover + model decision simulation."""
     if df.empty or not model_output:
         return 0.0
     df = df.copy()
@@ -235,12 +230,10 @@ def backtest_signals(df, model_output):
     df["Strategy"] = df["Signal"].shift(1) * df["Return"]
     return round(((df["Strategy"] + 1).prod() - 1) * 100, 2)
 
-
 # ───────────────────────────────────────────────
 # SUMMARY FUNCTION
 # ───────────────────────────────────────────────
 def summarize_assets(force_refresh=False):
-    """Loop through all assets and display progress."""
     results = []
     for asset, symbol in ASSET_SYMBOLS.items():
         st.write(f"⏳ Fetching **{asset} ({symbol})**...")
