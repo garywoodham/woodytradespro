@@ -670,5 +670,33 @@ def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_
     return pred_out, df
 
 # --------------------------------------------------------------------------------------
+# LEGACY COMPATIBILITY: calculate_model_performance (for tab_overview)
+# --------------------------------------------------------------------------------------
+
+def calculate_model_performance(df: pd.DataFrame) -> dict:
+    """
+    Backward-compatible helper for Overview tab.
+    Computes basic performance stats (win rate, avg return, equity curve)
+    based on MACD signal-following logic.
+    """
+    df = add_indicators(df)
+    out = {"win_rate": 0.0, "avg_return": 0.0, "equity_curve": pd.Series(dtype=float)}
+    if df is None or df.empty:
+        return out
+
+    try:
+        df["sig"] = np.where(df["macd"] > df["macd_signal"], 1, -1)
+        df["fut_ret"] = df["Close"].pct_change().shift(-1)
+        df["strat_ret"] = df["sig"] * df["fut_ret"]
+        r = df["strat_ret"].dropna()
+        if not r.empty:
+            out["win_rate"] = float((r > 0).mean() * 100)
+            out["avg_return"] = float(r.mean() * 100)
+            out["equity_curve"] = (1 + r.fillna(0)).cumprod()
+    except Exception as e:
+        print(f"⚠️ calculate_model_performance failed: {e}")
+    return out
+
+# --------------------------------------------------------------------------------------
 # END OF MODULE
 # --------------------------------------------------------------------------------------
