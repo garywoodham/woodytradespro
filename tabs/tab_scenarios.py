@@ -1,107 +1,133 @@
 import streamlit as st
-import pandas as pd
 import plotly.graph_objects as go
-import utils
-import time
+from utils import fetch_data, add_indicators, ASSET_SYMBOLS
+
 
 def render_scenarios():
-    st.title("📊 AI + Theory Trading Scenarios")
-    st.caption("Simulate outcomes under multiple risk levels with AI and trading methodology overlays.")
+    st.title("🎯 Market Scenarios and Predictions")
 
-    asset = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()), index=0)
-    interval = st.selectbox("Select Timeframe", list(utils.INTERVALS.keys()), index=1)
-    symbol = utils.ASSET_SYMBOLS[asset]
+    # --- Asset & interval selection ---
+    asset = st.selectbox(
+        "Select Asset",
+        [
+            "Gold",
+            "NASDAQ 100",
+            "S&P 500",
+            "EUR/USD",
+            "GBP/USD",
+            "USD/JPY",
+            "Crude Oil",
+            "Bitcoin",
+        ],
+    )
 
+    interval = st.selectbox(
+        "Select Interval",
+        ["15m", "1h", "4h", "1d", "1w"],
+        index=1,
+    )
+
+    symbol = ASSET_SYMBOLS.get(asset)
     st.info(f"Fetching and analyzing **{asset} ({symbol})**... please wait ⏳")
-    df = utils.fetch_data(symbol, utils.INTERVALS[interval]["interval"], utils.INTERVALS[interval]["period"])
+
+    # --- Fetch data ---
+    df = fetch_data(symbol, interval)
+    df = add_indicators(df)
 
     if df.empty:
-        st.error(f"No data available for {asset}. Please try again later.")
-        return
-    st.success(f"✅ Loaded {len(df)} candles for {asset}.")
-
-    results = []
-    progress = st.progress(0)
-    for i, risk in enumerate(utils.RISK_MULT.keys(), 1):
-        progress.progress(i / len(utils.RISK_MULT))
-        try:
-            pred = utils.train_and_predict(df, horizon=interval, risk=risk)
-            back = utils.backtest_signals(df, pred)
-            if pred:
-                results.append({
-                    "Risk": risk,
-                    "Prediction": pred["prediction"],
-                    "Confidence": round(pred["probability"] * 100, 2),
-                    "Accuracy": round(pred["accuracy"] * 100, 2),
-                    "Win Rate": round(back["winrate"] * 100, 2),
-                    "Total Return": round(back["total_return"] * 100, 2),
-                    "TP": round(pred["tp"], 4),
-                    "SL": round(pred["sl"], 4)
-                })
-        except Exception as e:
-            st.warning(f"⚠️ Error processing {risk}: {e}")
-        time.sleep(0.5)
-
-    progress.progress(1.0)
-    if not results:
-        st.error("No scenarios produced valid results.")
+        st.error(f"⚠️ No data available for {asset}. Please try again later.")
         return
 
-    st.subheader("📈 Scenario Performance Overview")
-    st.dataframe(pd.DataFrame(results), use_container_width=True)
+    # --- Helper to get safe column names ---
+    def get_col(df, name):
+        cols = {c.lower(): c for c in df.columns}
+        return cols.get(name.lower())
 
-    st.divider()
-    st.subheader("📊 Trade Signal Visualization")
+    # --- PRICE CHART ---
+    fig_price = go.Figure()
 
-    chosen = st.radio("Select Risk Level to Visualize", list(utils.RISK_MULT.keys()), index=1)
-    pred = utils.train_and_predict(df, horizon=interval, risk=chosen)
-    back = utils.backtest_signals(df, pred)
+    open_col = get_col(df, "Open")
+    high_col = get_col(df, "High")
+    low_col = get_col(df, "Low")
+    close_col = get_col(df, "Close")
 
-    if not pred:
-        st.warning("No valid prediction for visualization.")
-        return
+    if open_col and high_col and low_col and close_col:
+        fig_price.add_trace(
+            go.Candlestick(
+                x=df.index,
+                open=df[open_col],
+                high=df[high_col],
+                low=df[low_col],
+                close=df[close_col],
+                name="Price",
+            )
+        )
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Price", line=dict(width=1.8)))
+    ema20_col = get_col(df, "EMA_20")
+    ema50_col = get_col(df, "EMA_50")
 
-    # Mark signals
-    buy_x, buy_y, sell_x, sell_y = [], [], [], []
-    for i in range(1, len(df)):
-        if pred["prediction"] == "buy" and df["Close"].iloc[i] > df["Close"].iloc[i-1]:
-            buy_x.append(df.index[i])
-            buy_y.append(df["Close"].iloc[i])
-        elif pred["prediction"] == "sell" and df["Close"].iloc[i] < df["Close"].iloc[i-1]:
-            sell_x.append(df.index[i])
-            sell_y.append(df["Close"].iloc[i])
+    if ema20_col:
+        fig_price.add_trace(
+            go.Scatter(x=df.index, y=df[ema20_col], mode="lines", name="EMA 20")
+        )
+    if ema50_col:
+        fig_price.add_trace(
+            go.Scatter(x=df.index, y=df[ema50_col], mode="lines", name="EMA 50")
+        )
 
-    if buy_x:
-        fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers", name="Buy Signal",
-                                 marker=dict(color="green", size=8, symbol="triangle-up")))
-    if sell_x:
-        fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers", name="Sell Signal",
-                                 marker=dict(color="red", size=8, symbol="triangle-down")))
-
-    eq = back["equity_curve"]
-    if not eq.empty:
-        fig.add_trace(go.Scatter(x=eq.index, y=df["Close"].iloc[0] * (eq / eq.iloc[0]),
-                                 mode="lines", name="Equity (Simulated)",
-                                 line=dict(dash="dot", width=1.2, color="royalblue"), opacity=0.6))
-
-    fig.update_layout(
-        title=f"{asset} — {pred['prediction'].upper()} ({chosen} Risk)",
+    fig_price.update_layout(
+        title=f"{asset} Price & Trend Analysis ({interval})",
+        xaxis_title="Date",
         yaxis_title="Price",
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        height=600,
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig_price, use_container_width=True, config={"displaylogo": False})
 
-    st.markdown(f"""
-    ### 📊 Strategy Summary
-    **Prediction:** {pred['prediction']}  
-    **Confidence:** {pred['probability'] * 100:.2f}%  
-    **Accuracy:** {pred['accuracy'] * 100:.2f}%  
-    **Historical Win Rate:** {back['winrate'] * 100:.2f}%  
-    **Estimated Return:** {back['total_return'] * 100:.2f}%  
-    **TP:** {pred['tp']:.4f} | **SL:** {pred['sl']:.4f}  
-    **Candles Tested:** {len(df):,}  
-    """)
+    # --- RSI Chart ---
+    rsi_col = get_col(df, "RSI")
+    if rsi_col:
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(go.Scatter(x=df.index, y=df[rsi_col], mode="lines", name="RSI"))
+        fig_rsi.add_hline(y=70, line=dict(color="red", dash="dash"))
+        fig_rsi.add_hline(y=30, line=dict(color="green", dash="dash"))
+        fig_rsi.update_layout(
+            title="RSI (Relative Strength Index)",
+            height=300,
+            yaxis_title="RSI Value",
+        )
+        st.plotly_chart(fig_rsi, use_container_width=True, config={"displaylogo": False})
+    else:
+        st.info("ℹ️ RSI data not available for this timeframe.")
+
+    # --- MACD Chart ---
+    macd_col = get_col(df, "MACD")
+    signal_col = get_col(df, "Signal")
+
+    if macd_col and signal_col:
+        fig_macd = go.Figure()
+        fig_macd.add_trace(
+            go.Scatter(x=df.index, y=df[macd_col], mode="lines", name="MACD")
+        )
+        fig_macd.add_trace(
+            go.Scatter(x=df.index, y=df[signal_col], mode="lines", name="Signal")
+        )
+        fig_macd.update_layout(
+            title="MACD (Moving Average Convergence Divergence)",
+            height=300,
+            yaxis_title="MACD Value",
+        )
+        st.plotly_chart(fig_macd, use_container_width=True, config={"displaylogo": False})
+    else:
+        st.info("ℹ️ MACD data not available for this timeframe.")
+
+    # --- Scenario summary (AI-style placeholder, can be replaced with real model) ---
+    st.subheader("📊 Market Scenario Summary")
+    st.markdown(
+        f"""
+        - **Asset:** {asset} ({symbol})  
+        - **Interval:** {interval}  
+        - **Current Trend:** {'📈 Uptrend' if df[get_col(df, 'Close')].iloc[-1] > df[get_col(df, 'Close')].iloc[-5] else '📉 Downtrend'}  
+        - **RSI Level:** {round(df[rsi_col].iloc[-1], 2) if rsi_col else 'N/A'}  
+        - **MACD Signal:** {'Bullish' if macd_col and df[macd_col].iloc[-1] > df[signal_col].iloc[-1] else 'Bearish' if macd_col else 'N/A'}
+        """
+    )
