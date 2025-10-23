@@ -52,9 +52,7 @@ def _normalize(df):
 
     # Flatten multi-index if present
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            "_".join([str(c) for c in col if c]) for col in df.columns
-        ]
+        df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
 
     # Capitalize single-level names safely
     df.columns = [str(c).capitalize() for c in df.columns]
@@ -65,7 +63,6 @@ def _normalize(df):
     # Keep only valid price columns
     keep = ["Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in keep if c in df.columns]
-
     df = df[keep].dropna(how="any")
 
     # Ensure numeric
@@ -131,11 +128,14 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
                 auto_adjust=True,
             )
             df = _normalize(data)
-            if not df.empty and len(df) > 40:
+
+            # ✅ FIXED LOGIC: only retry if empty or too small
+            if df.empty or len(df) < 40:
+                st.write(f"⚠️ {symbol}: got {len(df)} rows, retrying...")
+            else:
                 st.write(f"✅ {symbol}: fetched {len(df)} rows.")
                 break
-            else:
-                st.write(f"⚠️ {symbol}: got {len(df)} rows, retrying...")
+
         except Exception as e:
             if "Too Many Requests" in str(e):
                 wait = 10 + random.uniform(1, 5)
