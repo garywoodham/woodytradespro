@@ -13,7 +13,7 @@ from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
 
 # ───────────────────────────────────────────────
-# GLOBAL SETTINGS
+# GLOBAL CONFIGURATION
 # ───────────────────────────────────────────────
 RISK_MULT = {"Low": 0.5, "Medium": 1.0, "High": 1.5}
 
@@ -40,28 +40,24 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ───────────────────────────────────────────────
-# INTERNAL HELPERS
+# HELPER FUNCTIONS
 # ───────────────────────────────────────────────
 def _normalize(df):
-    """Normalize and clean an OHLCV dataframe."""
-    if df is None or df.empty:
+    """Ensure dataframe is clean, numeric, and normalized."""
+    if df is None or len(df) == 0:
         return pd.DataFrame()
 
-    # Flatten multi-index (from yfinance)
+    # Flatten multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(c) for c in col if c]) for col in df.columns]
 
-    # Capitalize single columns
     df.columns = [str(c).capitalize() for c in df.columns]
-
-    # Replace infinities and fill missing values
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
 
     keep = ["Open", "High", "Low", "Close", "Volume"]
     keep = [c for c in keep if c in df.columns]
     df = df[keep].dropna(how="any")
 
-    # Ensure numeric types
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -69,7 +65,7 @@ def _normalize(df):
 
 
 def _mirror_fetch(symbol):
-    """Fetch from Yahoo API directly (mirror) if blocked."""
+    """Mirror data fetch from Yahoo endpoint."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -86,34 +82,34 @@ def _mirror_fetch(symbol):
     return pd.DataFrame()
 
 # ───────────────────────────────────────────────
-# FETCH DATA WITH CACHE & RETRIES
+# DATA FETCHING WITH CACHE & RETRY
 # ───────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=False):
     """
-    Fetch market data using yfinance with retry, caching, and mirror fallback.
+    Fetch Yahoo Finance data with cache, retry, and fallback mirror.
     """
     fname = f"{symbol.replace('^','').replace('=','_')}_{interval}.csv"
     fpath = os.path.join(DATA_DIR, fname)
 
-    # Try cached version if recent (<24h)
+    # Use cached version if recent
     if not force_refresh and os.path.exists(fpath):
         age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(fpath))
         if age < timedelta(hours=24):
             try:
                 df = pd.read_csv(fpath, index_col=0, parse_dates=True)
                 if not df.empty:
-                    st.write(f"📁 Loaded cached {symbol} ({len(df)} rows)")
+                    st.write(f"📁 Loaded cached {symbol} ({len(df)} rows, updated {age.seconds // 3600}h ago)")
                     return _normalize(df)
             except Exception as e:
                 st.warning(f"⚠️ Cache read failed for {symbol}: {e}")
 
     df = pd.DataFrame()
 
-    # Retry loop for fetching from Yahoo
     for attempt in range(1, retries + 1):
         try:
             st.write(f"⏳ Attempt {attempt}: Fetching {symbol} from Yahoo...")
+
             data = yf.download(
                 symbol,
                 period=period,
@@ -122,14 +118,15 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
                 threads=False,
                 auto_adjust=True,
             )
+
             df = _normalize(data)
 
-            # ✅ Accept valid data (>=100 rows typical)
-            if df is not None and not df.empty and len(df) >= 100:
+            # ✅ FIX: Ensure DataFrame type & enough data
+            if isinstance(df, pd.DataFrame) and not df.empty and len(df) > 50:
                 st.write(f"✅ {symbol}: fetched {len(df)} rows successfully.")
                 break
             else:
-                st.write(f"⚠️ {symbol}: insufficient data ({len(df)} rows), retrying...")
+                st.warning(f"⚠️ {symbol}: invalid or insufficient data ({type(df)} with {len(df)} rows), retrying...")
 
         except Exception as e:
             if "Too Many Requests" in str(e):
@@ -140,7 +137,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
                 st.warning(f"⚠️ {symbol}: fetch error {e}")
         time.sleep(1 + random.random())
 
-    # Fallback: mirror API
+    # Fallback mirror fetch
     if df.empty:
         st.info(f"🪞 Attempting mirror fetch for {symbol}...")
         df = _mirror_fetch(symbol)
@@ -149,7 +146,7 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
         else:
             st.error(f"🚫 All fetch attempts failed for {symbol}.")
 
-    # Save cache
+    # Save cached data
     if not df.empty:
         try:
             df.to_csv(fpath)
@@ -160,13 +157,12 @@ def fetch_data(symbol, interval="1h", period="1mo", retries=4, force_refresh=Fal
     return df
 
 # ───────────────────────────────────────────────
-# INDICATORS
+# TECHNICAL INDICATORS
 # ───────────────────────────────────────────────
 def add_indicators(df):
-    """Add EMA, RSI, MACD, and EMA cross features."""
+    """Add EMA, RSI, MACD and derived signals."""
     if df.empty:
         return df
-
     df = df.copy()
     df["EMA_20"] = EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA_50"] = EMAIndicator(df["Close"], window=50).ema_indicator()
@@ -179,17 +175,17 @@ def add_indicators(df):
     return df
 
 # ───────────────────────────────────────────────
-# TRADING THEORY
+# TRADING THEORY OVERLAY
 # ───────────────────────────────────────────────
 def apply_trading_theory(pred, df):
     """
-    Adjust model confidence using EMA trend + RSI signals.
+    Adjust predictions using EMA/RSI overlay.
     """
     if df.empty:
         return pred, 1.0
     try:
-        trend_bias = "buy" if df["EMA_20"].iloc[-1] > df["EMA_50"].iloc[-1] else "sell"
-        conf = 1.15 if pred == trend_bias else 0.85
+        trend = "buy" if df["EMA_20"].iloc[-1] > df["EMA_50"].iloc[-1] else "sell"
+        conf = 1.15 if pred == trend else 0.85
         rsi = df["RSI"].iloc[-1]
         if (rsi > 70 and pred == "buy") or (rsi < 30 and pred == "sell"):
             conf *= 0.7
@@ -198,19 +194,16 @@ def apply_trading_theory(pred, df):
         return pred, 1.0
 
 # ───────────────────────────────────────────────
-# MODEL TRAINING & PREDICTION
+# MODEL TRAINING AND PREDICTION
 # ───────────────────────────────────────────────
 def train_and_predict(df, horizon="1h", risk="Medium"):
-    """
-    Train RandomForest model and generate buy/sell prediction with TP/SL.
-    """
+    """Train model and output predicted direction with TP/SL."""
     df = add_indicators(df)
     if len(df) < 50:
         return None
 
     df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-
     feats = [f for f in FEATURES if f in df.columns]
     if not feats:
         return None
@@ -228,10 +221,10 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
         prob = clf.predict_proba(X.iloc[[-1]])[0][cls]
         pred = "buy" if cls == 1 else "sell"
     except Exception as e:
-        st.warning(f"⚠️ Model failed for this asset: {e}")
+        st.warning(f"⚠️ Model failed: {e}")
         return None
 
-    # Trading theory overlay
+    # Overlay theory
     pred, conf_adj = apply_trading_theory(pred, df)
     conf = min(1.0, prob * conf_adj)
 
@@ -253,22 +246,20 @@ def train_and_predict(df, horizon="1h", risk="Medium"):
 # BACKTESTING
 # ───────────────────────────────────────────────
 def backtest_signals(df, model_output):
-    """Basic backtest using EMA crossover."""
+    """Backtest using simple EMA crossover."""
     if df.empty or not model_output:
         return 0.0
-
     df = df.copy()
     df["Signal"] = np.where(df["EMA_20"] > df["EMA_50"], 1, 0)
     df["Return"] = df["Close"].pct_change()
     df["Strategy"] = df["Signal"].shift(1) * df["Return"]
-
     return round(((df["Strategy"] + 1).prod() - 1) * 100, 2)
 
 # ───────────────────────────────────────────────
-# AGGREGATE SUMMARY
+# SUMMARY AGGREGATOR
 # ───────────────────────────────────────────────
 def summarize_assets(force_refresh=False):
-    """Fetch, analyze, predict, and summarize all assets."""
+    """Fetch, analyze, and summarize all assets."""
     results = []
     st.info("Fetching and analyzing market data... please wait ⏳")
 
@@ -295,7 +286,6 @@ def summarize_assets(force_refresh=False):
                 "SL": round(pred["sl"], 2),
                 "BacktestReturn": ret,
             })
-
         except Exception as e:
             st.error(f"❌ Error processing {asset}: {e}")
             continue
