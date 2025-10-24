@@ -1,4 +1,4 @@
-# utils.py — FINAL SMART v2 FULL VERSION
+# utils.py — FINAL SMART v2 FULL VERSION (CLEAN & STABLE)
 # ---------------------------------------------------------------------------
 # WoodyTradesPro Forecast Utilities
 # ---------------------------------------------------------------------------
@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 import time
+import logging
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 
@@ -25,17 +26,11 @@ from sklearn.ensemble import RandomForestClassifier
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import warnings
 
-import logging
+# ---------------------------------------------------------------------------
+# SUPPRESS EXCESS LOGGING & WARNINGS
+# ---------------------------------------------------------------------------
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
-warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-
-
-# ---------------------------------------------------------------------------
-# SUPPRESS EXCESS WARNINGS
-# ---------------------------------------------------------------------------
 warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -203,217 +198,268 @@ def fetch_sentiment(symbol: str) -> float:
         for n in news:
             title = n.get("title") or ""
             if not title:
-                continue
-            s = _sent.polarity_scores(title)["compound"]
-            scores.append(s)
-        return float(np.mean(scores)) if scores else 0.0
-    except Exception:
-        return 0.0
-
-
+                
 def detect_regime(df: pd.DataFrame) -> str:
     if "ema20" not in df or "ema50" not in df:
         return "range"
-    spread = (df["ema20"] - df["ema50"]).abs() / df["Close"]
-    dom = max((df["ema20"] > df["ema50"]).mean(), (df["ema20"] < df["ema50"]).mean())
-    return "trend" if spread.tail(100).mean() > 0.002 and dom > 0.7 else "range"
+    spread = (df["ema20"] - df["ema50"]) / df["Close"]
+    volatility = df["Close"].pct_change().rolling(20).std()
+    trend_strength = spread.abs().mean()
+    vol_level = volatility.mean()
+    if trend_strength > 0.0025 and vol_level > 0.0015:
+        return "trend"
+    return "range"
 
 
-def train_rf(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
-    cols = ["ema20", "ema50", "RSI", "macd", "macd_signal", "atr", "sentiment"]
-    df = df.copy()
-    df["fwd"] = df["Close"].pct_change().shift(-1)
-    df["up"] = (df["fwd"] > 0).astype(int)
-    X = df[cols].shift(1)
-    y = df["up"]
-    mask = X.notna().all(axis=1) & y.notna()
-    if mask.sum() < 200:
+def train_ml_classifier(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
+    """Train RandomForest to classify next-bar direction from indicators."""
+    if len(df) < 200:
         return None
-    model = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
-    model.fit(X[mask], y[mask])
-    return model
+    df = df.copy()
+    df["target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
+    features = ["ema20", "ema50", "RSI", "macd", "macd_signal"]
+    df = df.dropna(subset=features + ["target"])
+    X, y = df[features], df["target"]
+    if len(X) < 50:
+        return None
+    clf = RandomForestClassifier(n_estimators=150, random_state=42)
+    clf.fit(X, y)
+    return clf
+
+
+def ml_predict_next(df: pd.DataFrame, clf: RandomForestClassifier) -> Optional[float]:
+    """Return probability of upward move (0–1)."""
+    try:
+        latest = df[["ema20", "ema50", "RSI", "macd", "macd_signal"]].iloc[-1:].dropna()
+        if latest.empty:
+            return None
+        prob = clf.predict_proba(latest)[0][1]
+        return float(prob)
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
-# SIGNAL ENGINE + BACKTEST + PIPELINES
+# SIGNAL FUSION
+# ---------------------------------------------------------------------------
+def compute_fused_signal(df: pd.DataFrame, sentiment: float, ml_prob: float, regime: str) -> Tuple[str, float]:
+    """Combine technical, sentiment, and ML into final signal."""
+    if len(df) < 2:
+        return "Hold", 0.0
+    row_prev, row = df.iloc[-2], df.iloc[-1]
+    score, votes = 0.0, 0
+
+    # EMA trend
+    if pd.notna(row["ema20"]) and pd.notna(row["ema50"]):
+        votes += 1
+        score += 1 if row["ema20"] > row["ema50"] else -1
+
+    # RSI
+    if pd.notna(row["RSI"]):
+        votes += 1
+        if row["RSI"] < 30:
+            score += 1
+        elif row["RSI"] > 70:
+            score -= 1
+
+    # MACD cross
+    if all(pd.notna(x) for x in [row["macd"], row["macd_signal"], row_prev["macd"], row_prev["macd_signal"]]):
+        votes += 1
+        crossed_up = (row_prev["macd"] <= row_prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
+        crossed_dn = (row_prev["macd"] >= row_prev["macd_signal"]) and (row["macd"] < row["macd_signal"])
+        if crossed_up:
+            score += 1
+        elif crossed_dn:
+            score -= 1
+
+    # Normalize technical signal
+    tech_bias = 0.0 if votes == 0 else score / votes
+
+    # Blend sentiment (0–1) and ML probability (0–1)
+    fused = 0.5 * tech_bias + 0.3 * sentiment + 0.2 * (ml_prob - 0.5 if ml_prob is not None else 0)
+
+    # Regime adjustment
+    if regime == "range":
+        fused *= 0.8  # less aggressive in sideways markets
+    elif regime == "trend":
+        fused *= 1.2
+
+    if fused > 0.25:
+        return "Buy", min(1.0, abs(fused))
+    elif fused < -0.25:
+        return "Sell", min(1.0, abs(fused))
+    return "Hold", 1 - abs(fused)
+
+# ---------------------------------------------------------------------------
+# TP/SL CALCULATION
 # ---------------------------------------------------------------------------
 def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
-    m = RISK_MULT.get(risk, RISK_MULT["Medium"])
-    if side == "Buy":
-        return price + m["tp_atr"] * atr, price - m["sl_atr"] * atr
-    else:
-        return price - m["tp_atr"] * atr, price + m["sl_atr"] * atr
+    r = RISK_MULT.get(risk, RISK_MULT["Medium"])
+    tp = price + r["tp_atr"] * atr if side == "Buy" else price - r["tp_atr"] * atr
+    sl = price - r["sl_atr"] * atr if side == "Buy" else price + r["sl_atr"] * atr
+    return float(tp), float(sl)
 
-
-def fused_signal(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optional[Dict[str, object]]:
-    if df.empty:
+# ---------------------------------------------------------------------------
+# LATEST PREDICTION PIPELINE
+# ---------------------------------------------------------------------------
+def latest_prediction(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optional[Dict[str, object]]:
+    if df is None or len(df) < 80:
         return None
     df = add_indicators(df)
-    sent = fetch_sentiment(symbol)
-    df["sentiment"] = sent
+    sentiment = fetch_sentiment(symbol)
     regime = detect_regime(df)
-    model = train_rf(df)
-    last = df.iloc[-1]
-    score = 0
-    if last["ema20"] > last["ema50"]:
-        score += 1
-    if last["RSI"] < 40:
-        score += 1
-    if last["RSI"] > 60:
-        score -= 1
-    if last["macd"] > last["macd_signal"]:
-        score += 1
-    elif last["macd"] < last["macd_signal"]:
-        score -= 1
-    side_rule = "Buy" if score > 0 else "Sell" if score < 0 else "Hold"
-
-    prob_up = 0.5
-    if model is not None:
-        feat = pd.DataFrame([{
-            "ema20": last.get("ema20"), "ema50": last.get("ema50"),
-            "RSI": last.get("RSI"), "macd": last.get("macd"),
-            "macd_signal": last.get("macd_signal"), "atr": last.get("atr"),
-            "sentiment": sent,
-        }])
-        prob_up = float(model.predict_proba(feat)[0, 1])
-
-    votes_buy = votes_sell = 0
-    if side_rule == "Buy":
-        votes_buy += 1
-    elif side_rule == "Sell":
-        votes_sell += 1
-    if sent > 0.1:
-        votes_buy += 1
-    elif sent < -0.1:
-        votes_sell += 1
-    if prob_up > 0.55:
-        votes_buy += 1
-    elif prob_up < 0.45:
-        votes_sell += 1
-
-    final_side = "Buy" if votes_buy > votes_sell else "Sell" if votes_sell > votes_buy else "Hold"
-    conf = min(1.0, abs(votes_buy - votes_sell) / 3 + abs(prob_up - 0.5) * 2)
-
-    atr = float(last["atr"])
-    price = float(last["Close"])
-    tp, sl = compute_tp_sl(price, atr, final_side, risk)
+    clf = train_ml_classifier(df)
+    ml_prob = ml_predict_next(df, clf) if clf else 0.5
+    side, prob = compute_fused_signal(df, sentiment, ml_prob, regime)
+    atr_val = float(df["atr"].iloc[-1]) if "atr" in df else 0.0
+    price = float(df["Close"].iloc[-1])
+    tp, sl = (None, None)
+    if side != "Hold":
+        tp, sl = compute_tp_sl(price, atr_val, side, risk)
     return {
-        "side": final_side, "prob": conf, "price": price,
-        "tp": tp, "sl": sl, "atr": atr,
-        "regime": regime, "sentiment": sent, "ml_prob_up": prob_up,
+        "side": side,
+        "prob": round(prob * 100.0, 2),
+        "price": price,
+        "tp": tp,
+        "sl": sl,
+        "atr": atr_val,
+        "sentiment": sentiment,
+        "regime": regime,
+        "ml_prob": ml_prob,
     }
 
 # ---------------------------------------------------------------------------
-# BACKTEST AND PIPELINES
+# BACKTEST
 # ---------------------------------------------------------------------------
-def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, object]:
-    res = {"win_rate": 0, "total_return_pct": 0, "n_trades": 0, "trades": []}
-    if len(df) < 120:
-        return res
+def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object]:
+    out = {"win_rate": 0.0, "total_return_pct": 0.0, "n_trades": 0, "trades": []}
+    if df.empty or len(df) < 200:
+        return out
     df = add_indicators(df)
-    df["sentiment"] = fetch_sentiment(symbol)
-    pos = None
-    wins = ret_sum = 0
-    trades = []
-    for i in range(60, len(df)):
-        sig = fused_signal(df.iloc[:i + 1], symbol, risk)
-        if not sig:
+    signals, prev = [], df.iloc[0]
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        if i < 2:
             continue
-        side = sig["side"]
-        px = float(df["Close"].iloc[i])
-        ts = df.index[i]
+        side, _ = compute_fused_signal(df.iloc[:i], 0, 0.5, detect_regime(df.iloc[:i]))
+        atr = df["atr"].iloc[i] if "atr" in df else 0.0
+        tp, sl = compute_tp_sl(row["Close"], atr, side, risk)
+        signals.append((df.index[i], side, row["Close"], tp, sl))
+
+    pos = None
+    eq, wins, trades = 0.0, 0, []
+    for ts, side, px, tp, sl in signals:
         if pos is None and side in ("Buy", "Sell"):
-            pos = (side, px, ts)
-        elif pos is not None:
-            ps, ep, ets = pos
-            if side in ("Buy", "Sell") and side != ps:
-                r = (px - ep) / ep * (1 if ps == "Buy" else -1)
-                ret_sum += r
-                if r > 0:
-                    wins += 1
-                trades.append({
-                    "entry_time": ets, "exit_time": ts, "side": ps,
-                    "entry": ep, "exit": px, "return_pct": r * 100,
-                })
-                pos = (side, px, ts)
+            pos = (side, px, tp, sl, ts)
+            continue
+        if pos:
+            side0, entry, tp0, sl0, t0 = pos
+            hit_tp = (side0 == "Buy" and px >= tp0) or (side0 == "Sell" and px <= tp0)
+            hit_sl = (side0 == "Buy" and px <= sl0) or (side0 == "Sell" and px >= sl0)
+            if hit_tp or hit_sl or side != "Hold":
+                ret = (px - entry) / entry * (1 if side0 == "Buy" else -1)
+                wins += 1 if ret > 0 else 0
+                eq += ret
+                trades.append({"entry": entry, "exit": px, "side": side0,
+                               "return_pct": ret * 100, "entry_time": t0, "exit_time": ts})
+                pos = None
     n = len(trades)
-    res.update({
-        "n_trades": n, "win_rate": 100 * wins / n if n else 0,
-        "total_return_pct": 100 * ret_sum, "trades": trades,
-    })
-    return res
+    if n > 0:
+        out["win_rate"] = 100 * wins / n
+        out["total_return_pct"] = 100 * eq
+        out["n_trades"] = n
+        out["trades"] = trades
+    return out
 
-
+# ---------------------------------------------------------------------------
+# PIPELINES
+# ---------------------------------------------------------------------------
 def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache=True) -> Optional[Dict[str, object]]:
     df = fetch_data(symbol, interval_key, use_cache)
     if df.empty:
         return None
     df = add_indicators(df)
-    pred = fused_signal(df, symbol, risk)
-    bt = backtest(df, symbol, risk)
+    pred = latest_prediction(df, symbol, risk)
     if not pred:
         return None
+    bt = backtest_signals(df, risk)
     return {
-        "symbol": symbol, "interval_key": interval_key, "risk": risk,
-        "last_price": float(df["Close"].iloc[-1]), "signal": pred["side"],
-        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"],
-        "sl": pred["sl"], "atr": pred["atr"], "regime": pred["regime"],
-        "sentiment": pred["sentiment"], "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
-        "win_rate": bt["win_rate"], "total_return_pct": bt["total_return_pct"],
-        "n_trades": bt["n_trades"], "df": df, "trades": bt["trades"],
+        "symbol": symbol,
+        "interval_key": interval_key,
+        "risk": risk,
+        "price": float(df["Close"].iloc[-1]),
+        "signal": pred["side"],
+        "probability": pred["prob"],
+        "tp": pred["tp"],
+        "sl": pred["sl"],
+        "win_rate": bt["win_rate"],
+        "total_return_pct": bt["total_return_pct"],
+        "n_trades": bt["n_trades"],
+        "sentiment": pred["sentiment"],
+        "regime": pred["regime"],
+        "ml_prob": pred["ml_prob"],
+        "df": df,
+        "trades": bt["trades"],
     }
 
-
 def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> pd.DataFrame:
-    rows = []
     _log("Fetching and analyzing market data (smart v2)...")
+    rows = []
     for asset, symbol in ASSET_SYMBOLS.items():
         _log(f"{asset} ({symbol})...")
-        try:
-            r = analyze_asset(symbol, interval_key, risk, use_cache)
-            if r:
-                rows.append({
-                    "Asset": asset, "Symbol": symbol, "Interval": interval_key,
-                    "Price": r["last_price"], "Signal": r["signal"],
-                    "Probability_%": r["probability"], "TP": r["tp"], "SL": r["sl"],
-                    "WinRate_%": r["win_rate"], "BacktestReturn_%": r["total_return_pct"],
-                    "Trades": r["n_trades"], "Regime": r["regime"],
-                    "Sentiment": r["sentiment"], "ML_ProbUp_%": r["ml_prob_up"],
-                })
-        except Exception as e:
-            _log(f"Error analyzing {asset}: {e}")
+        res = analyze_asset(symbol, interval_key, risk, use_cache)
+        if not res:
+            continue
+        rows.append({
+            "Asset": asset,
+            "Symbol": symbol,
+            "Signal": res["signal"],
+            "Probability_%": res["probability"],
+            "Price": res["price"],
+            "TP": res["tp"],
+            "SL": res["sl"],
+            "WinRate_%": res["win_rate"],
+            "BacktestReturn_%": res["total_return_pct"],
+            "Trades": res["n_trades"],
+            "Sentiment": res["sentiment"],
+            "Regime": res["regime"],
+        })
     return pd.DataFrame(rows)
-
 
 def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) -> Tuple[str, pd.DataFrame]:
     if asset not in ASSET_SYMBOLS:
         raise KeyError(asset)
-    sym = ASSET_SYMBOLS[asset]
-    df = fetch_data(sym, interval_key, use_cache)
-    return sym, add_indicators(df)
+    symbol = ASSET_SYMBOLS[asset]
+    df = fetch_data(symbol, interval_key, use_cache)
+    return symbol, add_indicators(df)
 
-
-def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True) -> Tuple[Optional[Dict[str, object]], pd.DataFrame]:
-    sym = ASSET_SYMBOLS.get(asset)
-    if not sym:
+def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True):
+    symbol = ASSET_SYMBOLS.get(asset)
+    if not symbol:
         return None, pd.DataFrame()
-    df = fetch_data(sym, interval_key, use_cache)
+    df = fetch_data(symbol, interval_key, use_cache)
     if df.empty:
-        return None, df
+        return None, pd.DataFrame()
     df = add_indicators(df)
-    pred = fused_signal(df, sym, risk)
-    bt = backtest(df, sym, risk)
-    if not pred:
-        return None, df
+    pred = latest_prediction(df, symbol, risk)
+    bt = backtest_signals(df, risk)
     return {
-        "asset": asset, "symbol": sym, "interval": interval_key,
-        "price": float(df["Close"].iloc[-1]), "side": pred["side"],
-        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"],
-        "sl": pred["sl"], "atr": pred["atr"], "regime": pred["regime"],
-        "sentiment": pred["sentiment"], "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
-        "win_rate": bt["win_rate"], "backtest_return_pct": bt["total_return_pct"],
-        "n_trades": bt["n_trades"], "trades": bt["trades"],
+        "asset": asset,
+        "symbol": symbol,
+        "interval": interval_key,
+        "price": float(df["Close"].iloc[-1]),
+        "side": pred["side"],
+        "probability": pred["prob"],
+        "tp": pred["tp"],
+        "sl": pred["sl"],
+        "win_rate": bt["win_rate"],
+        "backtest_return_pct": bt["total_return_pct"],
+        "n_trades": bt["n_trades"],
+        "sentiment": pred["sentiment"],
+        "regime": pred["regime"],
+        "ml_prob": pred["ml_prob"],
+        "trades": bt["trades"],
     }, df
 
 # ---------------------------------------------------------------------------
-# END OF FILE
+# END OF MODULE
 # ---------------------------------------------------------------------------
