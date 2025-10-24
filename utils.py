@@ -1,12 +1,9 @@
-# utils.py — complete and corrected (index fetch + backtest win-rate fix)
+# utils.py — FINAL, FULL VERSION
 # --------------------------------------------------------------------------------------
 # Robust data fetch, caching, indicators, signal engine (BUY/SELL/HOLD),
-# backtesting (win rate & total return), and asset summarization.
-# Safe against yfinance quirks and pandas shape issues.
+# backtesting (win rate & total return), and asset summarization for Streamlit app.
 
 from __future__ import annotations
-
-import os
 import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
@@ -32,16 +29,16 @@ DATA_DIR.mkdir(exist_ok=True)
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m", "period": "5d", "min_rows": 100},
-    "1h": {"interval": "60m", "period": "2mo", "min_rows": 200},  # extended period + lower min rows
-    "4h": {"interval": "240m", "period": "3mo", "min_rows": 200},
-    "1d": {"interval": "1d", "period": "1y", "min_rows": 150},
+    "1h":  {"interval": "60m", "period": "2mo", "min_rows": 200},
+    "4h":  {"interval": "240m", "period": "3mo", "min_rows": 200},
+    "1d":  {"interval": "1d", "period": "1y", "min_rows": 150},
     "1wk": {"interval": "1wk", "period": "5y", "min_rows": 100},
 }
 
 RISK_MULT: Dict[str, Dict[str, float]] = {
-    "Low": {"tp_atr": 1.0, "sl_atr": 1.5},
+    "Low":    {"tp_atr": 1.0, "sl_atr": 1.5},
     "Medium": {"tp_atr": 1.5, "sl_atr": 1.0},
-    "High": {"tp_atr": 2.0, "sl_atr": 0.8},
+    "High":   {"tp_atr": 2.0, "sl_atr": 0.8},
 }
 
 ASSET_SYMBOLS: Dict[str, str] = {
@@ -66,7 +63,7 @@ def _log(msg: str) -> None:
         pass
 
 # --------------------------------------------------------------------------------------
-# DATA FETCH & CACHE
+# FETCH & CACHE
 # --------------------------------------------------------------------------------------
 
 def _cache_path(symbol: str, interval_key: str) -> Path:
@@ -95,9 +92,6 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
 
     for col in df.columns:
-        val = df[col].values
-        if isinstance(val, np.ndarray) and getattr(val, "ndim", 1) > 1:
-            df[col] = pd.Series(val.ravel(), index=df.index)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna(how="all")
@@ -141,7 +135,7 @@ def fetch_data(
     period = INTERVALS[interval_key]["period"]
     min_rows = INTERVALS[interval_key]["min_rows"]
 
-    # Fix for indices returning limited hourly data
+    # Fix for indices that return limited data
     if symbol in ["^NDX", "^GSPC", "^DJI"]:
         min_rows = 100
 
@@ -164,7 +158,6 @@ def fetch_data(
             _log(f"✅ {symbol}: fetched {len(df)} rows.")
             try:
                 df.to_csv(cache_fp)
-                _log(f"💾 Cached {symbol} → {cache_fp}")
             except Exception as e:
                 _log(f"⚠️ Cache write failed: {e}")
             return df
@@ -177,7 +170,6 @@ def fetch_data(
         _log(f"✅ Mirror fetch succeeded for {symbol}.")
         try:
             df.to_csv(cache_fp)
-            _log(f"💾 Cached {symbol} mirror → {cache_fp}")
         except Exception as e:
             _log(f"⚠️ Cache write failed: {e}")
         return df
@@ -193,9 +185,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
+
     for col in ["Close", "High", "Low"]:
-        if col not in df.columns:
-            return pd.DataFrame()
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # EMA
@@ -281,18 +272,27 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
     if df is None or df.empty or len(df) < 60:
         return None
     df = add_indicators(df)
+    if df.empty or len(df) < 60:
+        return None
+
     row_prev, row = df.iloc[-2], df.iloc[-1]
-    side, prob = compute_signal_row(row_prev, row)
+    side, conf_raw = compute_signal_row(row_prev, row)
+
     atr_val = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].iloc[-14:].mean())
-    tp, sl = compute_tp_sl(row["Close"], atr_val, side, risk) if side != "Hold" else (None, None)
-    return {"side": side, "prob": prob, "price": float(row["Close"]), "tp": tp, "sl": sl, "atr": atr_val}
+    current_price = float(row["Close"])
+
+    display_side = side if side != "Hold" else "Buy"
+    tp_val, sl_val = compute_tp_sl(current_price, atr_val, display_side, risk)
+
+    prob_pct = 0.0 if side == "Hold" else round(conf_raw * 100.0, 2)
+    return {"side": side, "prob": prob_pct / 100.0, "price": current_price,
+            "tp": tp_val, "sl": sl_val, "atr": atr_val}
 
 
 def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool = True) -> Dict[str, object]:
     out = {"win_rate": 0.0, "total_return_pct": 0.0, "n_trades": 0, "trades": []}
     if df is None or df.empty or len(df) < 120:
         return out
-
     df = add_indicators(df)
     if df.empty:
         return out
@@ -307,54 +307,59 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool 
         prev = row
 
     eq_curve, wins, trades, position = 0.0, 0, [], None
-
     for idx, (ts, side, conf, tp, sl) in enumerate(signals):
         if idx + 1 >= len(df):
             break
-        price = float(df["Close"].iloc[idx + 1])
-        high = float(df["High"].iloc[idx + 1])
-        low = float(df["Low"].iloc[idx + 1])
+        px = float(df["Close"].iloc[idx + 1])
+        hi = float(df["High"].iloc[idx + 1])
+        lo = float(df["Low"].iloc[idx + 1])
 
         if position is None:
             if side in ("Buy", "Sell"):
-                position = (side, price, tp, sl, ts)
+                position = (side, px, tp, sl, ts)
             continue
 
-        pos_side, entry_px, pos_tp, pos_sl, entry_ts = position
-        exit_reason, exit_px = None, price
+        pos_side, entry, pos_tp, pos_sl, entry_ts = position
+        exit_reason, exit_px = None, px
 
         if pos_side == "Buy":
-            if not np.isnan(pos_tp) and high >= pos_tp:
+            if not np.isnan(pos_tp) and hi >= pos_tp:
                 exit_reason, exit_px = "TP", pos_tp
-            elif not np.isnan(pos_sl) and low <= pos_sl:
+            elif not np.isnan(pos_sl) and lo <= pos_sl:
                 exit_reason, exit_px = "SL", pos_sl
             elif side == "Sell":
                 exit_reason = "Flip"
         else:
-            if not np.isnan(pos_tp) and low <= pos_tp:
+            if not np.isnan(pos_tp) and lo <= pos_tp:
                 exit_reason, exit_px = "TP", pos_tp
-            elif not np.isnan(pos_sl) and high >= pos_sl:
+            elif not np.isnan(pos_sl) and hi >= pos_sl:
                 exit_reason, exit_px = "SL", pos_sl
             elif side == "Buy":
                 exit_reason = "Flip"
 
         if exit_reason:
-            ret = (exit_px - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
+            ret = (exit_px - entry) / entry * (1 if pos_side == "Buy" else -1)
             eq_curve += ret
             if ret > 0:
                 wins += 1
-            trades.append({
-                "entry_time": entry_ts,
-                "exit_time": ts,
-                "side": pos_side,
-                "entry": entry_px,
-                "exit": exit_px,
-                "reason": exit_reason,
-                "return_pct": ret * 100.0,
-            })
+            trades.append({"entry_time": entry_ts, "exit_time": ts,
+                           "side": pos_side, "entry": entry, "exit": exit_px,
+                           "reason": exit_reason, "return_pct": ret * 100.0})
             position = None
             if exit_reason == "Flip" and side in ("Buy", "Sell"):
-                position = (side, price, tp, sl, ts)
+                position = (side, px, tp, sl, ts)
+
+    # Close last trade if open
+    if position:
+        last_close = float(df["Close"].iloc[-1])
+        pos_side, entry, _, _, entry_ts = position
+        ret = (last_close - entry) / entry * (1 if pos_side == "Buy" else -1)
+        eq_curve += ret
+        if ret > 0:
+            wins += 1
+        trades.append({"entry_time": entry_ts, "exit_time": df.index[-1],
+                       "side": pos_side, "entry": entry, "exit": last_close,
+                       "reason": "EoS", "return_pct": ret * 100.0})
 
     n = len(trades)
     out["n_trades"] = n
@@ -377,8 +382,8 @@ def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cach
         return None
     return {"symbol": symbol, "interval_key": interval_key, "risk": risk,
             "last_price": float(df["Close"].iloc[-1]), "signal": pred["side"],
-            "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"], "atr": pred["atr"],
-            "win_rate": bt["win_rate"], "total_return_pct": bt["total_return_pct"],
+            "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
+            "atr": pred["atr"], "win_rate": bt["win_rate"], "total_return_pct": bt["total_return_pct"],
             "n_trades": bt["n_trades"], "df": df, "trades": bt["trades"]}
 
 
@@ -390,13 +395,11 @@ def summarize_assets(interval_key="1h", risk="Medium", use_cache=True) -> pd.Dat
         try:
             res = analyze_asset(symbol, interval_key, risk, use_cache)
             if res:
-                rows.append({
-                    "Asset": asset, "Symbol": symbol, "Interval": interval_key,
-                    "Price": res["last_price"], "Signal": res["signal"],
-                    "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
-                    "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
-                    "Trades": res["n_trades"]
-                })
+                rows.append({"Asset": asset, "Symbol": symbol, "Interval": interval_key,
+                             "Price": res["last_price"], "Signal": res["signal"],
+                             "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
+                             "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
+                             "Trades": res["n_trades"]})
         except Exception as e:
             _log(f"❌ Error analyzing {asset}: {e}")
     if not rows:
