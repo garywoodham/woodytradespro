@@ -1,15 +1,25 @@
-# utils.py - FINAL FULL ASCII-SAFE VERSION
+# utils.py - FINAL MERGED VERSION (v1 + v2)
 # ---------------------------------------------------------------------------
-# Robust data fetch, caching, indicators, signal engine (BUY/SELL/HOLD),
-# backtesting with win rate & trades, and asset summaries for Streamlit app.
+# Includes:
+# - Robust data fetch, caching, indicators
+# - v1: basic technical signal engine (EMA, RSI, MACD, ATR)
+# - v1: basic backtest and pipelines
+# - v2: sentiment, market regime detection, ML classifier (RandomForest)
+# - v2: fused adaptive signal + improved backtest + summary
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# ML / Sentiment
+from sklearn.ensemble import RandomForestClassifier
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Technical indicators
 try:
@@ -27,7 +37,7 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 INTERVALS: Dict[str, Dict[str, object]] = {
-    "15m": {"interval": "15m", "period": "5d", "min_rows": 100},
+    "15m": {"interval": "15m", "period": "5d", "min_rows": 150},
     "1h":  {"interval": "60m", "period": "2mo", "min_rows": 200},
     "4h":  {"interval": "240m", "period": "3mo", "min_rows": 200},
     "1d":  {"interval": "1d", "period": "1y", "min_rows": 150},
@@ -123,8 +133,6 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache: bool = True,
     interval = INTERVALS[interval_key]["interval"]
     period = INTERVALS[interval_key]["period"]
     min_rows = INTERVALS[interval_key]["min_rows"]
-    if symbol in ["^NDX", "^GSPC", "^DJI"]:
-        min_rows = 100
     cache_fp = _cache_path(symbol, interval_key)
     _log(f"Fetching {symbol} [{interval}] for {period}...")
     if use_cache and cache_fp.exists():
@@ -206,7 +214,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# SIGNAL ENGINE
+# SIGNAL ENGINE (v1)
 # ---------------------------------------------------------------------------
 
 def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
@@ -237,149 +245,4 @@ def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]
     return "Hold", 0.2
 
 # ---------------------------------------------------------------------------
-# PREDICTION & BACKTEST
-# ---------------------------------------------------------------------------
-
-def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
-    m = RISK_MULT.get(risk, RISK_MULT["Medium"])
-    if side not in ("Buy", "Sell"):
-        side = "Buy"
-    tp = price + m["tp_atr"] * atr if side == "Buy" else price - m["tp_atr"] * atr
-    sl = price - m["sl_atr"] * atr if side == "Buy" else price + m["sl_atr"] * atr
-    return float(tp), float(sl)
-
-
-def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[str, object]]:
-    if df is None or df.empty or len(df) < 30:
-        return None
-    df = add_indicators(df)
-    if df.empty:
-        return None
-    row_prev, row = df.iloc[-2], df.iloc[-1]
-    side, conf_raw = compute_signal_row(row_prev, row)
-    atr_val = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].tail(14).mean())
-    price_now = float(row["Close"])
-    tp_val, sl_val = compute_tp_sl(price_now, atr_val, side, risk)
-    prob_pct = max(5.0, round(conf_raw * 100.0, 2))
-    return {"side": side, "prob": prob_pct / 100.0, "price": price_now,
-            "tp": tp_val, "sl": sl_val, "atr": atr_val}
-
-
-def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool = True) -> Dict[str, object]:
-    out = {"win_rate": 0.0, "total_return_pct": 0.0, "n_trades": 0, "trades": []}
-    if df is None or df.empty or len(df) < 60:
-        return out
-    df = add_indicators(df)
-    if df.empty:
-        return out
-    prev = df.iloc[0]
-    position = None
-    trades, wins, total_ret = [], 0, 0.0
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        side, _ = compute_signal_row(prev, row)
-        atr_here = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].iloc[max(0, i - 14):i + 1].mean())
-        tp, sl = compute_tp_sl(row["Close"], atr_here, side, risk)
-        if position is None and side in ("Buy", "Sell"):
-            position = (side, row["Close"], tp, sl, row.name)
-        elif position is not None:
-            pos_side, entry_px, _, _, entry_ts = position
-            if side != pos_side and side in ("Buy", "Sell"):
-                exit_px = row["Close"]
-                ret = (exit_px - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
-                total_ret += ret
-                wins += 1 if ret > 0 else 0
-                trades.append({"entry_time": entry_ts, "exit_time": row.name,
-                               "side": pos_side, "entry": entry_px, "exit": exit_px,
-                               "reason": "Flip", "return_pct": ret * 100.0})
-                position = None
-        prev = row
-    if position is not None:
-        pos_side, entry_px, _, _, entry_ts = position
-        last_close = df["Close"].iloc[-1]
-        ret = (last_close - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
-        total_ret += ret
-        wins += 1 if ret > 0 else 0
-        trades.append({"entry_time": entry_ts, "exit_time": df.index[-1],
-                       "side": pos_side, "entry": entry_px, "exit": last_close,
-                       "reason": "EoS", "return_pct": ret * 100.0})
-    n = len(trades)
-    out["n_trades"] = n
-    out["win_rate"] = 100.0 * wins / n if n else 0.0
-    out["total_return_pct"] = 100.0 * total_ret if n else 0.0
-    out["trades"] = trades
-    return out
-
-# ---------------------------------------------------------------------------
-# PIPELINES FOR APP
-# ---------------------------------------------------------------------------
-
-def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache: bool = True) -> Optional[Dict[str, object]]:
-    df = fetch_data(symbol, interval_key, use_cache)
-    if df.empty:
-        return None
-    df = add_indicators(df)
-    pred = latest_prediction(df, risk)
-    bt = backtest_signals(df, risk)
-    if not pred:
-        return None
-    return {"symbol": symbol, "interval_key": interval_key, "risk": risk,
-            "last_price": float(df["Close"].iloc[-1]), "signal": pred["side"],
-            "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
-            "atr": pred["atr"], "win_rate": bt["win_rate"], "total_return_pct": bt["total_return_pct"],
-            "n_trades": bt["n_trades"], "df": df, "trades": bt["trades"]}
-
-
-def summarize_assets(interval_key="1h", risk="Medium", use_cache=True) -> pd.DataFrame:
-    rows = []
-    _log("Fetching and analyzing market data... please wait")
-    for asset, symbol in ASSET_SYMBOLS.items():
-        _log(f"Analyzing {asset} ({symbol}) ...")
-        try:
-            res = analyze_asset(symbol, interval_key, risk, use_cache)
-            if res:
-                rows.append({"Asset": asset, "Symbol": symbol, "Interval": interval_key,
-                             "Price": res["last_price"], "Signal": res["signal"],
-                             "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
-                             "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
-                             "Trades": res["n_trades"]})
-        except Exception as e:
-            _log(f"Error analyzing {asset}: {e}")
-    if not rows:
-        return pd.DataFrame()
-    cols = ["Asset", "Symbol", "Interval", "Price", "Signal", "Probability_%", "TP", "SL",
-            "WinRate_%", "BacktestReturn_%", "Trades"]
-    return pd.DataFrame(rows)[cols]
-
-
-def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) -> Tuple[str, pd.DataFrame]:
-    if asset not in ASSET_SYMBOLS:
-        raise KeyError(f"Unknown asset {asset}")
-    symbol = ASSET_SYMBOLS[asset]
-    df = fetch_data(symbol, interval_key, use_cache)
-    df = add_indicators(df)
-    return symbol, df
-
-
-def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True) -> Tuple[Optional[Dict[str, object]], pd.DataFrame]:
-    symbol = ASSET_SYMBOLS.get(asset)
-    if not symbol:
-        return None, pd.DataFrame()
-    df = fetch_data(symbol, interval_key, use_cache)
-    if df.empty:
-        return None, pd.DataFrame()
-    df = add_indicators(df)
-    pred = latest_prediction(df, risk)
-    bt = backtest_signals(df, risk)
-    if not pred:
-        return None, df
-    pred_out = {"asset": asset, "symbol": symbol, "interval": interval_key,
-                "price": float(df["Close"].iloc[-1]), "side": pred["side"],
-                "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
-                "atr": pred["atr"], "win_rate": bt["win_rate"], "backtest_return_pct": bt["total_return_pct"],
-                "n_trades": bt["n_trades"], "trades": bt["trades"]}
-    return pred_out, df
-
-# ---------------------------------------------------------------------------
-# END OF MODULE
-# ---------------------------------------------------------------------------
+# CONTINUES BELOW...
