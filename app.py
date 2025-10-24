@@ -1,751 +1,413 @@
+# utils.py — complete and corrected
+# --------------------------------------------------------------------------------------
+# Robust data fetch, caching, indicators, signal engine (BUY/SELL/HOLD),
+# backtesting (win rate & total return), asset summarization for all tabs.
+# Safe against yfinance API quirks and pandas shape issues.
+
 from __future__ import annotations
 
 import os
-import json
+import time
 import math
-import pickle
-import logging
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Tuple, List, Dict, Optional, Iterable
+import json
+from pathlib import Path
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import matplotlib.pyplot as plt
+import yfinance as yf
+
+# Technical indicators (ta)
+try:
+    from ta.trend import EMAIndicator, MACD
+    from ta.momentum import RSIIndicator
+    from ta.volatility import AverageTrueRange
+except ImportError:
+    EMAIndicator = MACD = RSIIndicator = AverageTrueRange = None
+
+# --------------------------------------------------------------------------------------
+# CONSTANTS & CONFIG
+# --------------------------------------------------------------------------------------
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+INTERVALS: Dict[str, Dict[str, object]] = {
+    "15m": {"interval": "15m", "period": "5d", "min_rows": 150},
+    "1h":  {"interval": "60m", "period": "1mo", "min_rows": 300},
+    "4h":  {"interval": "240m", "period": "3mo", "min_rows": 250},
+    "1d":  {"interval": "1d", "period": "1y", "min_rows": 200},
+    "1wk": {"interval": "1wk", "period": "5y", "min_rows": 150},
+}
+
+RISK_MULT: Dict[str, Dict[str, float]] = {
+    "Low":    {"tp_atr": 1.0, "sl_atr": 1.5},
+    "Medium": {"tp_atr": 1.5, "sl_atr": 1.0},
+    "High":   {"tp_atr": 2.0, "sl_atr": 0.8},
+}
+
+ASSET_SYMBOLS: Dict[str, str] = {
+    "Gold": "GC=F",
+    "NASDAQ 100": "^NDX",
+    "S&P 500": "^GSPC",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "Crude Oil": "CL=F",
+    "Bitcoin": "BTC-USD",
+}
+
+# --------------------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+# --------------------------------------------------------------------------------------
+# DATA FETCH & CACHE
+# --------------------------------------------------------------------------------------
+
+def _cache_path(symbol: str, interval_key: str) -> Path:
+    safe_sym = symbol.replace("^", "").replace("=", "_").replace("/", "_").replace("-", "_")
+    return DATA_DIR / f"{safe_sym}_{interval_key}.csv"
 
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
 
-def get_logger(name: str = "forecast", level: int = logging.INFO) -> logging.Logger:
-    """
-    Return a module-level logger with a standard format.
-    Ensures we don't attach duplicate handlers if called multiple times.
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    if not logger.handlers:
-        ch = logging.StreamHandler()
-        ch.setLevel(level)
-        fmt = logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    if not keep:
+        rename_map = {c: c.capitalize() for c in df.columns}
+        df = df.rename(columns=rename_map)
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[keep].copy()
 
-    return logger
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            pass
+    df = df.sort_index()
 
+    for col in df.columns:
+        val = df[col].values
+        if isinstance(val, np.ndarray) and getattr(val, "ndim", 1) > 1:
+            df[col] = pd.Series(val.ravel(), index=df.index)
+        if col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-log = get_logger()
-
-
-# -----------------------------------------------------------------------------
-# Configuration dataclass
-# -----------------------------------------------------------------------------
-
-@dataclass
-class RunConfig:
-    """
-    Central config you can save with each trained model so inference
-    can rebuild preprocessing identically.
-
-    Extend this with any hyperparams you care about.
-    """
-    target_col: str = "gold_price"
-    timestamp_col: str = "date"
-    feature_cols: Optional[List[str]] = None  # set after feature eng
-    lookback: int = 60        # timesteps fed into model
-    horizon: int = 1          # forecast horizon (t+1 by default)
-    scaler_type: str = "standard"  # "standard" or "minmax"
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15  # test is whatever is left
-    freq: Optional[str] = None  # e.g. "D" if you'd like to resample
-    # add model-specific stuff here if needed:
-    model_type: str = "LSTM"
-    notes: str = ""
-
-
-def save_config(cfg: RunConfig, path: str) -> None:
-    """
-    Persist config as json (human-readable + git diff friendly).
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
-    log.info(f"Config saved -> {path}")
-
-
-def load_config(path: str) -> RunConfig:
-    """
-    Load config json and return RunConfig.
-    """
-    with open(path, "r") as f:
-        data = json.load(f)
-    cfg = RunConfig(**data)
-    log.info(f"Config loaded <- {path}")
-    return cfg
-
-
-# -----------------------------------------------------------------------------
-# Paths / filesystem helpers
-# -----------------------------------------------------------------------------
-
-def ensure_dir(path: str) -> None:
-    """
-    Create directory if not exists.
-    """
-    if path and not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-        log.info(f"Created directory: {path}")
-
-
-# -----------------------------------------------------------------------------
-# Data loading & cleaning
-# -----------------------------------------------------------------------------
-
-def load_price_data(
-    path: str,
-    date_col: str = "date",
-    price_col: str = "gold_price",
-    parse_dates: bool = True,
-    sort: bool = True,
-    freq: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Load raw price data from CSV (or feather/parquet based on extension),
-    clean column names, parse datetime, sort, and optional resample.
-
-    Expected columns: at least [date_col, price_col].
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext in [".csv"]:
-        df = pd.read_csv(path)
-    elif ext in [".feather", ".ft"]:
-        df = pd.read_feather(path)
-    elif ext in [".parquet", ".pq"]:
-        df = pd.read_parquet(path)
-    else:
-        raise ValueError(f"Unsupported file extension '{ext}' for {path}")
-
-    # normalize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    # rename to expected if needed (be forgiving about naming)
-    if date_col.lower() != "date" and "date" in df.columns:
-        df.rename(columns={"date": date_col}, inplace=True)
-    if price_col.lower() != "gold_price" and "gold_price" in df.columns:
-        df.rename(columns={"gold_price": price_col}, inplace=True)
-
-    # datetime
-    if parse_dates:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-
-    # drop rows with invalid date or missing price
-    df = df.dropna(subset=[date_col, price_col])
-    # sort
-    if sort:
-        df = df.sort_values(date_col)
-
-    # optional resample to regular frequency
-    if freq:
-        df = (
-            df.set_index(date_col)
-              .resample(freq)
-              .last()  # last known price in period
-              .ffill()
-              .reset_index()
-        )
-
-    df = df.reset_index(drop=True)
-    log.info(
-        f"Loaded data: {path} -> {len(df)} rows, "
-        f"{df[date_col].min()} to {df[date_col].max()}"
-    )
+    df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna(how="all")
     return df
 
 
-# -----------------------------------------------------------------------------
-# Feature engineering
-# -----------------------------------------------------------------------------
+def _yahoo_try_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    try:
+        raw = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
+        return _normalize_ohlcv(raw)
+    except Exception as e:
+        _log(f"⚠️ {symbol}: fetch error {e}")
+        return pd.DataFrame()
 
-def add_returns_and_lags(
-    df: pd.DataFrame,
-    price_col: str,
-    lags: Iterable[int] = (1, 2, 3, 5, 10, 20),
-    pct_change_windows: Iterable[int] = (1, 5, 10, 20),
+
+def _yahoo_mirror_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    try:
+        tk = yf.Ticker(symbol)
+        raw = tk.history(period=period, interval=interval, auto_adjust=True, prepost=False)
+        df = _normalize_ohlcv(raw)
+        if not df.empty:
+            return df
+        raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
+        return _normalize_ohlcv(raw2)
+    except Exception as e:
+        _log(f"⚠️ Mirror history error for {symbol}: {e}")
+        return pd.DataFrame()
+
+
+def fetch_data(
+    symbol: str,
+    interval_key: str = "1h",
+    use_cache: bool = True,
+    max_retries: int = 4,
+    backoff_range: Tuple[float, float] = (3.5, 12.5),
 ) -> pd.DataFrame:
-    """
-    Add lagged prices and % returns.
-    """
-    out = df.copy()
+    if interval_key not in INTERVALS:
+        raise KeyError(f"Unknown interval_key '{interval_key}'. Known: {list(INTERVALS.keys())}")
 
-    # % change features
-    for win in pct_change_windows:
-        out[f"ret_{win}"] = out[price_col].pct_change(win)
+    interval = str(INTERVALS[interval_key]["interval"])
+    period = str(INTERVALS[interval_key]["period"])
+    min_rows = int(INTERVALS[interval_key]["min_rows"])
 
-    # lag features
-    for lag in lags:
-        out[f"{price_col}_lag_{lag}"] = out[price_col].shift(lag)
+    _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
+    cache_fp = _cache_path(symbol, interval_key)
 
-    return out
+    if use_cache and cache_fp.exists():
+        try:
+            cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
+            cached = _normalize_ohlcv(cached)
+            if len(cached) >= min_rows:
+                _log(f"✅ Using cached {symbol} ({len(cached)} rows).")
+                return cached
+            else:
+                _log(f"ℹ️ Cache exists for {symbol} but only {len(cached)} rows; needs {min_rows}.")
+        except Exception as e:
+            _log(f"⚠️ Cache read failed for {symbol}: {e}")
 
+    for attempt in range(1, max_retries + 1):
+        _log(f"⏳ Attempt {attempt}: Fetching {symbol} from Yahoo...")
+        df = _yahoo_try_download(symbol, interval, period)
+        if not df.empty and len(df) >= min_rows:
+            _log(f"✅ {symbol}: fetched {len(df)} rows.")
+            try:
+                df.to_csv(cache_fp)
+                _log(f"💾 Cached {symbol} data → {cache_fp}")
+            except Exception as e:
+                _log(f"⚠️ Cache write failed for {symbol}: {e}")
+            return df
 
-def add_technical_indicators(
-    df: pd.DataFrame,
-    price_col: str,
-    windows: Iterable[int] = (5, 10, 20, 50, 100, 200),
-) -> pd.DataFrame:
-    """
-    Add common technical indicators (SMA, EMA, rolling vol, RSI-lite).
-    This is intentionally self-contained (no ta-lib dependency).
-    """
-    out = df.copy()
+        got = len(df) if isinstance(df, pd.DataFrame) else "N/A"
+        _log(f"⚠️ {symbol}: invalid or insufficient data ({got} rows), retrying...")
+        time.sleep(np.random.uniform(*backoff_range))
 
-    # simple moving averages & rolling std (volatility)
-    for w in windows:
-        out[f"sma_{w}"] = out[price_col].rolling(w).mean()
-        out[f"vol_{w}"] = (
-            out[price_col].pct_change().rolling(w).std()
-        )  # realized vol proxy
+    _log(f"🪞 Attempting mirror fetch for {symbol}...")
+    df = _yahoo_mirror_history(symbol, interval, period)
+    if not df.empty and len(df) >= min_rows:
+        _log(f"✅ Mirror fetch succeeded for {symbol}.")
+        try:
+            df.to_csv(cache_fp)
+            _log(f"💾 Cached {symbol} data → {cache_fp}")
+        except Exception as e:
+            _log(f"⚠️ Cache write failed for {symbol}: {e}")
+        return df
 
-    # exponential moving averages
-    for w in windows:
-        out[f"ema_{w}"] = out[price_col].ewm(span=w, adjust=False).mean()
+    _log(f"🚫 All attempts failed for {symbol}, returning empty DataFrame.")
+    return pd.DataFrame()
 
-    # RSI (Relative Strength Index) style calc (14 default-ish)
-    period = 14
-    delta = out[price_col].diff()
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(gain).rolling(period).mean()
-    roll_down = pd.Series(loss).rolling(period).mean()
-    rs = roll_up / (roll_down + 1e-9)
-    out["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+# --------------------------------------------------------------------------------------
+# INDICATORS
+# --------------------------------------------------------------------------------------
 
-    return out
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
 
+    for col in ["Close", "High", "Low"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+        vals = df[col].values
+        if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
+            df[col] = pd.Series(vals.ravel(), index=df.index)
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-def forward_target(
-    df: pd.DataFrame,
-    price_col: str,
-    horizon: int = 1,
-    target_name: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Create the prediction target: price at t+horizon (or return to t+horizon).
-    Default: raw future price.
-    """
-    out = df.copy()
-    tgt_col = target_name or f"{price_col}_future_{horizon}"
-    out[tgt_col] = out[price_col].shift(-horizon)
-    return out
+    # EMA
+    try:
+        df["ema20"] = EMAIndicator(close=df["Close"], window=20).ema_indicator()
+        df["ema50"] = EMAIndicator(close=df["Close"], window=50).ema_indicator()
+    except Exception:
+        df["ema20"] = df["Close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
+    # RSI
+    try:
+        rsi_series = RSIIndicator(close=df["Close"], window=14).rsi()
+    except Exception:
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = -delta.clip(upper=0).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi_series = 100 - (100 / (1 + rs))
+    df["RSI"] = rsi_series
+    df["rsi"] = df["RSI"]
 
-def build_feature_matrix(
-    df: pd.DataFrame,
-    timestamp_col: str,
-    target_col: str,
-    dropna: bool = True,
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    After feature engineering + forward_target, split into:
-    X (features), y (target), t (timestamps).
-    """
-    # Keep timestamp separate so we don't scale it.
-    t = df[timestamp_col].copy()
+    # MACD
+    try:
+        macd = MACD(close=df["Close"])
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        df["macd_hist"] = macd.macd_diff()
+    except Exception:
+        ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+        df["macd"] = ema12 - ema26
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-    # y
-    y = df[target_col].copy()
+    # ATR
+    try:
+        atr = AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14)
+        df["atr"] = atr.average_true_range()
+    except Exception:
+        tr1 = (df["High"] - df["Low"]).abs()
+        tr2 = (df["High"] - df["Close"].shift(1)).abs()
+        tr3 = (df["Low"] - df["Close"].shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df["atr"] = tr.rolling(14).mean()
 
-    # X = everything numeric except timestamp & target
-    ignore_cols = {timestamp_col, target_col}
-    numeric_cols = [
-        c for c in df.columns
-        if c not in ignore_cols and pd.api.types.is_numeric_dtype(df[c])
-    ]
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+    return df
 
-    X = df[numeric_cols].copy()
+# --------------------------------------------------------------------------------------
+# SIGNAL ENGINE
+# --------------------------------------------------------------------------------------
 
-    if dropna:
-        valid_mask = ~(X.isna().any(axis=1) | y.isna())
-        X = X.loc[valid_mask].reset_index(drop=True)
-        y = y.loc[valid_mask].reset_index(drop=True)
-        t = t.loc[valid_mask].reset_index(drop=True)
+def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
+    score = 0.0
+    votes = 0
 
-    return X, y, t
+    if pd.notna(row["ema20"]) and pd.notna(row["ema50"]):
+        votes += 1
+        if row["ema20"] > row["ema50"]:
+            score += 1.0
+        elif row["ema20"] < row["ema50"]:
+            score -= 1.0
 
+    if pd.notna(row["RSI"]):
+        votes += 1
+        if row["RSI"] < 30:
+            score += 1.0
+        elif row["RSI"] > 70:
+            score -= 1.0
 
-# -----------------------------------------------------------------------------
-# Time-based split
-# -----------------------------------------------------------------------------
+    if (
+        pd.notna(row["macd"])
+        and pd.notna(row["macd_signal"])
+        and pd.notna(row_prev["macd"])
+        and pd.notna(row_prev["macd_signal"])
+    ):
+        votes += 1
+        crossed_up = (row_prev["macd"] <= row_prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
+        crossed_dn = (row_prev["macd"] >= row_prev["macd_signal"]) and (row["macd"] < row["macd_signal"])
+        if crossed_up:
+            score += 1.0
+        elif crossed_dn:
+            score -= 1.0
 
-def train_val_test_split_time(
-    X: pd.DataFrame,
-    y: pd.Series,
-    t: pd.Series,
-    train_ratio: float,
-    val_ratio: float,
-) -> Dict[str, pd.DataFrame]:
-    """
-    Deterministic chronological split.
-    """
-    assert len(X) == len(y) == len(t), "Length mismatch"
-    n = len(X)
-
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    n_test = n - n_train - n_val
-
-    if n_test <= 0:
-        raise ValueError("Not enough data left for test split. Adjust ratios.")
-
-    idx_train_end = n_train
-    idx_val_end = n_train + n_val
-
-    split = {
-        "X_train": X.iloc[:idx_train_end].reset_index(drop=True),
-        "y_train": y.iloc[:idx_train_end].reset_index(drop=True),
-        "t_train": t.iloc[:idx_train_end].reset_index(drop=True),
-
-        "X_val": X.iloc[idx_train_end:idx_val_end].reset_index(drop=True),
-        "y_val": y.iloc[idx_train_end:idx_val_end].reset_index(drop=True),
-        "t_val": t.iloc[idx_train_end:idx_val_end].reset_index(drop=True),
-
-        "X_test": X.iloc[idx_val_end:].reset_index(drop=True),
-        "y_test": y.iloc[idx_val_end:].reset_index(drop=True),
-        "t_test": t.iloc[idx_val_end:].reset_index(drop=True),
-    }
-
-    log.info(
-        f"Split sizes -> train:{len(split['X_train'])} "
-        f"val:{len(split['X_val'])} test:{len(split['X_test'])}"
-    )
-
-    return split
-
-
-# -----------------------------------------------------------------------------
-# Scaling
-# -----------------------------------------------------------------------------
-
-@dataclass
-class Scalers:
-    feature_scaler: object
-    target_scaler: object
-
-
-def fit_scalers(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    scaler_type: str = "standard",
-) -> Scalers:
-    """
-    Fit feature & target scalers on TRAIN ONLY.
-    """
-    if scaler_type == "standard":
-        feat_scaler = StandardScaler()
-        tgt_scaler = StandardScaler()
-    elif scaler_type == "minmax":
-        feat_scaler = MinMaxScaler()
-        tgt_scaler = MinMaxScaler()
+    conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
+    if score >= 0.67 * votes:
+        return "Buy", conf
+    elif score <= -0.67 * votes:
+        return "Sell", conf
     else:
-        raise ValueError(f"Unsupported scaler_type: {scaler_type}")
-
-    feat_scaler.fit(X_train.values)
-    tgt_scaler.fit(y_train.values.reshape(-1, 1))
-
-    return Scalers(feat_scaler, tgt_scaler)
+        return "Hold", 1.0 - conf
 
 
-def apply_scalers(
-    scalers: Scalers,
-    X: pd.DataFrame,
-    y: Optional[pd.Series] = None,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """
-    Transform any split using pre-fit scalers.
-    """
-    X_scaled = scalers.feature_scaler.transform(X.values)
-    y_scaled = None
-    if y is not None:
-        y_scaled = scalers.target_scaler.transform(y.values.reshape(-1, 1)).ravel()
-    return X_scaled, y_scaled
+def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
+    m = RISK_MULT.get(risk, RISK_MULT["Medium"])
+    tp_k = float(m["tp_atr"])
+    sl_k = float(m["sl_atr"])
+    tp = price + tp_k * atr if side == "Buy" else price - tp_k * atr
+    sl = price - sl_k * atr if side == "Buy" else price + sl_k * atr
+    return float(tp), float(sl)
 
 
-def inverse_target(
-    scalers: Scalers,
-    y_scaled: np.ndarray,
-) -> np.ndarray:
-    """
-    Undo scaling for predictions or eval.
-    """
-    return scalers.target_scaler.inverse_transform(y_scaled.reshape(-1, 1)).ravel()
+def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[str, object]]:
+    if df is None or df.empty or len(df) < 60:
+        return None
+    df = add_indicators(df)
+    if df.empty or len(df) < 60:
+        return None
 
+    row_prev = df.iloc[-2]
+    row = df.iloc[-1]
+    side, prob = compute_signal_row(row_prev, row)
 
-# -----------------------------------------------------------------------------
-# Sequence builder (for RNN/LSTM/Transformer style models)
-# -----------------------------------------------------------------------------
+    if side == "Hold":
+        return {"side": "Hold", "prob": prob, "price": float(row["Close"]),
+                "tp": None, "sl": None, "atr": float(row["atr"]) if pd.notna(row["atr"]) else None}
 
-def make_sequences(
-    X_arr: np.ndarray,
-    y_arr: np.ndarray,
-    lookback: int,
-    horizon: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Turn tabular time series into supervised sequences.
+    atr_val = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].iloc[-14:].mean())
+    tp, sl = compute_tp_sl(float(row["Close"]), atr_val, side, risk)
 
-    Example:
-        lookback = 60, horizon = 1
-        For index i, X_seq[i] = X_arr[i-lookback : i]
-                       y_seq[i] = y_arr[i + horizon - 1]
+    return {"side": side, "prob": prob, "price": float(row["Close"]),
+            "tp": tp, "sl": sl, "atr": atr_val}
 
-    We only create sequences where we have full lookback history
-    AND full horizon future.
-    """
-    n_samples = len(X_arr)
-    X_seqs = []
-    y_seqs = []
+# --------------------------------------------------------------------------------------
+# BACKTEST (FIXED)
+# --------------------------------------------------------------------------------------
 
-    # last usable index for input is n_samples - horizon
-    # but we also need i - lookback >= 0  -> i >= lookback
-    # so i runs from lookback to n_samples - horizon (inclusive-1)
-    max_i = n_samples - horizon
-    for i in range(lookback, max_i):
-        x_window = X_arr[i - lookback : i, :]
-        y_point = y_arr[i + horizon - 1]  # scalar
-        X_seqs.append(x_window)
-        y_seqs.append(y_point)
+def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool = True) -> Dict[str, object]:
+    out = {"win_rate": None, "total_return_pct": None, "n_trades": 0, "trades": []}
 
-    X_seqs = np.stack(X_seqs, axis=0)  # [N, lookback, features]
-    y_seqs = np.array(y_seqs)          # [N]
+    if df is None or df.empty or len(df) < 120:
+        return out
 
-    return X_seqs, y_seqs
+    df = add_indicators(df)
+    if df.empty:
+        return out
 
-
-def align_sequences_with_timestamps(
-    t: pd.Series,
-    lookback: int,
-    horizon: int,
-) -> pd.Series:
-    """
-    When you build sequences with make_sequences(), you're effectively
-    dropping the first <lookback> timestamps and the last <horizon> timestamps.
-
-    This helper returns the timestamps that correspond to each y in y_seqs
-    so you can plot pred vs actual on real dates.
-    """
-    n = len(t)
-    usable = []
-    max_i = n - horizon
-    for i in range(lookback, max_i):
-        usable.append(t.iloc[i + horizon - 1])
-    return pd.Series(usable).reset_index(drop=True)
-
-
-# -----------------------------------------------------------------------------
-# Metrics / evaluation
-# -----------------------------------------------------------------------------
-
-def regression_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-) -> Dict[str, float]:
-    """
-    Common evaluation metrics.
-    """
-    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-9))) * 100.0
-
-    return {
-        "rmse": rmse,
-        "mae": mae,
-        "r2": r2,
-        "mape_pct": mape,
-    }
-
-
-def plot_predictions(
-    timestamps: Iterable[pd.Timestamp],
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    title: str = "Forecast vs Actual",
-    figsize: Tuple[int, int] = (10, 4),
-    show: bool = False,
-    save_path: Optional[str] = None,
-) -> None:
-    """
-    Simple time series prediction plot.
-    """
-    plt.figure(figsize=figsize)
-    plt.plot(timestamps, y_true, label="Actual")
-    plt.plot(timestamps, y_pred, label="Predicted", linestyle="--")
-    plt.title(title)
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.tight_layout()
-
-    if save_path is not None:
-        ensure_dir(os.path.dirname(save_path))
-        plt.savefig(save_path, dpi=200)
-        log.info(f"Saved plot -> {save_path}")
-
-    if show:
-        plt.show()
-
-    plt.close()
-
-
-# -----------------------------------------------------------------------------
-# Walk-forward / rolling backtest scaffold
-# -----------------------------------------------------------------------------
-
-def walk_forward_backtest(
-    X_full: np.ndarray,
-    y_full: np.ndarray,
-    t_full: Iterable[pd.Timestamp],
-    train_size: int,
-    step_size: int,
-    fit_fn,
-    predict_fn,
-    inverse_fn=None,
-) -> pd.DataFrame:
-    """
-    Rolling-origin evaluation:
-    - Take the first `train_size` points, fit model
-    - Predict the next `step_size`
-    - Slide forward by `step_size`
-    - Repeat
-
-    fit_fn(X_train, y_train) should *train and return* a model object
-    predict_fn(model, X_input) should return predictions
-    inverse_fn(optional) to invert scaling on preds and y
-
-    Returns dataframe with columns:
-    ['timestamp','y_true','y_pred']
-    """
-
-    results = []
-
-    start = 0
-    n = len(X_full)
-
-    while True:
-        train_end = start + train_size
-        test_end = train_end + step_size
-        if test_end > n:
-            break  # not enough future data left
-
-        X_train = X_full[start:train_end]
-        y_train = y_full[start:train_end]
-
-        X_test = X_full[train_end:test_end]
-        y_test = y_full[train_end:test_end]
-
-        t_test = list(t_full[train_end:test_end])
-
-        model = fit_fn(X_train, y_train)
-        y_hat = predict_fn(model, X_test)
-
-        if inverse_fn is not None:
-            y_test_inv = inverse_fn(y_test)
-            y_hat_inv = inverse_fn(y_hat)
+    signals: List[Tuple[pd.Timestamp, str, float, float, float]] = []
+    prev = df.iloc[0]
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        side, conf = compute_signal_row(prev, row)
+        if side == "Hold" and hold_allowed:
+            signals.append((row.name, "Hold", conf, np.nan, np.nan))
         else:
-            y_test_inv = y_test
-            y_hat_inv = y_hat
+            atr_here = row["atr"] if pd.notna(row["atr"]) else df["atr"].iloc[max(0, i - 14):i + 1].mean()
+            tp, sl = compute_tp_sl(row["Close"], atr_here, side, risk)
+            signals.append((row.name, side, conf, tp, sl))
+        prev = row
 
-        for ts, yt, yp in zip(t_test, y_test_inv, y_hat_inv):
-            results.append(
-                {
-                    "timestamp": ts,
-                    "y_true": float(yt),
-                    "y_pred": float(yp),
-                }
-            )
+    position = None
+    eq_curve, wins = 0.0, 0
+    trades: List[Dict[str, object]] = []
 
-        start += step_size
+    for idx in range(len(signals)):
+        ts, side, conf, tp, sl = signals[idx]
+        candle_idx = idx + 1
+        if candle_idx >= len(df):
+            break
 
-    out_df = pd.DataFrame(results)
-    return out_df
+        price = float(df["Close"].iloc[candle_idx])
+        high = float(df["High"].iloc[candle_idx])
+        low = float(df["Low"].iloc[candle_idx])
 
+        if position is None:
+            if side in ("Buy", "Sell"):
+                position = (side, price, tp, sl, ts)
+            continue
 
-# -----------------------------------------------------------------------------
-# Model persistence
-# -----------------------------------------------------------------------------
+        pos_side, entry_px, pos_tp, pos_sl, entry_ts = position
+        exit_reason, exit_px = None, price
 
-def save_model(
-    model,
-    scalers: Optional[Scalers],
-    cfg: Optional[RunConfig],
-    out_dir: str,
-    model_name: str = "model",
-) -> None:
-    """
-    Save model weights (pickle or model.state_dict()), scalers, and config
-    into <out_dir>.
-
-    You can adapt this for Keras/PyTorch:
-      - For Keras: model.save(os.path.join(out_dir, f"{model_name}.h5"))
-      - For PyTorch: torch.save(model.state_dict(), path)
-    For now we assume a pickle-able model.
-    """
-    ensure_dir(out_dir)
-
-    # model
-    model_path = os.path.join(out_dir, f"{model_name}.pkl")
-    with open(model_path, "wb") as f:
-        pickle.dump(model, f)
-    log.info(f"Saved model -> {model_path}")
-
-    # scalers
-    if scalers is not None:
-        scalers_path = os.path.join(out_dir, "scalers.pkl")
-        with open(scalers_path, "wb") as f:
-            pickle.dump(scalers, f)
-        log.info(f"Saved scalers -> {scalers_path}")
-
-    # config
-    if cfg is not None:
-        cfg_path = os.path.join(out_dir, "config.json")
-        save_config(cfg, cfg_path)
-
-
-def load_model(
-    out_dir: str,
-    model_name: str = "model",
-    load_scalers: bool = True,
-    load_cfg: bool = True,
-) -> Tuple[object, Optional[Scalers], Optional[RunConfig]]:
-    """
-    Load model + scalers + config from disk.
-    """
-    model_path = os.path.join(out_dir, f"{model_name}.pkl")
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
-    log.info(f"Loaded model <- {model_path}")
-
-    scalers_obj = None
-    if load_scalers:
-        scalers_path = os.path.join(out_dir, "scalers.pkl")
-        if os.path.exists(scalers_path):
-            with open(scalers_path, "rb") as f:
-                scalers_obj = pickle.load(f)
-            log.info(f"Loaded scalers <- {scalers_path}")
+        if pos_side == "Buy":
+            if not np.isnan(pos_tp) and high >= pos_tp:
+                exit_reason, exit_px = "TP", pos_tp
+            elif not np.isnan(pos_sl) and low <= pos_sl:
+                exit_reason, exit_px = "SL", pos_sl
+            elif side == "Sell":
+                exit_reason = "Flip"
         else:
-            log.warning("No scalers.pkl found")
+            if not np.isnan(pos_tp) and low <= pos_tp:
+                exit_reason, exit_px = "TP", pos_tp
+            elif not np.isnan(pos_sl) and high >= pos_sl:
+                exit_reason, exit_px = "SL", pos_sl
+            elif side == "Buy":
+                exit_reason = "Flip"
 
-    cfg_obj = None
-    if load_cfg:
-        cfg_path = os.path.join(out_dir, "config.json")
-        if os.path.exists(cfg_path):
-            cfg_obj = load_config(cfg_path)
-            log.info(f"Loaded config <- {cfg_path}")
-        else:
-            log.warning("No config.json found")
+        if exit_reason:
+            ret = (exit_px - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
+            eq_curve += ret
+            wins += 1 if ret > 0 else 0
+            trades.append({
+                "entry_time": entry_ts, "exit_time": ts,
+                "side": pos_side, "entry": entry_px, "exit": exit_px,
+                "reason": exit_reason, "return_pct": ret * 100.0,
+            })
+            position = None
+            if exit_reason == "Flip" and side in ("Buy", "Sell"):
+                position = (side, price, tp, sl, ts)
 
-    return model, scalers_obj, cfg_obj
-
-
-# -----------------------------------------------------------------------------
-# Convenience end-to-end prep helper
-# -----------------------------------------------------------------------------
-
-def prepare_timeseries_supervised(
-    raw_df: pd.DataFrame,
-    cfg: RunConfig,
-) -> Dict[str, object]:
-    """
-    High-level convenience:
-    1. Feature engineering
-    2. Forward target
-    3. Build X,y,t
-    4. Chronological split
-    5. Fit scalers on train only
-    6. Scale all splits
-    7. Build sequences for each split
-
-    Returns a dict with:
-    {
-        'splits': {...original splits with unscaled y...},
-        'scalers': Scalers,
-        'seq': { 'train': (X_seq_train, y_seq_train, t_seq_train), ... }
-    }
-
-    NOTE:
-    - cfg.feature_cols will get set here to lock in columns.
-    """
-
-    # 1. engineered features (lags, indicators)
-    df_feat = raw_df.copy()
-    df_feat = add_returns_and_lags(df_feat, price_col=cfg.target_col)
-    df_feat = add_technical_indicators(df_feat, price_col=cfg.target_col)
-    df_feat = forward_target(df_feat, price_col=cfg.target_col, horizon=cfg.horizon)
-
-    target_name = f"{cfg.target_col}_future_{cfg.horizon}"
-
-    # 2. build matrices
-    X, y, t = build_feature_matrix(
-        df_feat,
-        timestamp_col=cfg.timestamp_col,
-        target_col=target_name,
-        dropna=True,
-    )
-
-    # persist which columns we actually used
-    cfg.feature_cols = list(X.columns)
-
-    # 3. split
-    splits_tab = train_val_test_split_time(
-        X, y, t,
-        train_ratio=cfg.train_ratio,
-        val_ratio=cfg.val_ratio,
-    )
-
-    # 4. scalers from TRAIN ONLY
-    scalers = fit_scalers(
-        splits_tab["X_train"],
-        splits_tab["y_train"],
-        scaler_type=cfg.scaler_type,
-    )
-
-    # 5. apply scalers to each split
-    Xtr_s, ytr_s = apply_scalers(scalers, splits_tab["X_train"], splits_tab["y_train"])
-    Xva_s, yva_s = apply_scalers(scalers, splits_tab["X_val"], splits_tab["y_val"])
-    Xte_s, yte_s = apply_scalers(scalers, splits_tab["X_test"], splits_tab["y_test"])
-
-    # 6. sequences
-    Xtr_seq, ytr_seq = make_sequences(Xtr_s, ytr_s, cfg.lookback, cfg.horizon)
-    ttr_seq = align_sequences_with_timestamps(
-        splits_tab["t_train"], cfg.lookback, cfg.horizon
-    )
-
-    Xva_seq, yva_seq = make_sequences(Xva_s, yva_s, cfg.lookback, cfg.horizon)
-    tva_seq = align_sequences_with_timestamps(
-        splits_tab["t_val"], cfg.lookback, cfg.horizon
-    )
-
-    Xte_seq, yte_seq = make_sequences(Xte_s, yte_s, cfg.lookback, cfg.horizon)
-    tte_seq = align_sequences_with_timestamps(
-        splits_tab["t_test"], cfg.lookback, cfg.horizon
-    )
-
-    out = {
-        "splits": splits_tab,
-        "scalers": scalers,
-        "seq": {
-            "train": (Xtr_seq, ytr_seq, ttr_seq),
-            "val":   (Xva_seq, yva_seq, tva_seq),
-            "test":  (Xte_seq, yte_seq, tte_seq),
-        },
-        "config": cfg,
-    }
-
-    return out
+    n = len(trades)
+    out["n_trades"] = n
+    out["win_rate"] = 100.0 * (wins /
