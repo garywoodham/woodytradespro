@@ -1,4 +1,4 @@
-# utils.py — complete and corrected (with index fetch fix)
+# utils.py — complete and corrected (index fetch + backtest win-rate fix)
 # --------------------------------------------------------------------------------------
 # Robust data fetch, caching, indicators, signal engine (BUY/SELL/HOLD),
 # backtesting (win rate & total return), and asset summarization.
@@ -32,7 +32,7 @@ DATA_DIR.mkdir(exist_ok=True)
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m", "period": "5d", "min_rows": 100},
-    "1h": {"interval": "60m", "period": "2mo", "min_rows": 200},  # period extended, row threshold reduced
+    "1h": {"interval": "60m", "period": "2mo", "min_rows": 200},  # extended period + lower min rows
     "4h": {"interval": "240m", "period": "3mo", "min_rows": 200},
     "1d": {"interval": "1d", "period": "1y", "min_rows": 150},
     "1wk": {"interval": "1wk", "period": "5y", "min_rows": 100},
@@ -60,7 +60,6 @@ ASSET_SYMBOLS: Dict[str, str] = {
 # --------------------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
-    """Print to console and flush for Streamlit logs."""
     try:
         print(msg, flush=True)
     except Exception:
@@ -76,7 +75,6 @@ def _cache_path(symbol: str, interval_key: str) -> Path:
 
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize OHLCV data to consistent structure."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -100,8 +98,7 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         val = df[col].values
         if isinstance(val, np.ndarray) and getattr(val, "ndim", 1) > 1:
             df[col] = pd.Series(val.ravel(), index=df.index)
-        if col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna(how="all")
     return df
@@ -137,22 +134,20 @@ def fetch_data(
     max_retries: int = 4,
     backoff_range: Tuple[float, float] = (3.5, 12.5),
 ) -> pd.DataFrame:
-    """Fetch OHLCV data with retries, caching, and normalization."""
     if interval_key not in INTERVALS:
         raise KeyError(f"Unknown interval_key '{interval_key}'")
 
-    interval = str(INTERVALS[interval_key]["interval"])
-    period = str(INTERVALS[interval_key]["period"])
-    min_rows = int(INTERVALS[interval_key]["min_rows"])
+    interval = INTERVALS[interval_key]["interval"]
+    period = INTERVALS[interval_key]["period"]
+    min_rows = INTERVALS[interval_key]["min_rows"]
 
-    # Dynamic min_rows relaxation for index tickers
+    # Fix for indices returning limited hourly data
     if symbol in ["^NDX", "^GSPC", "^DJI"]:
         min_rows = 100
 
     cache_fp = _cache_path(symbol, interval_key)
     _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
 
-    # 1) Cache read
     if use_cache and cache_fp.exists():
         try:
             cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
@@ -163,7 +158,6 @@ def fetch_data(
         except Exception as e:
             _log(f"⚠️ Cache read failed: {e}")
 
-    # 2) Try Yahoo fetch
     for attempt in range(1, max_retries + 1):
         df = _yahoo_try_download(symbol, interval, period)
         if not df.empty and len(df) >= min_rows:
@@ -177,7 +171,6 @@ def fetch_data(
         _log(f"⚠️ Retry {attempt} failed for {symbol} ({len(df)} rows).")
         time.sleep(np.random.uniform(*backoff_range))
 
-    # 3) Mirror fallback
     _log(f"🪞 Mirror fetch for {symbol}...")
     df = _yahoo_mirror_history(symbol, interval, period)
     if not df.empty and len(df) >= min_rows:
@@ -197,11 +190,9 @@ def fetch_data(
 # --------------------------------------------------------------------------------------
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add EMA, RSI, MACD, ATR indicators."""
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
-
     for col in ["Close", "High", "Low"]:
         if col not in df.columns:
             return pd.DataFrame()
@@ -301,7 +292,11 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool 
     out = {"win_rate": 0.0, "total_return_pct": 0.0, "n_trades": 0, "trades": []}
     if df is None or df.empty or len(df) < 120:
         return out
+
     df = add_indicators(df)
+    if df.empty:
+        return out
+
     signals, prev = [], df.iloc[0]
     for i in range(1, len(df)):
         row = df.iloc[i]
@@ -310,33 +305,62 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool 
         tp, sl = compute_tp_sl(row["Close"], atr_here, side, risk)
         signals.append((row.name, side, conf, tp, sl))
         prev = row
-    eq, wins, trades, position = 0.0, 0, [], None
-    for idx in range(len(signals)):
-        ts, side, conf, tp, sl = signals[idx]
-        if idx + 1 >= len(df): break
-        price, high, low = float(df["Close"].iloc[idx + 1]), float(df["High"].iloc[idx + 1]), float(df["Low"].iloc[idx + 1])
+
+    eq_curve, wins, trades, position = 0.0, 0, [], None
+
+    for idx, (ts, side, conf, tp, sl) in enumerate(signals):
+        if idx + 1 >= len(df):
+            break
+        price = float(df["Close"].iloc[idx + 1])
+        high = float(df["High"].iloc[idx + 1])
+        low = float(df["Low"].iloc[idx + 1])
+
         if position is None:
             if side in ("Buy", "Sell"):
                 position = (side, price, tp, sl, ts)
             continue
+
         pos_side, entry_px, pos_tp, pos_sl, entry_ts = position
         exit_reason, exit_px = None, price
+
         if pos_side == "Buy":
-            if not np.isnan(pos_tp) and high >= pos_tp: exit_reason, exit_px = "TP", pos_tp
-            elif not np.isnan(pos_sl) and low <= pos_sl: exit_reason, exit_px = "SL", pos_sl
-            elif side == "Sell": exit_reason = "Flip"
+            if not np.isnan(pos_tp) and high >= pos_tp:
+                exit_reason, exit_px = "TP", pos_tp
+            elif not np.isnan(pos_sl) and low <= pos_sl:
+                exit_reason, exit_px = "SL", pos_sl
+            elif side == "Sell":
+                exit_reason = "Flip"
         else:
-            if not np.isnan(pos_tp) and low <= pos_tp: exit_reason, exit_px = "TP", pos_tp
-            elif not np.isnan(pos_sl) and high >= pos_sl: exit_reason, exit_px = "SL", pos_sl
-            elif side == "Buy": exit_reason = "Flip"
+            if not np.isnan(pos_tp) and low <= pos_tp:
+                exit_reason, exit_px = "TP", pos_tp
+            elif not np.isnan(pos_sl) and high >= pos_sl:
+                exit_reason, exit_px = "SL", pos_sl
+            elif side == "Buy":
+                exit_reason = "Flip"
+
         if exit_reason:
             ret = (exit_px - entry_px) / entry_px * (1 if pos_side == "Buy" else -1)
-            eq += ret; wins += ret > 0; trades.append(
-                {"entry_time": entry_ts, "exit_time": ts, "side": pos_side, "entry": entry_px,
-                 "exit": exit_px, "reason": exit_reason, "return_pct": ret * 100})
+            eq_curve += ret
+            if ret > 0:
+                wins += 1
+            trades.append({
+                "entry_time": entry_ts,
+                "exit_time": ts,
+                "side": pos_side,
+                "entry": entry_px,
+                "exit": exit_px,
+                "reason": exit_reason,
+                "return_pct": ret * 100.0,
+            })
             position = None
+            if exit_reason == "Flip" and side in ("Buy", "Sell"):
+                position = (side, price, tp, sl, ts)
+
     n = len(trades)
-    out.update({"n_trades": n, "win_rate": 100 * wins / n if n else 0, "total_return_pct": 100 * eq, "trades": trades})
+    out["n_trades"] = n
+    out["win_rate"] = 100.0 * wins / n if n else 0.0
+    out["total_return_pct"] = 100.0 * eq_curve if n else 0.0
+    out["trades"] = trades
     return out
 
 # --------------------------------------------------------------------------------------
@@ -345,10 +369,12 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool 
 
 def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache: bool = True) -> Optional[Dict[str, object]]:
     df = fetch_data(symbol, interval_key, use_cache)
-    if df.empty: return None
+    if df.empty:
+        return None
     df = add_indicators(df)
     pred, bt = latest_prediction(df, risk), backtest_signals(df, risk)
-    if not pred: return None
+    if not pred:
+        return None
     return {"symbol": symbol, "interval_key": interval_key, "risk": risk,
             "last_price": float(df["Close"].iloc[-1]), "signal": pred["side"],
             "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"], "atr": pred["atr"],
@@ -357,17 +383,20 @@ def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cach
 
 
 def summarize_assets(interval_key="1h", risk="Medium", use_cache=True) -> pd.DataFrame:
-    rows = []; _log("Fetching and analyzing market data... please wait ⏳")
+    rows = []
+    _log("Fetching and analyzing market data... please wait ⏳")
     for asset, symbol in ASSET_SYMBOLS.items():
         _log(f"⏳ {asset} ({symbol}) ...")
         try:
             res = analyze_asset(symbol, interval_key, risk, use_cache)
             if res:
-                rows.append({"Asset": asset, "Symbol": symbol, "Interval": interval_key,
-                             "Price": res["last_price"], "Signal": res["signal"],
-                             "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
-                             "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
-                             "Trades": res["n_trades"]})
+                rows.append({
+                    "Asset": asset, "Symbol": symbol, "Interval": interval_key,
+                    "Price": res["last_price"], "Signal": res["signal"],
+                    "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
+                    "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
+                    "Trades": res["n_trades"]
+                })
         except Exception as e:
             _log(f"❌ Error analyzing {asset}: {e}")
     if not rows:
@@ -378,7 +407,8 @@ def summarize_assets(interval_key="1h", risk="Medium", use_cache=True) -> pd.Dat
 
 
 def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) -> Tuple[str, pd.DataFrame]:
-    if asset not in ASSET_SYMBOLS: raise KeyError(f"Unknown asset '{asset}'")
+    if asset not in ASSET_SYMBOLS:
+        raise KeyError(f"Unknown asset '{asset}'")
     symbol = ASSET_SYMBOLS[asset]
     df = fetch_data(symbol, interval_key, use_cache)
     df = add_indicators(df)
@@ -387,16 +417,20 @@ def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) ->
 
 def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True) -> Tuple[Optional[Dict[str, object]], pd.DataFrame]:
     symbol = ASSET_SYMBOLS.get(asset)
-    if not symbol: return None, pd.DataFrame()
+    if not symbol:
+        return None, pd.DataFrame()
     df = fetch_data(symbol, interval_key, use_cache)
-    if df.empty: return None, pd.DataFrame()
+    if df.empty:
+        return None, pd.DataFrame()
     df = add_indicators(df)
     pred, bt = latest_prediction(df, risk), backtest_signals(df, risk)
-    if not pred: return None, df
-    pred_out = {"asset": asset, "symbol": symbol, "interval": interval_key, "price": float(df["Close"].iloc[-1]),
-                "side": pred["side"], "probability": round(pred["prob"] * 100, 2),
-                "tp": pred["tp"], "sl": pred["sl"], "atr": pred["atr"],
-                "win_rate": bt["win_rate"], "backtest_return_pct": bt["total_return_pct"],
+    if not pred:
+        return None, df
+    pred_out = {"asset": asset, "symbol": symbol, "interval": interval_key,
+                "price": float(df["Close"].iloc[-1]), "side": pred["side"],
+                "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
+                "atr": pred["atr"], "win_rate": bt["win_rate"],
+                "backtest_return_pct": bt["total_return_pct"],
                 "n_trades": bt["n_trades"], "trades": bt["trades"]}
     return pred_out, df
 
