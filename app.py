@@ -1,6 +1,4 @@
-# app.py — WoodyTradesPro Smart v2 (Full + Clean)
-# ---------------------------------------------------------------------------
-# Streamlit App for Forecasting & Backtesting using utils.py Smart v2
+# app.py — WoodyTradesPro Smart v2 (Full + Clean, fixed duplicate selectbox IDs)
 # ---------------------------------------------------------------------------
 
 import os
@@ -24,7 +22,6 @@ warnings.filterwarnings("ignore", message="Please replace `use_container_width`"
 # APP CONFIG
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="WoodyTradesPro Forecast", layout="wide")
-
 st.title("📈 WoodyTradesPro Forecast (Smart v2)")
 
 tabs = st.tabs(["📊 Market Summary", "🎯 Predictions", "📈 Chart View", "🔍 Backtest Results"])
@@ -36,8 +33,12 @@ with tabs[0]:
     st.subheader("📊 Multi-Asset Market Summary")
 
     col1, col2 = st.columns(2)
-    interval_key = col1.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1)
-    risk = col2.selectbox("Risk Level", ["Low", "Medium", "High"], index=1)
+    interval_key = col1.selectbox(
+        "Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="summary_interval"
+    )
+    risk = col2.selectbox(
+        "Risk Level", ["Low", "Medium", "High"], index=1, key="summary_risk"
+    )
 
     st.info(f"Fetching latest market data for interval **{interval_key}**, risk profile **{risk}**...")
 
@@ -61,12 +62,17 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("🎯 Asset Predictions and Backtest")
 
-    asset = st.selectbox("Select Asset", list([
-        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
-        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
-    ]))
-    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1)
-    risk = st.selectbox("Risk Level", ["Low", "Medium", "High"], index=1)
+    asset = st.selectbox(
+        "Select Asset",
+        ["Gold", "NASDAQ 100", "S&P 500", "EUR/USD", "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"],
+        key="pred_asset",
+    )
+    interval_key = st.selectbox(
+        "Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="pred_interval"
+    )
+    risk = st.selectbox(
+        "Risk Level", ["Low", "Medium", "High"], index=1, key="pred_risk"
+    )
 
     st.info(f"Analyzing {asset} at {interval_key} timeframe with {risk} risk...")
 
@@ -103,11 +109,14 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("📈 Interactive Chart View")
 
-    asset = st.selectbox("Asset", list([
-        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
-        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
-    ]), key="chart_asset")
-    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="chart_interval")
+    asset = st.selectbox(
+        "Asset",
+        ["Gold", "NASDAQ 100", "S&P 500", "EUR/USD", "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"],
+        key="chart_asset",
+    )
+    interval_key = st.selectbox(
+        "Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="chart_interval"
+    )
 
     try:
         symbol, df = load_asset_with_indicators(asset, interval_key, use_cache=True)
@@ -115,9 +124,10 @@ with tabs[2]:
             st.warning("No data available for this asset.")
         else:
             fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                name="Price"))
+            fig.add_trace(
+                go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+                               low=df["Low"], close=df["Close"], name="Price")
+            )
             if "ema20" in df:
                 fig.add_trace(go.Scatter(x=df.index, y=df["ema20"], name="EMA20"))
             if "ema50" in df:
@@ -134,12 +144,17 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("🔍 Backtest Results Summary")
 
-    asset = st.selectbox("Select Asset for Backtest", list([
-        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
-        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
-    ]), key="bt_asset")
-    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="bt_interval")
-    risk = st.selectbox("Risk Level", ["Low", "Medium", "High"], index=1, key="bt_risk")
+    asset = st.selectbox(
+        "Select Asset for Backtest",
+        ["Gold", "NASDAQ 100", "S&P 500", "EUR/USD", "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"],
+        key="bt_asset",
+    )
+    interval_key = st.selectbox(
+        "Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="bt_interval"
+    )
+    risk = st.selectbox(
+        "Risk Level", ["Low", "Medium", "High"], index=1, key="bt_risk"
+    )
 
     try:
         result, df = asset_prediction_and_backtest(asset, interval_key, risk, use_cache=True)
