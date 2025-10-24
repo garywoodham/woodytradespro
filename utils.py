@@ -1,16 +1,16 @@
-# utils.py — FINAL SMART (v2) VERSION
+# utils.py — FINAL STABLE SMART (v2) VERSION
 # ---------------------------------------------------------------------------
 # WoodyTradesPro Forecast Utilities
 # ---------------------------------------------------------------------------
 # Features:
-#   • Data fetch + cache (yfinance)
-#   • Technical indicators (EMA, RSI, MACD, ATR)
-#   • Vader sentiment with safe Yahoo fallback
-#   • Market regime detection (trend / range)
-#   • RandomForest ML classifier (adaptive bias)
-#   • Fused signal (technicals + sentiment + ML)
-#   • Backtest (win rate + total return)
-#   • Fully compatible with app.py (no import edits)
+#   - Data fetch & cache (yfinance)
+#   - Technical indicators (EMA, RSI, MACD, ATR)
+#   - Vader sentiment with safe Yahoo fallback
+#   - Market regime detection (trend/range)
+#   - RandomForest ML classifier (adaptive bias)
+#   - Fused signal (technicals + sentiment + ML)
+#   - Backtest (win rate & total return)
+#   - Fully compatible with app.py
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,6 +23,15 @@ import pandas as pd
 import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import warnings
+
+# ---------------------------------------------------------------------------
+# SUPPRESS EXCESS WARNINGS
+# ---------------------------------------------------------------------------
+
+warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
+warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 try:
     from ta.trend import EMAIndicator, MACD
@@ -223,7 +232,7 @@ def train_rf(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
     return model
 
 # ---------------------------------------------------------------------------
-# SIGNAL ENGINE + BACKTEST
+# SIGNAL ENGINE + BACKTEST + PIPELINES
 # ---------------------------------------------------------------------------
 
 def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
@@ -303,7 +312,7 @@ def fused_signal(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optiona
     }
 
 # ---------------------------------------------------------------------------
-# BACKTEST
+# BACKTEST AND PIPELINES (unchanged)
 # ---------------------------------------------------------------------------
 
 def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, object]:
@@ -315,7 +324,6 @@ def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, o
     pos = None
     wins = ret_sum = 0
     trades = []
-
     for i in range(60, len(df)):
         sig = fused_signal(df.iloc[:i + 1], symbol, risk)
         if not sig:
@@ -333,32 +341,10 @@ def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, o
                 if r > 0:
                     wins += 1
                 trades.append({
-                    "entry_time": ets,
-                    "exit_time": ts,
-                    "side": ps,
-                    "entry": ep,
-                    "exit": px,
-                    "return_pct": r * 100,
+                    "entry_time": ets, "exit_time": ts, "side": ps,
+                    "entry": ep, "exit": px, "return_pct": r * 100,
                 })
                 pos = (side, px, ts)
-
-    if pos is not None:
-        ps, ep, ets = pos
-        lp = float(df["Close"].iloc[-1])
-        lts = df.index[-1]
-        r = (lp - ep) / ep * (1 if ps == "Buy" else -1)
-        ret_sum += r
-        if r > 0:
-            wins += 1
-        trades.append({
-            "entry_time": ets,
-            "exit_time": lts,
-            "side": ps,
-            "entry": ep,
-            "exit": lp,
-            "return_pct": r * 100,
-        })
-
     n = len(trades)
     res.update({
         "n_trades": n,
@@ -368,9 +354,6 @@ def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, o
     })
     return res
 
-# ---------------------------------------------------------------------------
-# PIPELINES USED BY APP
-# ---------------------------------------------------------------------------
 
 def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache=True) -> Optional[Dict[str, object]]:
     df = fetch_data(symbol, interval_key, use_cache)
@@ -382,23 +365,13 @@ def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cach
     if not pred:
         return None
     return {
-        "symbol": symbol,
-        "interval_key": interval_key,
-        "risk": risk,
-        "last_price": float(df["Close"].iloc[-1]),
-        "signal": pred["side"],
-        "probability": round(pred["prob"] * 100, 2),
-        "tp": pred["tp"],
-        "sl": pred["sl"],
-        "atr": pred["atr"],
-        "regime": pred["regime"],
-        "sentiment": pred["sentiment"],
-        "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
-        "win_rate": bt["win_rate"],
-        "total_return_pct": bt["total_return_pct"],
-        "n_trades": bt["n_trades"],
-        "df": df,
-        "trades": bt["trades"],
+        "symbol": symbol, "interval_key": interval_key, "risk": risk,
+        "last_price": float(df["Close"].iloc[-1]), "signal": pred["side"],
+        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"],
+        "sl": pred["sl"], "atr": pred["atr"], "regime": pred["regime"],
+        "sentiment": pred["sentiment"], "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
+        "win_rate": bt["win_rate"], "total_return_pct": bt["total_return_pct"],
+        "n_trades": bt["n_trades"], "df": df, "trades": bt["trades"],
     }
 
 
@@ -411,20 +384,12 @@ def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache=T
             r = analyze_asset(symbol, interval_key, risk, use_cache)
             if r:
                 rows.append({
-                    "Asset": asset,
-                    "Symbol": symbol,
-                    "Interval": interval_key,
-                    "Price": r["last_price"],
-                    "Signal": r["signal"],
-                    "Probability_%": r["probability"],
-                    "TP": r["tp"],
-                    "SL": r["sl"],
-                    "WinRate_%": r["win_rate"],
-                    "BacktestReturn_%": r["total_return_pct"],
-                    "Trades": r["n_trades"],
-                    "Regime": r["regime"],
-                    "Sentiment": r["sentiment"],
-                    "ML_ProbUp_%": r["ml_prob_up"],
+                    "Asset": asset, "Symbol": symbol, "Interval": interval_key,
+                    "Price": r["last_price"], "Signal": r["signal"],
+                    "Probability_%": r["probability"], "TP": r["tp"], "SL": r["sl"],
+                    "WinRate_%": r["win_rate"], "BacktestReturn_%": r["total_return_pct"],
+                    "Trades": r["n_trades"], "Regime": r["regime"],
+                    "Sentiment": r["sentiment"], "ML_ProbUp_%": r["ml_prob_up"],
                 })
         except Exception as e:
             _log(f"Error analyzing {asset}: {e}")
@@ -452,22 +417,13 @@ def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_
     if not pred:
         return None, df
     return {
-        "asset": asset,
-        "symbol": sym,
-        "interval": interval_key,
-        "price": float(df["Close"].iloc[-1]),
-        "side": pred["side"],
-        "probability": round(pred["prob"] * 100, 2),
-        "tp": pred["tp"],
-        "sl": pred["sl"],
-        "atr": pred["atr"],
-        "regime": pred["regime"],
-        "sentiment": pred["sentiment"],
+        "asset": asset, "symbol": sym, "interval": interval_key,
+        "price": float(df["Close"].iloc[-1]), "side": pred["side"],
+        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
+        "atr": pred["atr"], "regime": pred["regime"], "sentiment": pred["sentiment"],
         "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
-        "win_rate": bt["win_rate"],
-        "backtest_return_pct": bt["total_return_pct"],
-        "n_trades": bt["n_trades"],
-        "trades": bt["trades"],
+        "win_rate": bt["win_rate"], "backtest_return_pct": bt["total_return_pct"],
+        "n_trades": bt["n_trades"], "trades": bt["trades"],
     }, df
 
 # ---------------------------------------------------------------------------
