@@ -25,6 +25,14 @@ from sklearn.ensemble import RandomForestClassifier
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import warnings
 
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
+warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+
 # ---------------------------------------------------------------------------
 # SUPPRESS EXCESS WARNINGS
 # ---------------------------------------------------------------------------
