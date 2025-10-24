@@ -1,15 +1,15 @@
-# utils.py — FINAL SMART v2 FULL VERSION (CLEAN & STABLE)
+# utils.py — FINAL SMART v2 FULL VERSION (COMPLETE)
 # ---------------------------------------------------------------------------
 # WoodyTradesPro Forecast Utilities
 # ---------------------------------------------------------------------------
 # Features:
-#   - Data fetch & cache (yfinance)
+#   - Cached yfinance data fetch with retries
 #   - Technical indicators (EMA, RSI, MACD, ATR)
 #   - Vader sentiment with safe Yahoo fallback
-#   - Market regime detection (trend/range)
+#   - Market regime detection (trend vs. range)
 #   - RandomForest ML classifier (adaptive bias)
 #   - Fused signal (technicals + sentiment + ML)
-#   - Backtest (win rate & total return)
+#   - Backtest (win rate, total return)
 #   - Full pipeline functions for app.py
 # ---------------------------------------------------------------------------
 
@@ -188,7 +188,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 _sent = SentimentIntensityAnalyzer()
 
 def fetch_sentiment(symbol: str) -> float:
-    """Safely fetch sentiment; return 0 on failure."""
     try:
         tk = yf.Ticker(symbol)
         news = getattr(tk, "news", None)
@@ -198,7 +197,14 @@ def fetch_sentiment(symbol: str) -> float:
         for n in news:
             title = n.get("title") or ""
             if not title:
-                
+                continue
+            s = _sent.polarity_scores(title)["compound"]
+            scores.append(s)
+        return float(np.mean(scores)) if scores else 0.0
+    except Exception:
+        return 0.0
+
+
 def detect_regime(df: pd.DataFrame) -> str:
     if "ema20" not in df or "ema50" not in df:
         return "range"
@@ -212,7 +218,6 @@ def detect_regime(df: pd.DataFrame) -> str:
 
 
 def train_ml_classifier(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
-    """Train RandomForest to classify next-bar direction from indicators."""
     if len(df) < 200:
         return None
     df = df.copy()
@@ -228,7 +233,6 @@ def train_ml_classifier(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
 
 
 def ml_predict_next(df: pd.DataFrame, clf: RandomForestClassifier) -> Optional[float]:
-    """Return probability of upward move (0–1)."""
     try:
         latest = df[["ema20", "ema50", "RSI", "macd", "macd_signal"]].iloc[-1:].dropna()
         if latest.empty:
@@ -242,18 +246,15 @@ def ml_predict_next(df: pd.DataFrame, clf: RandomForestClassifier) -> Optional[f
 # SIGNAL FUSION
 # ---------------------------------------------------------------------------
 def compute_fused_signal(df: pd.DataFrame, sentiment: float, ml_prob: float, regime: str) -> Tuple[str, float]:
-    """Combine technical, sentiment, and ML into final signal."""
     if len(df) < 2:
         return "Hold", 0.0
     row_prev, row = df.iloc[-2], df.iloc[-1]
     score, votes = 0.0, 0
 
-    # EMA trend
     if pd.notna(row["ema20"]) and pd.notna(row["ema50"]):
         votes += 1
         score += 1 if row["ema20"] > row["ema50"] else -1
 
-    # RSI
     if pd.notna(row["RSI"]):
         votes += 1
         if row["RSI"] < 30:
@@ -261,7 +262,6 @@ def compute_fused_signal(df: pd.DataFrame, sentiment: float, ml_prob: float, reg
         elif row["RSI"] > 70:
             score -= 1
 
-    # MACD cross
     if all(pd.notna(x) for x in [row["macd"], row["macd_signal"], row_prev["macd"], row_prev["macd_signal"]]):
         votes += 1
         crossed_up = (row_prev["macd"] <= row_prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
@@ -271,15 +271,10 @@ def compute_fused_signal(df: pd.DataFrame, sentiment: float, ml_prob: float, reg
         elif crossed_dn:
             score -= 1
 
-    # Normalize technical signal
     tech_bias = 0.0 if votes == 0 else score / votes
-
-    # Blend sentiment (0–1) and ML probability (0–1)
     fused = 0.5 * tech_bias + 0.3 * sentiment + 0.2 * (ml_prob - 0.5 if ml_prob is not None else 0)
-
-    # Regime adjustment
     if regime == "range":
-        fused *= 0.8  # less aggressive in sideways markets
+        fused *= 0.8
     elif regime == "trend":
         fused *= 1.2
 
@@ -335,15 +330,12 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object
     if df.empty or len(df) < 200:
         return out
     df = add_indicators(df)
-    signals, prev = [], df.iloc[0]
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        if i < 2:
-            continue
+    signals = []
+    for i in range(2, len(df)):
         side, _ = compute_fused_signal(df.iloc[:i], 0, 0.5, detect_regime(df.iloc[:i]))
         atr = df["atr"].iloc[i] if "atr" in df else 0.0
-        tp, sl = compute_tp_sl(row["Close"], atr, side, risk)
-        signals.append((df.index[i], side, row["Close"], tp, sl))
+        tp, sl = compute_tp_sl(df["Close"].iloc[i], atr, side, risk)
+        signals.append((df.index[i], side, df["Close"].iloc[i], tp, sl))
 
     pos = None
     eq, wins, trades = 0.0, 0, []
