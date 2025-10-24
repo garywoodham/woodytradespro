@@ -1,11 +1,8 @@
-# utils.py — WoodyTradesPro Smart v2 (Full + Complete)
+# utils.py — WoodyTradesPro Smart v2 (Full + Warning-Free)
 # ---------------------------------------------------------------------------
 
 import os
-import json
-import math
 import time
-import random
 import warnings
 import logging
 from typing import Dict, Tuple, List, Optional
@@ -26,6 +23,7 @@ logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", message="Could not infer format")
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -47,46 +45,51 @@ ASSET_SYMBOLS = {
 INTERVALS = {"15m": "15m", "1h": "60m", "4h": "4h", "1d": "1d", "1wk": "1wk"}
 PERIODS = {"15m": "7d", "1h": "2mo", "4h": "6mo", "1d": "1y", "1wk": "5y"}
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper logger
 # ---------------------------------------------------------------------------
 def _log(msg: str):
     print(msg, flush=True)
-
-
-def _safe_run(fn, *a, **kw):
-    try:
-        return fn(*a, **kw)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
 # Data Fetch
 # ---------------------------------------------------------------------------
 def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.DataFrame:
+    """Fetch price data safely with caching and cleaned date parsing."""
     interval = INTERVALS.get(interval_key, "60m")
     period = PERIODS.get(interval_key, "2mo")
-    cache_path = os.path.join(DATA_DIR, f"{symbol.replace('=','_')}_{interval}.csv")
+    cache_path = os.path.join(DATA_DIR, f"{symbol.replace('=','_').replace('^','')}_{interval}.csv")
 
+    # Try cached data first
     if use_cache and os.path.exists(cache_path):
         try:
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            df = pd.read_csv(cache_path, index_col=0, parse_dates=True, infer_datetime_format=True)
             if not df.empty:
                 return df
         except Exception:
             pass
 
     _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
-    for attempt in range(5):
+    for attempt in range(4):
         try:
-            raw = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
-            if not raw.empty and len(raw) > 100:
+            raw = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                threads=False,
+                auto_adjust=True,
+            )
+            if not raw.empty and len(raw) > 50:
                 raw.to_csv(cache_path)
                 _log(f"✅ {symbol}: fetched {len(raw)} rows.")
                 return raw
-        except Exception:
+        except Exception as e:
+            _log(f"⚠️ Attempt {attempt + 1} failed for {symbol}: {e}")
             time.sleep(1 + attempt)
+
     _log(f"🚫 All fetch attempts failed for {symbol}.")
     return pd.DataFrame()
 
@@ -95,6 +98,7 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
 # Indicators
 # ---------------------------------------------------------------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute EMA, RSI, MACD, ATR indicators."""
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -112,8 +116,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Signal Computation
 # ---------------------------------------------------------------------------
 def compute_signal_row(prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
-    side = "Hold"
-    prob = 0.5
+    """Determine buy/sell/hold signals based on indicators."""
+    side, prob = "Hold", 0.5
     if row["ema20"] > row["ema50"] and row["rsi"] < 70 and row["macd"] > row["signal"]:
         side, prob = "Buy", 0.7
     elif row["ema20"] < row["ema50"] and row["rsi"] > 30 and row["macd"] < row["signal"]:
@@ -122,6 +126,7 @@ def compute_signal_row(prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
 
 
 def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
+    """Compute Take-Profit and Stop-Loss levels."""
     mult = {"Low": 0.5, "Medium": 1.0, "High": 2.0}.get(risk, 1.0)
     if atr is None or np.isnan(atr):
         atr = price * 0.005
@@ -137,6 +142,7 @@ def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float
 # Sentiment (safe fallback)
 # ---------------------------------------------------------------------------
 def fetch_sentiment(symbol: str) -> float:
+    """Compute average sentiment from Yahoo Finance news titles."""
     try:
         t = yf.Ticker(symbol)
         news = getattr(t, "news", [])
@@ -150,24 +156,20 @@ def fetch_sentiment(symbol: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Latest Prediction (TP/SL fix)
+# Latest Prediction (always returns TP/SL)
 # ---------------------------------------------------------------------------
 def latest_prediction(df: pd.DataFrame, symbol: str = "", risk: str = "Medium") -> Optional[Dict[str, object]]:
+    """Get most recent signal with TP/SL and sentiment/regime."""
     if df is None or df.empty or len(df) < 60:
         return None
     df = add_indicators(df)
-    row_prev = df.iloc[-2]
-    row = df.iloc[-1]
+    row_prev, row = df.iloc[-2], df.iloc[-1]
     side, prob = compute_signal_row(row_prev, row)
-
     atr_val = float(row["atr"]) if pd.notna(row["atr"]) else float(df["atr"].tail(14).mean())
     price = float(row["Close"])
-    # always compute TP/SL even on Hold
     tp, sl = compute_tp_sl(price, atr_val, "Buy" if side == "Hold" else side, risk)
-
     sentiment_score = fetch_sentiment(symbol)
     regime_label = "Bull" if row["ema20"] > row["ema50"] else "Bear"
-
     return {
         "side": side,
         "prob": prob,
@@ -182,9 +184,10 @@ def latest_prediction(df: pd.DataFrame, symbol: str = "", risk: str = "Medium") 
 
 
 # ---------------------------------------------------------------------------
-# ML / Backtest Utilities
+# ML / Backtesting
 # ---------------------------------------------------------------------------
 def train_ml_model(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
+    """Train a simple ML model for directional prediction."""
     if df is None or len(df) < 100:
         return None
     df = df.copy()
@@ -197,11 +200,11 @@ def train_ml_model(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
 
 
 def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object]:
+    """Run a basic strategy backtest over the indicator signals."""
     if df is None or len(df) < 80:
         return {"win_rate": 0, "total_return_pct": 0, "n_trades": 0, "trades": []}
 
-    trades = []
-    balance, wins = 1.0, 0
+    trades, balance, wins = [], 1.0, 0
     for i in range(60, len(df) - 1):
         prev, row = df.iloc[i - 1], df.iloc[i]
         side, _ = compute_signal_row(prev, row)
@@ -211,8 +214,7 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object
         tp, sl = compute_tp_sl(row["Close"], atr, side, risk)
         next_close = float(df["Close"].iloc[i + 1])
         profit = (next_close - row["Close"]) / row["Close"] if side == "Buy" else (row["Close"] - next_close) / row["Close"]
-        win = profit > 0
-        wins += int(win)
+        wins += int(profit > 0)
         balance *= 1 + profit
         trades.append({"index": i, "side": side, "profit_pct": profit * 100})
     win_rate = 100 * wins / len(trades) if trades else 0
@@ -221,9 +223,10 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object
 
 
 # ---------------------------------------------------------------------------
-# Main Asset Analysis
+# Asset Analysis
 # ---------------------------------------------------------------------------
 def analyze_asset(symbol: str, interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> Optional[Dict[str, object]]:
+    """Analyze one asset fully."""
     df = fetch_data(symbol, interval_key, use_cache)
     if df.empty:
         return None
@@ -250,6 +253,7 @@ def analyze_asset(symbol: str, interval_key: str = "1h", risk: str = "Medium", u
 # Multi-Asset Summary
 # ---------------------------------------------------------------------------
 def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> pd.DataFrame:
+    """Fetch, analyze and summarize all assets."""
     _log("Fetching and analyzing market data (smart v2)...")
     rows = []
     for asset, symbol in ASSET_SYMBOLS.items():
@@ -279,6 +283,7 @@ def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache=T
 # Public Entry Points
 # ---------------------------------------------------------------------------
 def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) -> Tuple[str, pd.DataFrame]:
+    """Load one asset’s data and indicators."""
     if asset not in ASSET_SYMBOLS:
         raise KeyError(asset)
     symbol = ASSET_SYMBOLS[asset]
@@ -287,6 +292,7 @@ def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) ->
 
 
 def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True):
+    """Get prediction and backtest for one asset."""
     symbol = ASSET_SYMBOLS.get(asset)
     if not symbol:
         return None, pd.DataFrame()
