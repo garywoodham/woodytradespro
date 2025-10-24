@@ -1,4 +1,4 @@
-# utils.py — WoodyTradesPro Smart v2 (Final Stable + Clean)
+# utils.py — WoodyTradesPro Smart v2 (Flattened Columns Fix)
 # ---------------------------------------------------------------------------
 
 import os
@@ -53,23 +53,36 @@ def _log(msg: str):
     print(msg, flush=True)
 
 # ---------------------------------------------------------------------------
-# Data Fetch
+# Data Fetch + Flatten
 # ---------------------------------------------------------------------------
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all columns are 1D, flattening any array-like values."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    for col in df.columns:
+        vals = df[col].values
+        if isinstance(vals, np.ndarray) and vals.ndim > 1:
+            df[col] = vals.ravel()
+    return df
+
 def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.DataFrame:
-    """Fetch price data safely with caching and cleaned date parsing."""
+    """Fetch price data safely with caching and flattened data."""
     interval = INTERVALS.get(interval_key, "60m")
     period = PERIODS.get(interval_key, "2mo")
     cache_path = os.path.join(DATA_DIR, f"{symbol.replace('=','_').replace('^','')}_{interval}.csv")
 
+    # Try cache first
     if use_cache and os.path.exists(cache_path):
         try:
-            # ✅ FIXED: removed deprecated infer_datetime_format
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            df = _flatten_columns(df)
             if not df.empty:
                 return df
         except Exception:
             pass
 
+    # Otherwise fetch new
     _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
     for attempt in range(4):
         try:
@@ -82,6 +95,7 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
                 auto_adjust=True,
             )
             if not raw.empty and len(raw) > 50:
+                raw = _flatten_columns(raw)
                 raw.to_csv(cache_path)
                 _log(f"✅ {symbol}: fetched {len(raw)} rows.")
                 return raw
@@ -99,7 +113,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Compute EMA, RSI, MACD, ATR indicators."""
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.copy()
+    df = _flatten_columns(df.copy())
     df["ema20"] = EMAIndicator(df["Close"], 20).ema_indicator()
     df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
     df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
@@ -113,7 +127,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Signal Computation
 # ---------------------------------------------------------------------------
 def compute_signal_row(prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
-    """Determine buy/sell/hold signals based on indicators."""
     side, prob = "Hold", 0.5
     if row["ema20"] > row["ema50"] and row["rsi"] < 70 and row["macd"] > row["signal"]:
         side, prob = "Buy", 0.7
@@ -122,7 +135,6 @@ def compute_signal_row(prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
     return side, prob
 
 def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
-    """Compute Take-Profit and Stop-Loss levels."""
     mult = {"Low": 0.5, "Medium": 1.0, "High": 2.0}.get(risk, 1.0)
     if atr is None or np.isnan(atr):
         atr = price * 0.005
@@ -134,10 +146,9 @@ def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float
         return price + mult * atr, price - mult * atr
 
 # ---------------------------------------------------------------------------
-# Sentiment (safe fallback)
+# Sentiment
 # ---------------------------------------------------------------------------
 def fetch_sentiment(symbol: str) -> float:
-    """Compute average sentiment from Yahoo Finance news titles."""
     try:
         t = yf.Ticker(symbol)
         news = getattr(t, "news", [])
@@ -150,10 +161,9 @@ def fetch_sentiment(symbol: str) -> float:
         return 0.0
 
 # ---------------------------------------------------------------------------
-# Latest Prediction (always returns TP/SL)
+# Latest Prediction
 # ---------------------------------------------------------------------------
 def latest_prediction(df: pd.DataFrame, symbol: str = "", risk: str = "Medium") -> Optional[Dict[str, object]]:
-    """Get most recent signal with TP/SL and sentiment/regime."""
     if df is None or df.empty or len(df) < 60:
         return None
     df = add_indicators(df)
@@ -177,10 +187,9 @@ def latest_prediction(df: pd.DataFrame, symbol: str = "", risk: str = "Medium") 
     }
 
 # ---------------------------------------------------------------------------
-# ML / Backtesting
+# ML + Backtesting
 # ---------------------------------------------------------------------------
 def train_ml_model(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
-    """Train a simple ML model for directional prediction."""
     if df is None or len(df) < 100:
         return None
     df = df.copy()
@@ -192,7 +201,6 @@ def train_ml_model(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
     return model
 
 def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object]:
-    """Run a basic strategy backtest over the indicator signals."""
     if df is None or len(df) < 80:
         return {"win_rate": 0, "total_return_pct": 0, "n_trades": 0, "trades": []}
 
@@ -214,10 +222,9 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object
     return {"win_rate": win_rate, "total_return_pct": total_return, "n_trades": len(trades), "trades": trades}
 
 # ---------------------------------------------------------------------------
-# Asset Analysis
+# Analysis
 # ---------------------------------------------------------------------------
 def analyze_asset(symbol: str, interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> Optional[Dict[str, object]]:
-    """Analyze one asset fully."""
     df = fetch_data(symbol, interval_key, use_cache)
     if df.empty:
         return None
@@ -239,40 +246,34 @@ def analyze_asset(symbol: str, interval_key: str = "1h", risk: str = "Medium", u
         "regime": pred["regime"],
     }
 
-# ---------------------------------------------------------------------------
-# Multi-Asset Summary
-# ---------------------------------------------------------------------------
 def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> pd.DataFrame:
-    """Fetch, analyze and summarize all assets."""
     _log("Fetching and analyzing market data (smart v2)...")
     rows = []
     for asset, symbol in ASSET_SYMBOLS.items():
         _log(f"{asset} ({symbol})...")
         res = analyze_asset(symbol, interval_key, risk, use_cache)
-        if res is None:
-            continue
-        rows.append({
-            "Asset": asset,
-            "Symbol": symbol,
-            "Interval": interval_key,
-            "Price": res["last_price"],
-            "Signal": res["signal"],
-            "Probability_%": res["probability"],
-            "TP": res["tp"],
-            "SL": res["sl"],
-            "WinRate_%": res["win_rate"],
-            "Return_%": res["return_pct"],
-            "Trades": res["n_trades"],
-            "Sentiment": res["sentiment"],
-            "Regime": res["regime"],
-        })
+        if res:
+            rows.append({
+                "Asset": asset,
+                "Symbol": symbol,
+                "Interval": interval_key,
+                "Price": res["last_price"],
+                "Signal": res["signal"],
+                "Probability_%": res["probability"],
+                "TP": res["tp"],
+                "SL": res["sl"],
+                "WinRate_%": res["win_rate"],
+                "Return_%": res["return_pct"],
+                "Trades": res["n_trades"],
+                "Sentiment": res["sentiment"],
+                "Regime": res["regime"],
+            })
     return pd.DataFrame(rows)
 
 # ---------------------------------------------------------------------------
-# Public Entry Points
+# Public
 # ---------------------------------------------------------------------------
 def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) -> Tuple[str, pd.DataFrame]:
-    """Load one asset’s data and indicators."""
     if asset not in ASSET_SYMBOLS:
         raise KeyError(asset)
     symbol = ASSET_SYMBOLS[asset]
@@ -280,7 +281,6 @@ def load_asset_with_indicators(asset: str, interval_key: str, use_cache=True) ->
     return symbol, add_indicators(df)
 
 def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache=True):
-    """Get prediction and backtest for one asset."""
     symbol = ASSET_SYMBOLS.get(asset)
     if not symbol:
         return None, pd.DataFrame()
