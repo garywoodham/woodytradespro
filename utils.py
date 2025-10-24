@@ -1,4 +1,4 @@
-# utils.py — WoodyTradesPro Smart v2 (Flattened Columns Fix)
+# utils.py — WoodyTradesPro Smart v2 (Final Stable + Flatten Fix)
 # ---------------------------------------------------------------------------
 
 import os
@@ -61,9 +61,10 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     df = df.copy()
     for col in df.columns:
-        vals = df[col].values
-        if isinstance(vals, np.ndarray) and vals.ndim > 1:
-            df[col] = vals.ravel()
+        vals = np.asarray(df[col]).squeeze()
+        if vals.ndim != 1:
+            vals = vals.reshape(-1)
+        df[col] = vals
     return df
 
 def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.DataFrame:
@@ -72,7 +73,6 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
     period = PERIODS.get(interval_key, "2mo")
     cache_path = os.path.join(DATA_DIR, f"{symbol.replace('=','_').replace('^','')}_{interval}.csv")
 
-    # Try cache first
     if use_cache and os.path.exists(cache_path):
         try:
             df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
@@ -82,7 +82,6 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
         except Exception:
             pass
 
-    # Otherwise fetch new
     _log(f"⏳ Fetching {symbol} [{interval}] for {period}...")
     for attempt in range(4):
         try:
@@ -110,18 +109,30 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
 # Indicators
 # ---------------------------------------------------------------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute EMA, RSI, MACD, ATR indicators."""
+    """Compute EMA, RSI, MACD, ATR indicators with forced 1-D flattening."""
     if df is None or df.empty:
         return pd.DataFrame()
-    df = _flatten_columns(df.copy())
+    df = df.copy()
+
+    # 🔧 Force-flatten all numeric columns before indicator computation
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            vals = np.asarray(df[col]).squeeze()
+            if vals.ndim != 1:
+                vals = vals.reshape(-1)
+            df[col] = vals
+
+    # --- Technical indicators ---
     df["ema20"] = EMAIndicator(df["Close"], 20).ema_indicator()
     df["ema50"] = EMAIndicator(df["Close"], 50).ema_indicator()
     df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
     macd = MACD(df["Close"])
     df["macd"] = macd.macd()
     df["signal"] = macd.macd_signal()
-    df["atr"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
-    return df.dropna()
+    atr = AverageTrueRange(df["High"], df["Low"], df["Close"], 14)
+    df["atr"] = atr.average_true_range()
+
+    return df.dropna().reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Signal Computation
@@ -222,7 +233,7 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium") -> Dict[str, object
     return {"win_rate": win_rate, "total_return_pct": total_return, "n_trades": len(trades), "trades": trades}
 
 # ---------------------------------------------------------------------------
-# Analysis
+# Analysis + Summary
 # ---------------------------------------------------------------------------
 def analyze_asset(symbol: str, interval_key: str = "1h", risk: str = "Medium", use_cache=True) -> Optional[Dict[str, object]]:
     df = fetch_data(symbol, interval_key, use_cache)
