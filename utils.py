@@ -1,4 +1,4 @@
-# utils.py — FINAL STABLE SMART (v2) VERSION
+# utils.py — FINAL SMART v2 FULL VERSION
 # ---------------------------------------------------------------------------
 # WoodyTradesPro Forecast Utilities
 # ---------------------------------------------------------------------------
@@ -10,7 +10,7 @@
 #   - RandomForest ML classifier (adaptive bias)
 #   - Fused signal (technicals + sentiment + ML)
 #   - Backtest (win rate & total return)
-#   - Fully compatible with app.py
+#   - Full pipeline functions for app.py
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ import warnings
 # ---------------------------------------------------------------------------
 # SUPPRESS EXCESS WARNINGS
 # ---------------------------------------------------------------------------
-
 warnings.filterwarnings("ignore", category=UserWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -43,7 +42,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -75,7 +73,6 @@ ASSET_SYMBOLS = {
 # ---------------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------------
-
 def _log(msg: str) -> None:
     try:
         print(msg, flush=True)
@@ -85,7 +82,6 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # DATA FETCHING
 # ---------------------------------------------------------------------------
-
 def _cache_path(symbol: str, interval_key: str) -> Path:
     safe = symbol.replace("^", "").replace("=", "_").replace("/", "_").replace("-", "_")
     return DATA_DIR / f"{safe}_{interval_key}.csv"
@@ -144,7 +140,6 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
 # ---------------------------------------------------------------------------
 # INDICATORS
 # ---------------------------------------------------------------------------
-
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -185,9 +180,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.ffill().bfill()
 
 # ---------------------------------------------------------------------------
-# SENTIMENT + REGIME + MACHINE LEARNING
+# SENTIMENT, REGIME, ML
 # ---------------------------------------------------------------------------
-
 _sent = SentimentIntensityAnalyzer()
 
 def fetch_sentiment(symbol: str) -> float:
@@ -234,7 +228,6 @@ def train_rf(df: pd.DataFrame) -> Optional[RandomForestClassifier]:
 # ---------------------------------------------------------------------------
 # SIGNAL ENGINE + BACKTEST + PIPELINES
 # ---------------------------------------------------------------------------
-
 def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
     m = RISK_MULT.get(risk, RISK_MULT["Medium"])
     if side == "Buy":
@@ -251,7 +244,6 @@ def fused_signal(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optiona
     df["sentiment"] = sent
     regime = detect_regime(df)
     model = train_rf(df)
-
     last = df.iloc[-1]
     score = 0
     if last["ema20"] > last["ema50"]:
@@ -269,12 +261,9 @@ def fused_signal(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optiona
     prob_up = 0.5
     if model is not None:
         feat = pd.DataFrame([{
-            "ema20": last.get("ema20"),
-            "ema50": last.get("ema50"),
-            "RSI": last.get("RSI"),
-            "macd": last.get("macd"),
-            "macd_signal": last.get("macd_signal"),
-            "atr": last.get("atr"),
+            "ema20": last.get("ema20"), "ema50": last.get("ema50"),
+            "RSI": last.get("RSI"), "macd": last.get("macd"),
+            "macd_signal": last.get("macd_signal"), "atr": last.get("atr"),
             "sentiment": sent,
         }])
         prob_up = float(model.predict_proba(feat)[0, 1])
@@ -300,21 +289,14 @@ def fused_signal(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Optiona
     price = float(last["Close"])
     tp, sl = compute_tp_sl(price, atr, final_side, risk)
     return {
-        "side": final_side,
-        "prob": conf,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "atr": atr,
-        "regime": regime,
-        "sentiment": sent,
-        "ml_prob_up": prob_up,
+        "side": final_side, "prob": conf, "price": price,
+        "tp": tp, "sl": sl, "atr": atr,
+        "regime": regime, "sentiment": sent, "ml_prob_up": prob_up,
     }
 
 # ---------------------------------------------------------------------------
-# BACKTEST AND PIPELINES (unchanged)
+# BACKTEST AND PIPELINES
 # ---------------------------------------------------------------------------
-
 def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, object]:
     res = {"win_rate": 0, "total_return_pct": 0, "n_trades": 0, "trades": []}
     if len(df) < 120:
@@ -347,10 +329,8 @@ def backtest(df: pd.DataFrame, symbol: str, risk: str = "Medium") -> Dict[str, o
                 pos = (side, px, ts)
     n = len(trades)
     res.update({
-        "n_trades": n,
-        "win_rate": 100 * wins / n if n else 0,
-        "total_return_pct": 100 * ret_sum,
-        "trades": trades,
+        "n_trades": n, "win_rate": 100 * wins / n if n else 0,
+        "total_return_pct": 100 * ret_sum, "trades": trades,
     })
     return res
 
@@ -419,9 +399,9 @@ def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_
     return {
         "asset": asset, "symbol": sym, "interval": interval_key,
         "price": float(df["Close"].iloc[-1]), "side": pred["side"],
-        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"], "sl": pred["sl"],
-        "atr": pred["atr"], "regime": pred["regime"], "sentiment": pred["sentiment"],
-        "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
+        "probability": round(pred["prob"] * 100, 2), "tp": pred["tp"],
+        "sl": pred["sl"], "atr": pred["atr"], "regime": pred["regime"],
+        "sentiment": pred["sentiment"], "ml_prob_up": round(pred["ml_prob_up"] * 100, 2),
         "win_rate": bt["win_rate"], "backtest_return_pct": bt["total_return_pct"],
         "n_trades": bt["n_trades"], "trades": bt["trades"],
     }, df
