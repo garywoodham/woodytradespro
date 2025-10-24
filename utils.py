@@ -1,4 +1,4 @@
-# utils.py — WoodyTradesPro Smart v2 (Final + Full, No Circular Import)
+# utils.py — WoodyTradesPro Smart v2 (Final Stable + Clean)
 # ---------------------------------------------------------------------------
 
 import os
@@ -63,7 +63,8 @@ def fetch_data(symbol: str, interval_key: str = "1h", use_cache=True) -> pd.Data
 
     if use_cache and os.path.exists(cache_path):
         try:
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True, infer_datetime_format=True)
+            # ✅ FIXED: removed deprecated infer_datetime_format
+            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             if not df.empty:
                 return df
         except Exception:
