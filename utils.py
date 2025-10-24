@@ -475,64 +475,69 @@ def _adaptive_thresholds(row: pd.Series) -> Tuple[float, float]:
 
 
 # --------------------------------------------------------------------------------------
-# Sentiment model
+# Sentiment model (fixed for tickers that return no news)
 # --------------------------------------------------------------------------------------
+import requests
+from functools import lru_cache
+import time
+
+@lru_cache(maxsize=64)
 def _fetch_sentiment(symbol: str, smoothing_window: int = 3) -> float:
     """
-    Score sentiment from recent yfinance headlines.
-    Heuristic:
-      - pull yf.Ticker(symbol).news (list of dicts with "title")
-      - VADER compound score per headline
-      - recency weighting (most recent heavier)
-      - asset weighting (indices/crypto react faster than FX)
-      - short EMA smoothing to avoid one crazy headline
+    Score sentiment from recent headlines.
+    Tries Yahoo Finance, then Finviz RSS fallback.
     Returns float in [-1,1].
+    Caches results for 10 minutes per symbol.
     """
+    start_t = time.time()
+    scores: list[float] = []
+
+    # --- Primary: Yahoo Finance via yfinance
     try:
         tk = yf.Ticker(symbol)
         news_items = getattr(tk, "news", []) or []
+        for item in news_items[:8]:
+            title = item.get("title", "")
+            if title:
+                s = _VADER.polarity_scores(title)["compound"]
+                scores.append(s)
     except Exception:
         news_items = []
 
-    if not news_items:
+    # --- Secondary: Finviz mirror fallback if Yahoo empty ---
+    if not scores:
+        try:
+            # Finviz uses slightly different tickers; remove ^ and =F
+            finviz_sym = symbol.replace("^", "").replace("=F", "")
+            resp = requests.get(
+                f"https://finviz-api.vercel.app/news/{finviz_sym}",
+                timeout=5,
+            )
+            if resp.ok:
+                data = resp.json().get("articles", [])
+                for art in data[:8]:
+                    title = art.get("title", "")
+                    if title:
+                        s = _VADER.polarity_scores(title)["compound"]
+                        scores.append(s)
+        except Exception:
+            pass
+
+    # --- Fallback: still nothing? return neutral (0.0) ---
+    if not scores:
         return 0.0
 
-    vals: List[float] = []
-    for i, item in enumerate(news_items[:7]):
-        title = item.get("title", "") or ""
-        if not title:
-            continue
-
-        raw_score = _VADER.polarity_scores(title)["compound"]
-
-        # recency weight
-        w_recency = 1.0 - 0.08 * i  # 1.00, 0.92, 0.84, ...
-        w_recency = max(0.7, w_recency)
-
-        # "asset class" tweak
-        if symbol.startswith("^") or symbol.endswith("-USD"):
-            w_asset = 1.1
-        elif symbol.endswith("=X"):
-            w_asset = 0.9
-        else:
-            w_asset = 1.0
-
-        vals.append(raw_score * w_recency * w_asset)
-
-    if not vals:
-        return 0.0
-
-    # Smooth via short EMA
-    alpha = 2.0 / (smoothing_window + 1.0)
-    ema_val = vals[0]
-    smoothed: List[float] = []
-    for v in vals:
-        ema_val = alpha * v + (1 - alpha) * ema_val
+    # --- Smooth and weight recent items ---
+    alpha = 2 / (smoothing_window + 1)
+    ema_val = scores[0]
+    smoothed = []
+    for sc in scores:
+        ema_val = alpha * sc + (1 - alpha) * ema_val
         smoothed.append(ema_val)
 
-    final_sent = float(np.mean(smoothed))
-    return float(np.clip(final_sent, -1.0, 1.0))
-
+    sentiment_val = float(np.clip(np.mean(smoothed), -1, 1))
+    _log(f"📰 Sentiment {symbol}: {round(sentiment_val,3)} ({len(scores)} headlines, {round(time.time()-start_t,2)}s)")
+    return sentiment_val
 
 # --------------------------------------------------------------------------------------
 # ML model (regime-aware cache)
