@@ -410,4 +410,107 @@ def backtest_signals(df: pd.DataFrame, risk: str = "Medium", hold_allowed: bool 
 
     n = len(trades)
     out["n_trades"] = n
-    out["win_rate"] = 100.0 * (wins /
+    out["win_rate"] = 100.0 * (wins / n) if n > 0 else 0.0
+    out["total_return_pct"] = 100.0 * eq_curve if n > 0 else 0.0
+    out["trades"] = trades
+    return out
+
+# --------------------------------------------------------------------------------------
+# PIPELINES
+# --------------------------------------------------------------------------------------
+
+def analyze_asset(symbol: str, interval_key: str, risk: str = "Medium", use_cache: bool = True) -> Optional[Dict[str, object]]:
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
+    if df.empty:
+        return None
+
+    df = add_indicators(df)
+    if df.empty:
+        return None
+
+    pred = latest_prediction(df, risk=risk)
+    if pred is None:
+        return None
+
+    bt = backtest_signals(df, risk=risk, hold_allowed=True)
+
+    return {
+        "symbol": symbol, "interval_key": interval_key, "risk": risk,
+        "last_price": float(df["Close"].iloc[-1]),
+        "signal": pred["side"], "probability": round(pred["prob"] * 100.0, 2),
+        "tp": pred["tp"], "sl": pred["sl"], "atr": pred["atr"],
+        "win_rate": bt.get("win_rate"), "total_return_pct": bt.get("total_return_pct"),
+        "n_trades": bt.get("n_trades"), "df": df, "trades": bt["trades"],
+    }
+
+
+def summarize_assets(interval_key: str = "1h", risk: str = "Medium", use_cache: bool = True) -> pd.DataFrame:
+    rows = []
+    _log("Fetching and analyzing market data... please wait ⏳")
+    for asset, symbol in ASSET_SYMBOLS.items():
+        _log(f"⏳ Fetching {asset} ({symbol})...")
+        try:
+            res = analyze_asset(symbol, interval_key=interval_key, risk=risk, use_cache=use_cache)
+            if res is None:
+                _log(f"⚠️ Could not analyze {asset}.")
+                continue
+            rows.append({
+                "Asset": asset, "Symbol": symbol, "Interval": interval_key,
+                "Price": res["last_price"], "Signal": res["signal"],
+                "Probability_%": res["probability"], "TP": res["tp"], "SL": res["sl"],
+                "WinRate_%": res["win_rate"], "BacktestReturn_%": res["total_return_pct"],
+                "Trades": res["n_trades"],
+            })
+        except Exception as e:
+            _log(f"❌ Error analyzing {asset}: {e}")
+
+    if not rows:
+        _log("No assets could be analyzed. Check your connection or data source.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    cols = ["Asset", "Symbol", "Interval", "Price", "Signal",
+            "Probability_%", "TP", "SL", "WinRate_%", "BacktestReturn_%", "Trades"]
+    return df[[c for c in cols if c in df.columns]]
+
+
+def load_asset_with_indicators(asset: str, interval_key: str, use_cache: bool = True) -> Tuple[str, pd.DataFrame]:
+    if asset not in ASSET_SYMBOLS:
+        raise KeyError(f"Unknown asset '{asset}'")
+    symbol = ASSET_SYMBOLS[asset]
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
+    df = add_indicators(df)
+    return symbol, df
+
+
+def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache: bool = True) -> Tuple[Optional[Dict[str, object]], pd.DataFrame]:
+    symbol = ASSET_SYMBOLS.get(asset)
+    if not symbol:
+        return None, pd.DataFrame()
+
+    df = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
+    if df.empty:
+        return None, pd.DataFrame()
+    df = add_indicators(df)
+    if df.empty:
+        return None, pd.DataFrame()
+
+    pred = latest_prediction(df, risk=risk)
+    bt = backtest_signals(df, risk=risk, hold_allowed=True)
+
+    if pred is None:
+        return None, df
+
+    pred_out = {
+        "asset": asset, "symbol": symbol, "interval": interval_key,
+        "price": float(df["Close"].iloc[-1]), "side": pred["side"],
+        "probability": round(pred["prob"] * 100.0, 2),
+        "tp": pred["tp"], "sl": pred["sl"], "atr": pred["atr"],
+        "win_rate": bt.get("win_rate"), "backtest_return_pct": bt.get("total_return_pct"),
+        "n_trades": bt.get("n_trades"), "trades": bt.get("trades", []),
+    }
+    return pred_out, df
+
+# --------------------------------------------------------------------------------------
+# END OF MODULE
+# --------------------------------------------------------------------------------------
