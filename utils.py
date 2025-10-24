@@ -782,3 +782,17 @@ if __name__ == "__main__":
         df = fetch_data(sym, "1h")
         pred = latest_prediction(df, sym, "Medium", "1h")
         print(f"{asset}: side={pred['side']}, prob={pred['prob']:.2f}, rr={pred['rr']:.2f}, regime={pred['regime']}")
+        
+        
+        # --- TEMPORARY DEBUG TEST ---
+import streamlit as st
+from utils import fetch_data, backtest_signals
+
+if st.button("🔍 Run Debug Test"):
+    d = fetch_data("GC=F", "1h")
+    bt = backtest_signals(d)
+    st.write("Rows:", len(d))
+    st.write("Trades:", bt["n_trades"])
+    st.write("Win rate:", bt["win_rate"])
+    st.write("Total return %:", bt["total_return_pct"])
+        
