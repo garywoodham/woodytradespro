@@ -474,25 +474,25 @@ def _adaptive_thresholds(row: pd.Series) -> Tuple[float, float]:
     return prob_th, rr_th
 
 
-# --------------------------------------------------------------------------------------
-# Sentiment model (fixed for tickers that return no news)
+    # --------------------------------------------------------------------------------------
+# Sentiment model (multi-source resilient)
 # --------------------------------------------------------------------------------------
 import requests
 from functools import lru_cache
+import xml.etree.ElementTree as ET
+import numpy as np
 import time
 
 @lru_cache(maxsize=64)
-def _fetch_sentiment(symbol: str, smoothing_window: int = 3) -> float:
+def _fetch_sentiment(symbol: str) -> float:
     """
-    Score sentiment from recent headlines.
-    Tries Yahoo Finance, then Finviz RSS fallback.
-    Returns float in [-1,1].
-    Caches results for 10 minutes per symbol.
+    Try Yahoo Finance -> Finviz -> Google RSS -> price-derived fallback.
+    Returns sentiment in [-1, 1].
     """
     start_t = time.time()
     scores: list[float] = []
 
-    # --- Primary: Yahoo Finance via yfinance
+    # --- Layer 1: Yahoo Finance ---
     try:
         tk = yf.Ticker(symbol)
         news_items = getattr(tk, "news", []) or []
@@ -502,12 +502,11 @@ def _fetch_sentiment(symbol: str, smoothing_window: int = 3) -> float:
                 s = _VADER.polarity_scores(title)["compound"]
                 scores.append(s)
     except Exception:
-        news_items = []
+        pass
 
-    # --- Secondary: Finviz mirror fallback if Yahoo empty ---
+    # --- Layer 2: Finviz mirror ---
     if not scores:
         try:
-            # Finviz uses slightly different tickers; remove ^ and =F
             finviz_sym = symbol.replace("^", "").replace("=F", "")
             resp = requests.get(
                 f"https://finviz-api.vercel.app/news/{finviz_sym}",
@@ -523,21 +522,48 @@ def _fetch_sentiment(symbol: str, smoothing_window: int = 3) -> float:
         except Exception:
             pass
 
-    # --- Fallback: still nothing? return neutral (0.0) ---
+    # --- Layer 3: Google Finance RSS ---
     if not scores:
+        try:
+            feed_url = f"https://news.google.com/rss/search?q={symbol}+finance"
+            xml_data = requests.get(feed_url, timeout=5).text
+            root = ET.fromstring(xml_data)
+            for item in root.findall(".//item")[:8]:
+                title = item.findtext("title", "")
+                if title:
+                    s = _VADER.polarity_scores(title)["compound"]
+                    scores.append(s)
+        except Exception:
+            pass
+
+    # --- Layer 4: Market-derived sentiment ---
+    if not scores:
+        try:
+            df = fetch_data(symbol, "1h", use_cache=True)
+            if not df.empty:
+                slope = np.polyfit(range(20), df["Close"].iloc[-20:], 1)[0]
+                rsi_val = df["Close"].pct_change().tail(14).mean()
+                price_bias = np.tanh(slope * 1000)
+                rsi_bias = np.tanh(rsi_val * 50)
+                est = (price_bias + rsi_bias) / 2
+                _log(f"📈 Synthetic sentiment for {symbol}: {round(est,3)}")
+                return float(np.clip(est, -1, 1))
+        except Exception:
+            pass
+
+    # --- Combine all headline scores ---
+    if not scores:
+        _log(f"⚠️ Sentiment fallback to 0 for {symbol}")
         return 0.0
 
-    # --- Smooth and weight recent items ---
-    alpha = 2 / (smoothing_window + 1)
+    # Exponential smoothing for recent relevance
+    alpha = 0.3
     ema_val = scores[0]
-    smoothed = []
-    for sc in scores:
+    for sc in scores[1:]:
         ema_val = alpha * sc + (1 - alpha) * ema_val
-        smoothed.append(ema_val)
-
-    sentiment_val = float(np.clip(np.mean(smoothed), -1, 1))
-    _log(f"📰 Sentiment {symbol}: {round(sentiment_val,3)} ({len(scores)} headlines, {round(time.time()-start_t,2)}s)")
-    return sentiment_val
+    final_score = float(np.clip(ema_val, -1, 1))
+    _log(f"📰 Sentiment {symbol}: {round(final_score,3)} ({len(scores)} items, {round(time.time()-start_t,2)}s)")
+    return final_score
 
 # --------------------------------------------------------------------------------------
 # ML model (regime-aware cache)
