@@ -1,145 +1,162 @@
-# app.py — WoodyTrades Pro Dashboard (stable build for current utils.py)
-# --------------------------------------------------------------------------------------
+# app.py — WoodyTradesPro Smart v2 (Full + Clean)
+# ---------------------------------------------------------------------------
+# Streamlit App for Forecasting & Backtesting using utils.py Smart v2
+# ---------------------------------------------------------------------------
+
+import os
+os.environ["STREAMLIT_SERVER_FILEWATCHERTYPE"] = "none"  # prevent reload spam
+
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 import traceback
+import warnings
 
 from utils import (
     summarize_assets,
     asset_prediction_and_backtest,
     load_asset_with_indicators,
-    ASSET_SYMBOLS,
 )
 
-# --------------------------------------------------------------------------------------
-# PAGE CONFIG
-# --------------------------------------------------------------------------------------
-st.set_page_config(page_title="WoodyTrades Pro", layout="wide")
-st.title("📈 WoodyTrades Pro — Multi-Asset Signal Dashboard")
+warnings.filterwarnings("ignore", message="Please replace `use_container_width`")
 
-# --------------------------------------------------------------------------------------
-# SIDEBAR CONTROLS
-# --------------------------------------------------------------------------------------
-st.sidebar.header("⚙️ Settings")
+# ---------------------------------------------------------------------------
+# APP CONFIG
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="WoodyTradesPro Forecast", layout="wide")
 
-interval_key = st.sidebar.selectbox(
-    "Select Interval",
-    options=["15m", "1h", "4h", "1d", "1wk"],
-    index=1,
-)
+st.title("📈 WoodyTradesPro Forecast (Smart v2)")
 
-risk = st.sidebar.selectbox(
-    "Select Risk Level",
-    options=["Low", "Medium", "High"],
-    index=1,
-)
+tabs = st.tabs(["📊 Market Summary", "🎯 Predictions", "📈 Chart View", "🔍 Backtest Results"])
 
-use_cache = st.sidebar.checkbox("Use cached data", value=True)
+# ---------------------------------------------------------------------------
+# TAB 1 — MARKET SUMMARY
+# ---------------------------------------------------------------------------
+with tabs[0]:
+    st.subheader("📊 Multi-Asset Market Summary")
 
-selected_asset = st.sidebar.selectbox("Select Asset", list(ASSET_SYMBOLS.keys()), index=0)
+    col1, col2 = st.columns(2)
+    interval_key = col1.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1)
+    risk = col2.selectbox("Risk Level", ["Low", "Medium", "High"], index=1)
 
-# --------------------------------------------------------------------------------------
-# SAFETY WRAPPER — so Streamlit never goes blank
-# --------------------------------------------------------------------------------------
-def safe_section(fn):
+    st.info(f"Fetching latest market data for interval **{interval_key}**, risk profile **{risk}**...")
+
+    @st.cache_data(ttl=3600)
+    def load_summary(interval_key, risk):
+        return summarize_assets(interval_key, risk, use_cache=True)
+
     try:
-        fn()
-    except Exception as e:
-        st.error(f"⚠️ Error: {e}")
-        st.exception(traceback.format_exc())
-
-# --------------------------------------------------------------------------------------
-# TABS
-# --------------------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["🌍 Overview", "📊 Asset Detail", "🧪 Scenarios"])
-
-# --------------------------------------------------------------------------------------
-# TAB 1 — MARKET OVERVIEW
-# --------------------------------------------------------------------------------------
-with tab1:
-    def render_overview():
-        st.subheader("🌍 Market Overview")
-        st.caption("Aggregated signals and backtest metrics for all tracked assets.")
-        df_summary = summarize_assets(interval_key=interval_key, risk=risk, use_cache=use_cache)
-
-        if df_summary is None or df_summary.empty:
-            st.warning("⚠️ No data available. Try disabling cache or check your internet connection.")
-            return
-
-        st.dataframe(df_summary, use_container_width=True)
-
-    safe_section(render_overview)
-
-# --------------------------------------------------------------------------------------
-# TAB 2 — ASSET DETAIL
-# --------------------------------------------------------------------------------------
-with tab2:
-    def render_asset_detail():
-        st.subheader(f"📊 Detailed Analysis — {selected_asset}")
-        pred, df = asset_prediction_and_backtest(selected_asset, interval_key, risk, use_cache=use_cache)
-
-        if pred is None or df is None or df.empty:
-            st.warning("⚠️ Not enough data to compute indicators or signals.")
-            return
-
-        # Top metrics
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Signal", pred["side"])
-        col2.metric("Probability", f"{pred['probability']}%")
-        col3.metric("Win Rate", f"{pred.get('win_rate', 0):.1f}%")
-        col4.metric("Backtest Return", f"{pred.get('backtest_return_pct', 0):.2f}%")
-
-        st.write("---")
-
-        # Price chart
-        st.line_chart(df["Close"], use_container_width=True)
-        st.caption(f"Closing Price — {selected_asset} ({interval_key})")
-
-        # Trade history table
-        trades = pred.get("trades", [])
-        if trades:
-            st.subheader("Trade History")
-            trades_df = pd.DataFrame(trades)
-            st.dataframe(trades_df, use_container_width=True)
+        df_summary = load_summary(interval_key, risk)
+        if df_summary.empty:
+            st.warning("⚠️ No market data could be loaded.")
         else:
-            st.info("No completed trades to display yet.")
+            st.dataframe(df_summary, width="stretch")
+    except Exception as e:
+        st.error(f"Error loading summary: {e}")
+        st.text(traceback.format_exc())
 
-    safe_section(render_asset_detail)
+# ---------------------------------------------------------------------------
+# TAB 2 — PREDICTIONS
+# ---------------------------------------------------------------------------
+with tabs[1]:
+    st.subheader("🎯 Asset Predictions and Backtest")
 
-# --------------------------------------------------------------------------------------
-# TAB 3 — SCENARIO TESTING
-# --------------------------------------------------------------------------------------
-with tab3:
-    def render_scenarios():
-        st.subheader("🧪 Scenario Simulation")
-        st.caption("Re-evaluate the selected asset with different intervals and risk levels.")
+    asset = st.selectbox("Select Asset", list([
+        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
+        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
+    ]))
+    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1)
+    risk = st.selectbox("Risk Level", ["Low", "Medium", "High"], index=1)
 
-        alt_interval = st.selectbox("Interval to Test", ["15m", "1h", "4h", "1d", "1wk"], index=1)
-        alt_risk = st.selectbox("Risk Level to Test", ["Low", "Medium", "High"], index=1)
+    st.info(f"Analyzing {asset} at {interval_key} timeframe with {risk} risk...")
 
-        pred_alt, df_alt = asset_prediction_and_backtest(selected_asset, alt_interval, alt_risk, use_cache=use_cache)
+    try:
+        result, df = asset_prediction_and_backtest(asset, interval_key, risk, use_cache=True)
+        if not result:
+            st.warning("⚠️ Could not generate prediction.")
+        else:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Signal", result["side"])
+            col2.metric("Probability", f"{result['probability']}%")
+            col3.metric("Win Rate", f"{result['win_rate']:.1f}%")
+            col4.metric("Trades", result["n_trades"])
 
-        if pred_alt is None or df_alt is None or df_alt.empty:
-            st.warning("⚠️ Could not generate scenario data. Try another interval or disable cache.")
-            return
+            st.markdown(f"""
+            **Current Price:** {result['price']:.2f}  
+            **Take Profit:** {result['tp']}  
+            **Stop Loss:** {result['sl']}  
+            **Sentiment:** {result['sentiment']:.2f}  
+            **Market Regime:** {result['regime']}  
+            **ML Probability (Up):** {result['ml_prob']:.2f}
+            """)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Signal", pred_alt["side"])
-        col2.metric("Probability", f"{pred_alt['probability']}%")
-        col3.metric("ATR", f"{pred_alt.get('atr', 0):.2f}")
+            if result["trades"]:
+                st.subheader("📜 Trade Log")
+                st.dataframe(pd.DataFrame(result["trades"]), width="stretch")
+    except Exception as e:
+        st.error(f"Error generating prediction: {e}")
+        st.text(traceback.format_exc())
 
-        st.write("---")
-        st.line_chart(df_alt["Close"], use_container_width=True)
-        st.caption(f"Scenario price curve — {selected_asset} ({alt_interval})")
+# ---------------------------------------------------------------------------
+# TAB 3 — CHART VIEW
+# ---------------------------------------------------------------------------
+with tabs[2]:
+    st.subheader("📈 Interactive Chart View")
 
-    safe_section(render_scenarios)
+    asset = st.selectbox("Asset", list([
+        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
+        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
+    ]), key="chart_asset")
+    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="chart_interval")
 
-# --------------------------------------------------------------------------------------
-# FOOTER
-# --------------------------------------------------------------------------------------
-st.write("---")
-st.caption("© 2025 WoodyTrades Pro — Forecast Project (Streamlit build)")
+    try:
+        symbol, df = load_asset_with_indicators(asset, interval_key, use_cache=True)
+        if df.empty:
+            st.warning("No data available for this asset.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                name="Price"))
+            if "ema20" in df:
+                fig.add_trace(go.Scatter(x=df.index, y=df["ema20"], name="EMA20"))
+            if "ema50" in df:
+                fig.add_trace(go.Scatter(x=df.index, y=df["ema50"], name="EMA50"))
+            fig.update_layout(title=f"{asset} ({symbol}) — {interval_key}", height=600)
+            st.plotly_chart(fig, width="stretch")
+    except Exception as e:
+        st.error(f"Chart failed to load: {e}")
+        st.text(traceback.format_exc())
 
-# --------------------------------------------------------------------------------------
-# END OF MODULE
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TAB 4 — BACKTEST RESULTS
+# ---------------------------------------------------------------------------
+with tabs[3]:
+    st.subheader("🔍 Backtest Results Summary")
+
+    asset = st.selectbox("Select Asset for Backtest", list([
+        "Gold", "NASDAQ 100", "S&P 500", "EUR/USD",
+        "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"
+    ]), key="bt_asset")
+    interval_key = st.selectbox("Interval", ["15m", "1h", "4h", "1d", "1wk"], index=1, key="bt_interval")
+    risk = st.selectbox("Risk Level", ["Low", "Medium", "High"], index=1, key="bt_risk")
+
+    try:
+        result, df = asset_prediction_and_backtest(asset, interval_key, risk, use_cache=True)
+        if not result:
+            st.warning("⚠️ Could not run backtest.")
+        else:
+            st.metric("Backtest Win Rate", f"{result['win_rate']:.1f}%")
+            st.metric("Total Return", f"{result['backtest_return_pct']:.2f}%")
+            if result["trades"]:
+                st.subheader("📄 Detailed Trade History")
+                st.dataframe(pd.DataFrame(result["trades"]), width="stretch")
+    except Exception as e:
+        st.error(f"Error in backtest: {e}")
+        st.text(traceback.format_exc())
+
+# ---------------------------------------------------------------------------
+# END OF APP
+# ---------------------------------------------------------------------------
+st.markdown("---")
+st.caption("© 2025 WoodyTradesPro | Smart v2 Forecast System")
