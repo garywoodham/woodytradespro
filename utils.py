@@ -36,6 +36,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+import os
+os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
+
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -684,16 +687,16 @@ def _dynamic_cutoff(recent_winrate: float) -> float:
     return float(np.clip(raw, 0.50, 0.75))
     
 # --------------------------------------------------------------------------------------
-# SMART PREDICTION ENGINE (FIXED SENTIMENT + NEUTRAL TP/SL)
+# SMART PREDICTION ENGINE (FIXED SENTIMENT + NEUTRAL TP/SL + 4-ARG SIGNATURE)
 # --------------------------------------------------------------------------------------
 
-def _latest_prediction(symbol: str, interval_key: str, risk: str) -> dict:
+def _latest_prediction(symbol: str, interval_key: str, risk: str, use_cache: bool = True) -> dict:
     """
     Combines technical, ML, and sentiment predictions into a final signal.
     Returns a consistent dict for all assets (no missing TP/SL/Sentiment).
     """
 
-    df = fetch_data(symbol, interval_key, use_cache=True)
+    df = fetch_data(symbol, interval_key, use_cache=use_cache)
     if df is None or df.empty or len(df) < 60:
         return {"symbol": symbol, "side": "Hold", "probability": 0.5, "sentiment": 0.0, "tp": None, "sl": None, "rr": None}
 
@@ -785,7 +788,7 @@ def _latest_prediction(symbol: str, interval_key: str, risk: str) -> dict:
         "tp": float(tp) if tp else None,
         "sl": float(sl) if sl else None,
         "rr": float(rr) if rr else 1.0,
-    } 
+    }
 
 
 # --------------------------------------------------------------------------------------
