@@ -15,8 +15,13 @@ from datetime import datetime
 # Prevent inotify watch-limit crash
 os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
 
-# Streamlit deprecation suppressions
-st.set_option("deprecation.showPyplotGlobalUse", False)
+# Streamlit config setup (safe for all versions)
+try:
+    # Only set if available (older versions only)
+    st.set_option("deprecation.showPyplotGlobalUse", False)
+except Exception:
+    pass  # Silently skip for new Streamlit versions
+
 st.set_page_config(page_title="Woody Trades Pro - Smart v7", layout="wide")
 
 # --------------------------------------------------------------------------------------
@@ -80,10 +85,9 @@ with tabs[0]:
                 df_summary,
                 width='stretch',
                 hide_index=True,
-                use_container_width=False,
             )
 
-            # Plot Probability vs Sentiment
+            # Probability vs Sentiment scatter plot
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=df_summary["Sentiment"],
@@ -137,7 +141,6 @@ with tabs[1]:
                 c5.metric("SL", f"{result.get('sl', 0.0):,.2f}")
                 c6.metric("RR", f"{result.get('rr', 0.0):.2f}")
 
-                # Chart
                 if not df.empty:
                     fig = go.Figure()
                     fig.add_trace(go.Candlestick(
@@ -148,18 +151,10 @@ with tabs[1]:
                         close=df["Close"],
                         name="Price",
                     ))
-                    fig.add_trace(go.Scatter(
-                        x=df.index,
-                        y=df["ema20"],
-                        line=dict(width=1.5),
-                        name="EMA20",
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=df.index,
-                        y=df["ema50"],
-                        line=dict(width=1.5),
-                        name="EMA50",
-                    ))
+                    if "ema20" in df.columns:
+                        fig.add_trace(go.Scatter(x=df.index, y=df["ema20"], name="EMA20", line=dict(width=1.5)))
+                    if "ema50" in df.columns:
+                        fig.add_trace(go.Scatter(x=df.index, y=df["ema50"], name="EMA50", line=dict(width=1.5)))
                     fig.update_layout(
                         title=f"{asset} Price & EMA Overview",
                         template="plotly_dark",
@@ -200,7 +195,6 @@ with tabs[2]:
                 col4.metric("MaxDD", f"{stats.get('maxdd', 0.0):.2f}%")
                 col5.metric("Sharpe-like", f"{stats.get('sharpe', 0.0):.2f}")
 
-            # Draw price + EMA chart
             if df_bt is not None and not df_bt.empty:
                 fig_bt = go.Figure()
                 fig_bt.add_trace(go.Candlestick(
