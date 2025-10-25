@@ -1,32 +1,84 @@
 # ======================================================================================
 # utils.py
-# Smart v7 Full Runtime (Historical + ML + Sentiment + Adaptive Backtest)
+# Smart v7.1 Full Runtime (Historical + ML + Sentiment + Adaptive Backtest)
 #
-# This file is intentionally verbose.
-# It merges:
-#  - data caching + normalization
-#  - indicator pipelines
-#  - signal logic (rule-based & ML hybrid)
-#  - sentiment engine w/ fallback
-#  - TP/SL, RR, risk scaling
-#  - adaptive fusion model with dynamic thresholds
-#  - rolling backtest with win rate, return, max drawdown, sharpe-like ratio
-#  - asset summary table builder
-#  - Streamlit-friendly helper functions
-#  - debug/status utilities
+# IMPORTANT:
+# This file is intentionally long, explicit, and heavily commented. We are preserving
+# ALL behavior we've built so far in this project. Nothing is dropped:
 #
-# Absolutely nothing is intentionally dropped:
-# - We still compute and expose probability, sentiment, TP/SL, RR, win rate, return, drawdown.
-# - We compute indicators like EMA20/50/100, RSI, MACD, ATR, ADX-like proxy, Bollinger width,
-#   relative ATR, regime duration, etc.
-# - We produce short-horizon ML classification to predict 3-bar direction.
-# - Sentiment has multi-source fallback and synthetic mode.
-# - "Hold" entries still get populated outputs (TP/SL etc.).
+#   1. Data fetch & caching (yfinance with retry, mirror, cache).
+#   2. Data normalization (OHLCV cleanup, MultiIndex flattening).
+#   3. Technical indicators:
+#        - EMA20 / EMA50 / EMA100
+#        - RSI(14)
+#        - MACD (12/26/9) and histogram
+#        - ATR(14) and ATR as % of price
+#        - Bollinger %B and bandwidth
+#        - ROC(5)
+#        - ADX-like proxy (trend strength)
+#        - "stretch" above EMA20 in ATRs
+#        - "trend_age" (bars since trend flip)
 #
-# Notes:
-#  - This module does NOT import from app.py (no circular import).
-#  - Streamlit is imported only for caching decorators and logging convenience.
-#  - All functions are pure / stable enough to be used across tabs.
+#   4. Rule-based signal (Buy/Sell/Hold) from EMA/RSI/MACD,
+#      + volatility gates (ADX > X, ATR% > Y).
+#
+#   5. Exhaustion logic to avoid chasing overextended trends.
+#
+#   6. TP/SL computation using ATR scaling and risk profiles (Low/Medium/High).
+#
+#   7. Sentiment module with 3 fallback layers:
+#        A. Yahoo Finance headlines via yfinance.Ticker(symbol).news
+#        B. Google News RSS sentiment
+#        C. Synthetic sentiment based on slope/momentum of recent price
+#
+#   8. ML model:
+#        - We train a RandomForestClassifier per (symbol, interval_key, regime_label)
+#          where regime_label ~ bull/bear based on ema20>ema50.
+#        - Model predicts probability that price will be UP in 3 bars.
+#
+#   9. Probability fusion:
+#        - Combine rule_conf, ml_prob, sentiment, ATR%, ADX, and recent win rate.
+#        - Adaptive thresholds for prob and RR, dynamic cutoff based on recent winrate.
+#
+#   10. Rolling backtest:
+#        - Simulate trades across recent window (entry signal, TP/SL hit inside horizon).
+#        - Compute win rate, trades executed, cumulative return%, max drawdown%, sharpe-like.
+#
+#   11. summarize_assets():
+#        - Runs fresh indicators, fresh backtest, then latest prediction.
+#        - Populates Probability, Sentiment, TP, SL, RR, WinRate, Trades, Return%, MaxDD%, SharpeLike.
+#        - Sorts by Probability.
+#        - This version FIXES the "all zeros" bug by forcing backtest_signals()
+#          and using its winrate as context into _latest_prediction().
+#
+#   12. load_asset_with_indicators():
+#        - For charting in Asset Analysis tab.
+#
+#   13. asset_prediction_single():
+#        - Used in Asset Analysis tab to show current signal card
+#          (Side / Probability / Sentiment / TP / SL / RR).
+#
+#   14. asset_prediction_and_backtest():
+#        - Used in Backtest tab to show stats + chart.
+#
+#   15. debug_signal_breakdown():
+#        - Dev introspection: see rule_conf, ml_prob, fused_prob, RR, etc.
+#
+#   16. __main__ self test:
+#        - Lets you run `python utils.py` locally to sanity check everything
+#          without Streamlit.
+#
+# Also to note:
+# - We provide helper functions like _safe_float(), _is_exhausted(), _dynamic_cutoff(),
+#   _adaptive_thresholds() and so on. Do not remove them.
+# - We keep RISK_MULT, INTERVAL_CONFIG, ASSET_SYMBOLS global state to match app.py.
+# - We export the same function names app.py imports:
+#     summarize_assets
+#     asset_prediction_single
+#     asset_prediction_and_backtest
+#     load_asset_with_indicators
+#
+# If you add/modify logic later, APPEND new code rather than deleting working code.
 # ======================================================================================
 
 from __future__ import annotations
@@ -48,27 +100,27 @@ import yfinance as yf
 import requests
 import xml.etree.ElementTree as ET
 
-# optional: scikit-learn for ML model
+# scikit-learn for ML classifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
-# sentiment
+# sentiment model
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# for app caches (safe if running under Streamlit)
+# Streamlit is optional here. utils must also work from plain python.
 try:
-    import streamlit as st
+    import streamlit as st  # noqa: F401
 except Exception:
-    st = None  # allows running utils standalone from CLI
+    st = None
 
-# --------------------------------------------------------------------------------------
-# GLOBAL CONSTANTS / CONFIG
-# --------------------------------------------------------------------------------------
+# ======================================================================================
+# GLOBAL CONSTANTS AND CONFIG
+# ======================================================================================
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# timeframes -> yfinance interval + historical lookback period + required rows
+# Timeframe config: interval, history period for fetch, and min_rows required
 INTERVAL_CONFIG: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m",  "period": "5d",  "min_rows": 150},
     "1h":  {"interval": "60m",  "period": "2mo", "min_rows": 300},
@@ -77,14 +129,14 @@ INTERVAL_CONFIG: Dict[str, Dict[str, object]] = {
     "1wk": {"interval": "1wk",  "period": "5y",  "min_rows": 150},
 }
 
-# risk multipliers (the "old" model)
+# Risk profiles for TP/SL distance in ATRs
 RISK_MULT: Dict[str, Dict[str, float]] = {
     "Low":    {"tp_atr": 1.0, "sl_atr": 1.5},
     "Medium": {"tp_atr": 1.5, "sl_atr": 1.0},
     "High":   {"tp_atr": 2.0, "sl_atr": 0.8},
 }
 
-# asset universe
+# Mapping of pretty asset labels (in UI) to tickers
 ASSET_SYMBOLS: Dict[str, str] = {
     "Gold": "GC=F",
     "NASDAQ 100": "^NDX",
@@ -96,44 +148,51 @@ ASSET_SYMBOLS: Dict[str, str] = {
     "Bitcoin": "BTC-USD",
 }
 
-# Analyzer instances
+# Shared analyzer / model caches
 _VADER = SentimentIntensityAnalyzer()
+_MODEL_CACHE: Dict[Tuple[str, str, str], RandomForestClassifier] = {}  # (symbol, interval_key, regime_label)
 
-# ML model cache keyed by (symbol, interval_key, regime_label)
-_MODEL_CACHE: Dict[Tuple[str, str, str], RandomForestClassifier] = {}
-
-# Fallback base thresholds for adaptive entry
-_BASE_PROB_THRESHOLD = 0.6
-_BASE_MIN_RR = 1.2
+# Baseline gating constraints for trades (used in thresholds)
+_BASE_PROB_THRESHOLD = 0.6   # base probability cutoff for entering trades
+_BASE_MIN_RR = 1.2           # base reward:risk min
 
 # ======================================================================================
-# UTILITY / LOGGING
+# LOG UTILS
 # ======================================================================================
 
 def _log(msg: str) -> None:
-    """Safe print to console (works in Streamlit logs)."""
+    """Print for server logs/Streamlit console. Safe even if stdout weird."""
     try:
         print(msg, flush=True)
     except Exception:
         pass
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Turn anything into float safely. Use default for NaN/None."""
     try:
-        if val is None or (isinstance(val, float) and math.isnan(val)):
+        if val is None:
+            return default
+        if isinstance(val, float) and math.isnan(val):
             return default
         return float(val)
     except Exception:
         return default
 
 def _now_ts() -> float:
+    """Return current UNIX timestamp."""
     return time.time()
 
 # ======================================================================================
-# DATA FETCHING / CACHING
+# DATA FETCH / CACHE
 # ======================================================================================
 
 def _cache_path(symbol: str, interval_key: str) -> Path:
-    """Generate stable CSV cache path for a (symbol, interval_key) pair."""
+    """
+    Generate clean filename for cached CSV:
+      "^NDX" -> "NDX"
+      "GC=F" -> "GC_F"
+      "EURUSD=X" -> "EURUSD_X"
+    """
     safe = (
         symbol.replace("^", "")
         .replace("=", "_")
@@ -142,39 +201,51 @@ def _cache_path(symbol: str, interval_key: str) -> Path:
     )
     return DATA_DIR / f"{safe}_{interval_key}.csv"
 
+
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Unify yfinance output into a clean OHLCV DataFrame."""
+    """
+    yfinance can return:
+      - MultiIndex columns
+      - columns with lowercase names
+      - 2D columns (n,1)
+      - NaN/inf pockets
+    We fix all of that here and enforce columns: Open/High/Low/Close/Adj Close/Volume
+    plus a DatetimeIndex.
+    """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
 
-    # flatten MultiIndex columns if any
+    # Flatten possible MultiIndex (("Open", "GC=F"), ...) to "Open"
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # rename weird lowercase columns, etc.
+    # Normalize column names to standard case
     rename_map = {}
     for c in df.columns:
-        if c.lower() == "adj close":
-            rename_map[c] = "Adj Close"
-        elif c.lower() == "close":
-            rename_map[c] = "Close"
-        elif c.lower() == "open":
+        cl = c.lower()
+        if cl == "open":
             rename_map[c] = "Open"
-        elif c.lower() == "high":
+        elif cl == "high":
             rename_map[c] = "High"
-        elif c.lower() == "low":
+        elif cl == "low":
             rename_map[c] = "Low"
-        elif c.lower() == "volume":
+        elif cl == "close":
+            rename_map[c] = "Close"
+        elif cl == "adj close":
+            rename_map[c] = "Adj Close"
+        elif cl == "volume":
             rename_map[c] = "Volume"
+
     if rename_map:
         df = df.rename(columns=rename_map)
 
     keep_cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
     if not keep_cols:
         return pd.DataFrame()
+
     df = df[keep_cols].copy()
 
-    # force datetime index
+    # Ensure DateTimeIndex, sort ascending
     if not isinstance(df.index, pd.DatetimeIndex):
         try:
             df.index = pd.to_datetime(df.index)
@@ -182,23 +253,26 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
             pass
     df = df.sort_index()
 
-    # flatten any 2D columns
+    # Flatten any (n,1) columns
     for col in df.columns:
         vals = df[col].values
         if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
             df[col] = pd.Series(vals.ravel(), index=df.index)
-        # numeric
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # clean
+    # Clean inf and NaN patches
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.ffill(inplace=True)
     df.bfill(inplace=True)
     df.dropna(how="all", inplace=True)
+
     return df
 
+
 def _yahoo_try_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    """Primary fetch using yf.download."""
+    """
+    Main fetch path using yfinance.download.
+    """
     try:
         raw = yf.download(
             symbol,
@@ -212,19 +286,24 @@ def _yahoo_try_download(symbol: str, interval: str, period: str) -> pd.DataFrame
         _log(f"⚠️ {symbol}: yf.download error {e}")
         return pd.DataFrame()
 
+
 def _yahoo_mirror_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    """Secondary fetch via Ticker.history (fallback)."""
+    """
+    Mirror fetch fallback using Ticker.history
+    """
     try:
         tk = yf.Ticker(symbol)
         raw = tk.history(period=period, interval=interval, auto_adjust=True, prepost=False)
         df = _normalize_ohlcv(raw)
         if not df.empty:
             return df
+        # Try without auto_adjust
         raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
         return _normalize_ohlcv(raw2)
     except Exception as e:
         _log(f"⚠️ {symbol}: mirror fetch error {e}")
         return pd.DataFrame()
+
 
 def fetch_data(
     symbol: str,
@@ -234,22 +313,24 @@ def fetch_data(
     backoff_range: Tuple[float, float] = (2.0, 6.0),
 ) -> pd.DataFrame:
     """
-    Unified robust fetch:
-     1. Attempt cache if adequate
-     2. Attempt yf.download with retries
-     3. Attempt Ticker.history fallback
-     4. Cache success result
+    Robust unified fetch:
+      1. Try cached CSV (if fresh & big enough)
+      2. yf.download with retry/backoff
+      3. Ticker.history fallback
+      4. Cache successful frame to CSV
+
+    interval_key must exist in INTERVAL_CONFIG.
     """
     if interval_key not in INTERVAL_CONFIG:
         raise KeyError(f"Unknown interval_key={interval_key}, valid={list(INTERVAL_CONFIG.keys())}")
 
     interval = str(INTERVAL_CONFIG[interval_key]["interval"])
-    period = str(INTERVAL_CONFIG[interval_key]["period"])
+    period   = str(INTERVAL_CONFIG[interval_key]["period"])
     min_rows = int(INTERVAL_CONFIG[interval_key]["min_rows"])
 
     cache_fp = _cache_path(symbol, interval_key)
 
-    # cache path attempt
+    # 1. attempt cache
     if use_cache and cache_fp.exists():
         try:
             cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
@@ -258,16 +339,17 @@ def fetch_data(
                 _log(f"✅ Using cached {symbol} ({len(cached)} rows).")
                 return cached
             else:
-                _log(f"ℹ️ Cache {symbol} is short ({len(cached)}/{min_rows}).")
+                _log(f"ℹ️ Cache {symbol} short: {len(cached)} < {min_rows}")
         except Exception as e:
             _log(f"⚠️ Cache read fail for {symbol}: {e}")
 
-    # live fetch attempts
+    # 2. live fetch retries
     _log(f"⏳ Fetching {symbol} [{interval}] ...")
     for attempt in range(1, max_retries + 1):
         df_live = _yahoo_try_download(symbol, interval, period)
         if not df_live.empty and len(df_live) >= min_rows:
             _log(f"✅ {symbol}: fetched {len(df_live)} rows.")
+            # write cache
             try:
                 df_live.to_csv(cache_fp)
                 _log(f"💾 Cached → {cache_fp}")
@@ -280,11 +362,12 @@ def fetch_data(
         low, high = backoff_range
         time.sleep(np.random.uniform(low, high))
 
-    # fallback
+    # 3. mirror fallback
     _log(f"🪞 Mirror fetch for {symbol}...")
     df_m = _yahoo_mirror_history(symbol, interval, period)
     if not df_m.empty and len(df_m) >= min_rows:
-        _log(f"✅ Mirror fetch success for {symbol}.")
+        _log(f"✅ Mirror fetch success {symbol}, {len(df_m)} rows.")
+        # cache
         try:
             df_m.to_csv(cache_fp)
             _log(f"💾 Cached mirror → {cache_fp}")
@@ -292,7 +375,8 @@ def fetch_data(
             _log(f"⚠️ Cache write fail for {symbol}: {e}")
         return df_m
 
-    _log(f"🚫 All fetch attempts failed for {symbol}. Returning empty frame.")
+    # 4. give up
+    _log(f"🚫 All fetch attempts failed for {symbol}. Returning empty DataFrame.")
     return pd.DataFrame()
 
 # ======================================================================================
@@ -300,9 +384,16 @@ def fetch_data(
 # ======================================================================================
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
+    """Plain EMA with adjust=False (trading convention)."""
     return series.ewm(span=span, adjust=False).mean()
 
+
 def _rsi_series(close: pd.Series, window: int = 14) -> pd.Series:
+    """
+    Classic RSI calc:
+        RS = avg(gain) / avg(loss)
+        RSI = 100 - 100/(1+RS)
+    """
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window).mean()
     loss = -delta.clip(upper=0).rolling(window).mean()
@@ -310,7 +401,17 @@ def _rsi_series(close: pd.Series, window: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+
 def _atr_series(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    """
+    ATR(14) style:
+      True Range = max(
+        high - low,
+        abs(high - prev_close),
+        abs(low  - prev_close)
+      )
+      ATR = rolling mean(True Range, 14)
+    """
     tr1 = (high - low).abs()
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -318,71 +419,80 @@ def _atr_series(high: pd.Series, low: pd.Series, close: pd.Series, window: int =
     atr = tr.rolling(window).mean()
     return atr
 
+
 def _adx_proxy(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
     """
-    Lightweight ADX-ish proxy.
-    We'll approximate directional movement velocity vs ATR.
+    Lightweight ADX-ish proxy:
+      - We approximate +DI and -DI then smooth.
+      - Not identical to real ADX, but enough to estimate "trend strength".
     """
     up_move = high.diff()
     down_move = -low.diff()
+
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
     atr_local = _atr_series(high, low, close, window)
+
     plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1/window, adjust=False).mean() / atr_local
     minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1/window, adjust=False).mean() / atr_local
     dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
     adx = dx.ewm(alpha=1/window, adjust=False).mean()
+
     return adx
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds full indicator set:
+    Enhance OHLCV with:
       ema20, ema50, ema100
       RSI
-      MACD, MACD signal, MACD hist
-      ATR (14)
-      ATR relative (atr/close)
+      MACD / MACD signal / MACD hist
+      ATR, ATR relative (atr / close)
       Bollinger %B, bandwidth
-      Rate of change (ROC)
+      Short-term ROC (5 bars)
       ADX proxy
-      stretch from ema20 measured in ATRs
-      trend_age / bars since flip
+      Stretch vs EMA20 (in ATR)
+      trend_age (bars since last trend flip)
+
+    This function must NEVER silently fail without returning df,
+    because downstream (backtest_signals, ML features, etc.) depend on all columns.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
 
-    # ensure numeric columns
+    # Force numeric shape for OHLC
     for col in ["Close", "High", "Low", "Open"]:
         if col not in df.columns:
-            return pd.DataFrame()
+            return pd.DataFrame()  # bail if missing key price cols
         arr = df[col].values
         if getattr(arr, "ndim", 1) > 1:
             df[col] = pd.Series(arr.ravel(), index=df.index)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # -- EMAs
+    # EMAs
     df["ema20"] = _ema(df["Close"], 20)
     df["ema50"] = _ema(df["Close"], 50)
     df["ema100"] = _ema(df["Close"], 100)
 
-    # -- RSI
+    # RSI
     df["RSI"] = _rsi_series(df["Close"], 14)
-    df["rsi"] = df["RSI"]  # backward compat older code
+    df["rsi"] = df["RSI"]  # backward compat for old code expecting 'rsi'
 
-    # -- MACD
+    # MACD-style
     ema12 = _ema(df["Close"], 12)
     ema26 = _ema(df["Close"], 26)
     df["macd"] = ema12 - ema26
     df["macd_signal"] = _ema(df["macd"], 9)
     df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-    # -- ATR
+    # ATR and relative ATR
     df["atr"] = _atr_series(df["High"], df["Low"], df["Close"], 14)
     df["atr_rel"] = df["atr"] / df["Close"]
 
-    # -- Bollinger
+    # Bollinger stats
     mid = df["Close"].rolling(20).mean()
     std = df["Close"].rolling(20).std()
     upper = mid + 2 * std
@@ -390,34 +500,36 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_percent_b"] = (df["Close"] - lower) / (upper - lower).replace(0, np.nan)
     df["bb_bandwidth"] = (upper - lower) / mid.replace(0, np.nan)
 
-    # -- Rate of change (momentum short-term)
+    # ROC (5-bar change %)
     df["roc_close"] = df["Close"].pct_change(5)
 
-    # -- ADX proxy
+    # ADX-ish trend strength proxy
     df["adx"] = _adx_proxy(df["High"], df["Low"], df["Close"], 14)
 
-    # stretch above/below EMA20 measured in ATR
+    # Stretch vs EMA20 in ATR units
     df["close_above_ema20_atr"] = (df["Close"] - df["ema20"]) / df["atr"].replace(0, np.nan)
 
-    # trend age calculation
-    # We'll consider an uptrend if ema20>ema50, else downtrend
+    # Trend age calculation: bars since last flip of ema20 > ema50
     trend_flag = (df["ema20"] > df["ema50"]).astype(int)  # 1 bull, 0 bear
-    age = []
-    current_age = 0
-    last_flag = None
+    age_list = []
+    curr_age = 0
+    last_flag_val = None
     for val in trend_flag:
-        if last_flag is None:
-            current_age = 1
+        if last_flag_val is None:
+            curr_age = 1
         else:
-            if val == last_flag:
-                current_age += 1
+            if val == last_flag_val:
+                curr_age += 1
             else:
-                current_age = 1
-        age.append(current_age)
-        last_flag = val
-    df["trend_age"] = age
+                curr_age = 1
+        age_list.append(curr_age)
+        last_flag_val = val
+    df["trend_age"] = age_list
 
-    # This ensures all inf -> NaN -> filled
+    # Secondary helpful columns:
+    df["ema_gap"] = df["ema20"] - df["ema50"]
+
+    # Cleanup inf -> NaN -> fill
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.ffill(inplace=True)
     df.bfill(inplace=True)
@@ -431,14 +543,19 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    Heuristic ensemble:
-      - EMA20 vs EMA50 alignment + MACD cross => directional bias
-      - RSI extremes confirm mean-revert edges
-      - We also require some volatility/structure (atr_rel, adx)
+    Heuristic ensemble voter:
+      - EMA20 vs EMA50 (trend)
+      - RSI extremes (<30 or >70)
+      - MACD cross vs signal
+      - Filter for "structure" (enough ADX and ATR%)
 
     Returns:
-      - side: "Buy", "Sell", or "Hold"
-      - base_conf: 0..1
+      side: "Buy", "Sell", or "Hold"
+      base_confidence: 0..1
+
+    NOTE:
+    This does NOT apply risk filters like exhaustion or RR threshold.
+    That happens later.
     """
     side = "Hold"
     score = 0.0
@@ -452,7 +569,7 @@ def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]
         elif row["ema20"] < row["ema50"]:
             score -= 1
 
-    # RSI extremes (mean reversion tilt)
+    # RSI extremes: oversold (<30) => bullish tilt, overbought (>70) => bearish tilt
     if not math.isnan(row["RSI"]):
         votes += 1
         if row["RSI"] < 30:
@@ -461,28 +578,30 @@ def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]
             score -= 1
 
     # MACD cross
-    if (
-        (not math.isnan(row["macd"])) and
-        (not math.isnan(row["macd_signal"])) and
-        (not math.isnan(row_prev.get("macd", np.nan))) and
-        (not math.isnan(row_prev.get("macd_signal", np.nan)))
-    ):
+    prev_macd = row_prev.get("macd", np.nan)
+    prev_sig  = row_prev.get("macd_signal", np.nan)
+    cur_macd  = row.get("macd", np.nan)
+    cur_sig   = row.get("macd_signal", np.nan)
+    if (not math.isnan(prev_macd) and
+        not math.isnan(prev_sig) and
+        not math.isnan(cur_macd) and
+        not math.isnan(cur_sig)):
         votes += 1
-        crossed_up = (row_prev["macd"] <= row_prev["macd_signal"]) and (row["macd"] > row["macd_signal"])
-        crossed_dn = (row_prev["macd"] >= row_prev["macd_signal"]) and (row["macd"] < row["macd_signal"])
+        crossed_up = (prev_macd <= prev_sig) and (cur_macd > cur_sig)
+        crossed_dn = (prev_macd >= prev_sig) and (cur_macd < cur_sig)
         if crossed_up:
             score += 1
         elif crossed_dn:
             score -= 1
 
-    # "Volatility / structure present" gate
+    # Base confidence from vote
+    base_conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
+
+    # Minimum "structure" filter:
     adx_ok = _safe_float(row.get("adx"), 0.0) > 12
     atr_rel_ok = _safe_float(row.get("atr_rel"), 0.0) >= 0.6
 
-    # base confidence
-    base_conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
-
-    # decision
+    # Assign raw side
     if score > 0.67 * votes and adx_ok and atr_rel_ok:
         side = "Buy"
     elif score < -0.67 * votes and adx_ok and atr_rel_ok:
@@ -492,35 +611,40 @@ def compute_signal_row(row_prev: pd.Series, row: pd.Series) -> Tuple[str, float]
 
     return side, base_conf
 
+
 def _is_exhausted(row: pd.Series, side: str) -> bool:
     """
-    Overextension filter:
-    - if price is stretched too far from EMA20 in ATR terms for too long,
-      we avoid chasing continuation in that same direction.
+    Avoid chasing if trend is too stretched for too long.
+    For bullish signals, if Close is >2 ATR above ema20 and trend_age>30 => exhaust.
+    For bearish signals, if Close is <2 ATR below ema20 and trend_age>30 => exhaust.
     """
     stretch = _safe_float(row.get("close_above_ema20_atr"), 0.0)
-    trend_age = _safe_float(row.get("trend_age"), 0.0)
-    if side == "Buy" and stretch > 2 and trend_age > 30:
-        return True
-    if side == "Sell" and stretch < -2 and trend_age > 30:
-        return True
+    t_age = _safe_float(row.get("trend_age"), 0.0)
+
+    if side == "Buy":
+        if stretch > 2 and t_age > 30:
+            return True
+    elif side == "Sell":
+        if stretch < -2 and t_age > 30:
+            return True
     return False
 
 # ======================================================================================
-# TP/SL + RISK LOGIC
+# RISK / TP / SL / REWARD:RISK
 # ======================================================================================
 
 def _compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
     """
-    Older "RISK_MULT" ATR-based model.
+    Compute TP/SL levels from ATR * risk multipliers.
+    Used internally.
     """
     m = RISK_MULT.get(risk, RISK_MULT["Medium"])
     tp_k = float(m["tp_atr"])
     sl_k = float(m["sl_atr"])
 
-    # fallback atr
+    # safety fallback if ATR is garbage
     if atr is None or (isinstance(atr, float) and math.isnan(atr)) or atr <= 0:
-        atr = price * 0.005
+        atr = price * 0.005  # ~0.5%
 
     if side == "Buy":
         tp = price + tp_k * atr
@@ -529,28 +653,34 @@ def _compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[floa
         tp = price - tp_k * atr
         sl = price + sl_k * atr
     else:
-        # neutral/hold fallback
+        # "Hold" fallback for display
         tp = price * 1.005
         sl = price * 0.995
 
     return float(tp), float(sl)
 
-def compute_tp_sl(close_price: float, atr_val: float, side: str, risk: str) -> Tuple[float, float]:
+
+def compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
     """
-    Wrapper to keep backward compatibility with versions that call compute_tp_sl directly.
+    Public wrapper for TP/SL in case app or past code calls compute_tp_sl().
     """
-    return _compute_tp_sl(close_price, atr_val, side, risk)
+    return _compute_tp_sl(price, atr, side, risk)
+
 
 def _calc_rr(price: float, tp: float, sl: float, side: str) -> float:
     """
-    Reward:Risk ratio for the planned trade.
+    Reward:Risk ratio:
+      reward = |target - entry|
+      risk   = |entry - stop|
+      If invalid risk, returns 0.
     """
     if side == "Sell":
         reward = price - tp
         risk_amt = sl - price
-    else:  # Buy or Hold fallback math
+    else:
         reward = tp - price
         risk_amt = price - sl
+
     if risk_amt <= 0:
         return 0.0
     return float(reward / risk_amt)
@@ -562,28 +692,29 @@ def _calc_rr(price: float, tp: float, sl: float, side: str) -> float:
 @lru_cache(maxsize=64)
 def _fetch_sentiment(symbol: str) -> float:
     """
-    Multi-layer sentiment logic:
-      1. yfinance Ticker.news headlines via VADER
+    Multi-layer sentiment score in [-1,1]:
+      1. yfinance headlines (Ticker.news)
       2. Google News RSS fallback
-      3. Synthetic price-derived "sentiment" if no news
-    Returns float in [-1, 1].
+      3. Synthetic fallback from recent slope/momentum
+
+    We also do exponential smoothing to bias toward more recent headlines.
     """
+
     scores: List[float] = []
 
-    # 1. Yahoo Finance news
+    # (1) Yahoo Finance headlines
     try:
         tk = yf.Ticker(symbol)
         news_items = tk.news or []
         for n in news_items[:8]:
-            title = n.get("title", "")
-            if not title:
-                continue
-            compound = _VADER.polarity_scores(title)["compound"]
-            scores.append(compound)
+            headline = n.get("title", "")
+            if headline:
+                comp = _VADER.polarity_scores(headline)["compound"]
+                scores.append(comp)
     except Exception:
         pass
 
-    # 2. Google RSS fallback
+    # (2) Google RSS fallback
     if not scores:
         try:
             rss_url = f"https://news.google.com/rss/search?q={symbol}+finance"
@@ -592,12 +723,13 @@ def _fetch_sentiment(symbol: str) -> float:
             for item in root.findall(".//item")[:8]:
                 headline = item.findtext("title", "") or ""
                 if headline:
-                    compound = _VADER.polarity_scores(headline)["compound"]
-                    scores.append(compound)
+                    comp = _VADER.polarity_scores(headline)["compound"]
+                    scores.append(comp)
         except Exception:
             pass
 
-    # 3. synthetic fallback = slope/momentum-based
+    # (3) Synthetic fallback based on short-term price structure
+    # This helps assets like FX where yfinance news is sparse or missing.
     if not scores:
         tmp = fetch_data(symbol, "1h", use_cache=True)
         if not tmp.empty and len(tmp) >= 20:
@@ -605,13 +737,14 @@ def _fetch_sentiment(symbol: str) -> float:
             x = np.arange(len(closes))
             slope = np.polyfit(x, closes, 1)[0]
             mom = tmp["Close"].pct_change().tail(14).mean()
+            # Map slope & momentum to [-1,1] via tanh
             guess = np.tanh((slope * 1000 + mom * 50) / 2.0)
             scores.append(float(guess))
 
     if not scores:
         return 0.0
 
-    # exponential smoothing to weight recent more
+    # Exponential smoothing to weight recent items more
     alpha = 0.3
     smoothed = scores[0]
     for s in scores[1:]:
@@ -626,7 +759,8 @@ def _fetch_sentiment(symbol: str) -> float:
 
 def _extract_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Core ML feature set. Must match what we train/predict on.
+    Build ML feature frame.
+    List of required columns must match training & inference.
     """
     feat_cols = [
         "ema20",
@@ -646,16 +780,20 @@ def _extract_ml_features(df: pd.DataFrame) -> pd.DataFrame:
         "close_above_ema20_atr",
         "trend_age",
     ]
-    # guarantee existence
-    for c in feat_cols:
-        if c not in df.columns:
-            df[c] = 0.0
 
-    return df[feat_cols].fillna(0.0)
+    for col in feat_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    feats = df[feat_cols].fillna(0.0)
+    return feats
+
 
 def _label_regime(df: pd.DataFrame) -> str:
     """
-    regime label, e.g. bull or bear, based on ema20 > ema50
+    Rough regime classification:
+      bull if ema20 >= ema50
+      bear otherwise
     """
     if df.empty:
         return "neutral"
@@ -665,11 +803,13 @@ def _label_regime(df: pd.DataFrame) -> str:
     else:
         return "bear"
 
+
 def _train_ml_model(symbol: str, interval_key: str, df: pd.DataFrame) -> Optional[RandomForestClassifier]:
     """
-    Train a regime-specific model:
-    - target: will price be higher 3 bars ahead?
-    - we re-train per regime (bull/bear) and cache model in _MODEL_CACHE
+    Train or retrieve cached RandomForestClassifier for (symbol, interval, regime).
+    Target = 1 if Close in 3 bars > current Close else 0.
+
+    We cache per (symbol, interval_key, regime_label).
     """
     if df.empty or len(df) < 120:
         return None
@@ -679,7 +819,6 @@ def _train_ml_model(symbol: str, interval_key: str, df: pd.DataFrame) -> Optiona
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    # Build classification target
     df_local = df.copy()
     df_local["target_up3"] = (df_local["Close"].shift(-3) > df_local["Close"]).astype(int)
 
@@ -687,8 +826,10 @@ def _train_ml_model(symbol: str, interval_key: str, df: pd.DataFrame) -> Optiona
     y = df_local["target_up3"]
 
     if y.nunique() < 2:
+        # if target is basically all 1s or all 0s we can't train
         return None
 
+    # train/test split (time-respecting: shuffle=False)
     X_train, _, y_train, _ = train_test_split(feats, y, test_size=0.3, shuffle=False)
 
     clf = RandomForestClassifier(
@@ -703,21 +844,23 @@ def _train_ml_model(symbol: str, interval_key: str, df: pd.DataFrame) -> Optiona
     _MODEL_CACHE[cache_key] = clf
     return clf
 
+
 def _ml_predict_prob(model: Optional[RandomForestClassifier], row_feat: pd.Series) -> Optional[float]:
     """
-    Predict up-move probability for single row.
+    Predict "probability of up move in next 3 bars".
+    Returns None if model missing.
     """
     if model is None:
         return None
     try:
-        inp = row_feat.to_frame().T  # shape (1, n_features)
-        proba = model.predict_proba(inp)[0][1]
+        row_df = row_feat.to_frame().T  # shape (1, n_features)
+        proba = model.predict_proba(row_df)[0][1]
         return float(proba)
     except Exception:
         return None
 
 # ======================================================================================
-# PROBABILITY FUSION / DYNAMIC THRESHOLDS
+# FUSION / ADAPTIVE THRESHOLDS
 # ======================================================================================
 
 def _fuse_prob(
@@ -729,58 +872,66 @@ def _fuse_prob(
     recent_winrate: float,
 ) -> float:
     """
-    Weighted fusion:
-      - rule_prob from compute_signal_row
-      - ml_prob from _ml_predict_prob
-      - sentiment (scaled)
-      - regime stability via adx/atr
-      - adapt weighting by recent win rate (backtest performance)
+    Combine rule_conf, ML prob, sentiment, volatility, and historical performance
+    into a final fused probability of success.
+
+    We bias toward ML more if recent winrate is high.
+    We penalize if ATR% is huge (chaos).
+    We boost if sentiment agrees and ADX is strong.
     """
+
+    # ML weighting scales with recent winrate
     ml_weight = np.clip(recent_winrate / 100.0, 0.25, 0.75)
+
     if ml_prob is None:
         fused = rule_prob
     else:
         fused = ml_weight * ml_prob + (1 - ml_weight) * rule_prob
 
-    # penalize high chaos (atr_pct big => reduce confidence)
+    # penalty for chaos (very high ATR%)
     fused *= math.exp(-min(atr_pct * 5.0, 2.5))
 
-    # sentiment only helps if ADX strong
+    # if ADX strong, allow sentiment to tilt confidence
     if adx_val >= 20:
         fused *= np.clip(1 + 0.2 * sentiment_score, 0.7, 1.4)
 
     fused = float(np.clip(fused, 0.0, 1.0))
     return fused
 
+
 def _dynamic_cutoff(recent_winrate: float) -> float:
     """
-    If strategy has been winning, we can tolerate slightly lower threshold.
-    If it's losing, demand higher threshold.
+    Make it harder to trade if recent performance is weak.
+    If recent winrate high, relax slightly.
     """
     raw = 0.55 + (0.65 - recent_winrate / 200.0)
+    # clamp 0.50..0.75
     return float(np.clip(raw, 0.50, 0.75))
+
 
 def _adaptive_thresholds(row: pd.Series) -> Tuple[float, float]:
     """
-    Adjust entry requirements based on regime:
-    - strong trending? lower prob ok but require better RR
-    - choppy/slow? demand higher prob but allow lower RR
+    Return (prob_threshold, rr_threshold) based on regime characteristics:
+      - strong trend (high ADX, high ATR%) => OK lower prob if RR high
+      - choppy => demand higher prob, but we might accept lower RR
     """
     adx_val = _safe_float(row.get("adx"), 0.0)
-    atr_rel = _safe_float(row.get("atr_rel"), 1.0)
+    atr_rel_val = _safe_float(row.get("atr_rel"), 1.0)
 
     prob_thresh = _BASE_PROB_THRESHOLD
-    rr_thresh = _BASE_MIN_RR
+    rr_thresh   = _BASE_MIN_RR
 
-    if adx_val > 25 and atr_rel >= 1.0:
+    if adx_val > 25 and atr_rel_val >= 1.0:
+        # trending/hot: lower prob ok, but expect better RR
         prob_thresh -= 0.03
-        rr_thresh += 0.2
-    elif adx_val < 15 or atr_rel < 0.8:
+        rr_thresh   += 0.2
+    elif adx_val < 15 or atr_rel_val < 0.8:
+        # choppy/low energy: demand higher prob, tolerate lower RR
         prob_thresh += 0.05
-        rr_thresh -= 0.1
+        rr_thresh   -= 0.1
 
     prob_thresh = max(0.5, min(0.9, prob_thresh))
-    rr_thresh = max(1.0, min(2.5, rr_thresh))
+    rr_thresh   = max(1.0, min(2.5, rr_thresh))
 
     return prob_thresh, rr_thresh
 
@@ -790,11 +941,27 @@ def _adaptive_thresholds(row: pd.Series) -> Tuple[float, float]:
 
 def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 5) -> Dict[str, Any]:
     """
-    Rolling pseudo-backtest:
-      - iterate through bars, compute signal
-      - simulate TP/SL hits within horizon bars
-      - track wins, losses, running balance
-      - compute winrate, total return %, max drawdown %, sharpe-like metric
+    Lightweight rolling backtest across recent data.
+
+    For each bar i:
+      1. Build signal (Buy/Sell/Hold) from compute_signal_row().
+      2. If Buy or Sell, compute TP/SL via ATR + risk.
+      3. Simulate forward for `horizon` bars. If TP hit => +1%.
+         If SL hit => -1%. (This is just a normalized performance proxy,
+         not literal PnL sizing.)
+      4. Track running balance.
+
+    Output includes:
+      - winrate (%)
+      - trades (count)
+      - return (% from 1.0 balance)
+      - maxdd (% max drawdown from equity peak)
+      - sharpe-like score (winrate / (drawdown+1)) as a quick quality stat.
+
+    NOTE:
+      This is intentionally simple because we want it stable & fast, and we
+      mainly use its outputs to influence probability fusion and to display
+      in the dashboard.
     """
     out = {
         "winrate": 0.0,
@@ -804,7 +971,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 5) -> Dict[str,
         "sharpe": 0.0,
     }
 
-    if df.empty or len(df) < 100:
+    if df is None or df.empty or len(df) < 100:
         return out
 
     balance = 1.0
@@ -814,25 +981,26 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 5) -> Dict[str,
     trades = 0
     drawdowns = []
 
+    # start from bar 60 to ensure indicators "warmed up"
     for i in range(60, len(df) - horizon):
-        prev = df.iloc[i-1]
-        row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+        cur_row  = df.iloc[i]
 
-        side, base_conf = compute_signal_row(prev, row)
-        if side == "Hold" or _is_exhausted(row, side):
+        side, base_conf = compute_signal_row(prev_row, cur_row)
+
+        # skip holds, and skip exhausted trend to avoid chasing
+        if side == "Hold" or _is_exhausted(cur_row, side):
             continue
 
-        price = float(row["Close"])
-        atr_here = float(row["atr"]) if "atr" in row and not math.isnan(row["atr"]) else price * 0.005
+        price = float(cur_row["Close"])
+        atr_here = float(cur_row["atr"]) if "atr" in cur_row and not math.isnan(cur_row["atr"]) else price * 0.005
         tp, sl = _compute_tp_sl(price, atr_here, side, risk)
 
-        # forward simulate horizon bars
         executed = False
-        for j in range(1, horizon+1):
-            nxt = df.iloc[i+j]
+        for j in range(1, horizon + 1):
+            nxt = df.iloc[i + j]
             nxt_px = float(nxt["Close"])
 
-            # check hit conditions
             if side == "Buy":
                 if nxt_px >= tp:
                     balance *= 1.01
@@ -872,92 +1040,118 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 5) -> Dict[str,
     out["return"] = round(total_ret, 2)
     out["maxdd"] = round(maxdd, 2)
     out["sharpe"] = round(sharpe_like, 2)
+
     return out
 
 # ======================================================================================
-# CORE PREDICTION PIPELINE
+# CORE LATEST PREDICTION PIPELINE
 # ======================================================================================
 
-def _latest_prediction(symbol: str, interval_key: str, risk: str, recent_winrate: float = 50.0, use_cache: bool = True) -> Dict[str, Any]:
+def _latest_prediction(
+    symbol: str,
+    interval_key: str,
+    risk: str,
+    recent_winrate: float = 50.0,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
     """
-    Full "brain":
-      - fetch & indicators
-      - compute rule signal
-      - compute sentiment
-      - train/score ML model on 3-bar move
-      - fuse probabilities (rule+ml+sentiment)
-      - adapt thresholds
-      - compute TP/SL, RR
-      - produce final side, prob, tp/sl, rr, sentiment
-      - handle Hold gracefully
+    The "brain" for one asset:
+      - Fetch data (with cache)
+      - Add indicators
+      - Compute rule-based signal (Buy/Sell/Hold) & base_conf
+      - Compute sentiment
+      - Train/fetch ML model + get ml_prob
+      - Fuse to final probability
+      - Adapt thresholds based on ADX, ATR%, and performance
+      - Compute TP/SL and RR
+      - Final decision (maybe override to Hold if it fails thresholds)
+      - Ensure Hold still gets TP/SL/RR filled so UI isn't blank
+
+    Outputs dict with keys:
+      side, probability, sentiment, tp, sl, rr
     """
 
     df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
     if df_raw.empty or len(df_raw) < 60:
-        return {"symbol": symbol, "side": "Hold", "probability": 0.5, "sentiment": 0.0,
-                "tp": None, "sl": None, "rr": None}
+        return {
+            "symbol": symbol,
+            "side": "Hold",
+            "probability": 0.5,
+            "sentiment": 0.0,
+            "tp": None,
+            "sl": None,
+            "rr": None,
+        }
 
     df = add_indicators(df_raw)
     if df.empty or len(df) < 60:
-        return {"symbol": symbol, "side": "Hold", "probability": 0.5, "sentiment": 0.0,
-                "tp": None, "sl": None, "rr": None}
+        return {
+            "symbol": symbol,
+            "side": "Hold",
+            "probability": 0.5,
+            "sentiment": 0.0,
+            "tp": None,
+            "sl": None,
+            "rr": None,
+        }
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # rule signal
+    # Rule side + raw rule confidence (0..1)
     rule_side, rule_conf = compute_signal_row(prev, last)
 
-    # sentiment
+    # Sentiment
     sent_score = _fetch_sentiment(symbol)
 
-    # ML model
+    # ML stuff
     model = _train_ml_model(symbol, interval_key, df)
     feats_all = _extract_ml_features(df)
     row_feat = feats_all.iloc[-1]
     ml_prob = _ml_predict_prob(model, row_feat)
 
-    # fused prob
-    atr_pct = _safe_float(last["atr_rel"], 0.0)
+    # Fuse probability
+    atr_pct = _safe_float(last.get("atr_rel"), 0.0)
     fused_prob = _fuse_prob(
         rule_prob=rule_conf,
         ml_prob=ml_prob,
         sentiment_score=sent_score,
-        adx_val=_safe_float(last["adx"], 0.0),
+        adx_val=_safe_float(last.get("adx"), 0.0),
         atr_pct=atr_pct,
         recent_winrate=recent_winrate,
     )
 
-    # thresholds
+    # Threshold calculations
     prob_thresh_regime, rr_thresh_regime = _adaptive_thresholds(last)
     prob_thresh_recent = _dynamic_cutoff(recent_winrate)
-    # final probability threshold is the stricter of both
+    # We demand the stricter probability requirement
     live_prob_thresh = max(prob_thresh_regime, prob_thresh_recent)
 
-    # compute TP/SL/RR
-    price_now = float(last["Close"])
-    atr_now = _safe_float(last["atr"], price_now * 0.005)
-    tp, sl = _compute_tp_sl(price_now, atr_now, rule_side, risk)
-    rr = _calc_rr(price_now, tp, sl, rule_side)
+    # Baseline trade stats
+    last_price = float(last["Close"])
+    atr_now = _safe_float(last.get("atr"), last_price * 0.005)
+    tp, sl = _compute_tp_sl(last_price, atr_now, rule_side, risk)
+    rr = _calc_rr(last_price, tp, sl, rule_side)
 
+    # Overextension filter
     exhausted = _is_exhausted(last, rule_side)
     if exhausted:
-        fused_prob *= 0.85
+        fused_prob *= 0.85  # degrade conviction
 
-    # final side decision
+    # Final gating
     final_side = "Hold"
     if rule_side != "Hold":
-        if (fused_prob >= live_prob_thresh) and (rr >= rr_thresh_regime):
+        if (fused_prob >= live_prob_thresh) and (rr >= rr_thresh_regime) and not exhausted:
             final_side = rule_side
 
-    # ensure "Hold" still shows tp/sl/rr and not zeros
+    # Even if we ended up "Hold", ensure we show some numbers, not blanks.
     if final_side == "Hold":
         if tp is None or sl is None:
-            tp = price_now * 1.005
-            sl = price_now * 0.995
+            tp = last_price * 1.005
+            sl = last_price * 0.995
             rr = 1.0
+        # fallback sentiment if 0.0 and can't get headlines:
         if sent_score == 0.0:
-            # fallback to simple recent momentum if sentiment source was empty
             sent_score = float(df["Close"].pct_change().tail(10).mean())
 
     return {
@@ -971,17 +1165,15 @@ def _latest_prediction(symbol: str, interval_key: str, risk: str, recent_winrate
     }
 
 # ======================================================================================
-# WRAPPERS FOR DASHBOARD / TABS
+# WRAPPERS EXPOSED TO STREAMLIT APP
 # ======================================================================================
 
 def analyze_asset(symbol: str, interval_key: str, risk: str, use_cache: bool = True) -> Dict[str, Any]:
     """
-    High-level single-asset analysis pipeline:
-      - fetch data
-      - compute indicators
-      - run backtest to get winrate etc
-      - run latest_prediction using that winrate as context
-    Returns dict that the app can display directly.
+    High-level single asset pipeline:
+      1. fetch_data + add_indicators
+      2. run backtest_signals to get stats
+      3. run _latest_prediction() with that winrate as context
     """
     df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
     df_ind = add_indicators(df_raw)
@@ -1011,31 +1203,63 @@ def analyze_asset(symbol: str, interval_key: str, risk: str, use_cache: bool = T
     }
     return out
 
+
 def summarize_assets(interval_key: str, risk: str, use_cache: bool = True) -> pd.DataFrame:
     """
-    Iterates over ASSET_SYMBOLS and builds a summary dataframe
-    for the Market Summary tab.
+    Build the Market Summary dataframe shown in tab 1.
+
+    FIX APPLIED:
+    - We do NOT skip the backtest step anymore.
+      For each asset we now:
+        a) fetch+indicators
+        b) backtest_signals
+        c) _latest_prediction(using backtest winrate)
+      so WinRate/Return/Trades/etc. don't revert to 0.
+
+    Columns:
+      Asset | Side | Probability | Sentiment | TP | SL | RR |
+      WinRate | Trades | Return% | MaxDD% | SharpeLike
     """
     rows = []
-    _log("Fetching and analyzing market data (smart v7)...")
+    _log("Fetching and analyzing market data (smart v7.1 with backtest refresh)...")
+
     for asset_name, symbol in ASSET_SYMBOLS.items():
         _log(f"{asset_name} ({symbol})...")
         try:
-            res = analyze_asset(symbol, interval_key, risk, use_cache=use_cache)
+            # Step A: fetch + indicators
+            df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
+            df_ind = add_indicators(df_raw)
+            if df_ind is None or df_ind.empty:
+                _log(f"⚠️ {symbol}: indicator data empty.")
+                continue
+
+            # Step B: backtest
+            back = backtest_signals(df_ind, risk)
+
+            # Step C: latest prediction with adaptive fusion/thresholds
+            pred = _latest_prediction(
+                symbol=symbol,
+                interval_key=interval_key,
+                risk=risk,
+                recent_winrate=back["winrate"],
+                use_cache=use_cache,
+            )
+
             rows.append({
                 "Asset": asset_name,
-                "Side": res.get("side", "Hold"),
-                "Probability": res.get("probability", 0.0),
-                "Sentiment": res.get("sentiment", 0.0),
-                "TP": res.get("tp"),
-                "SL": res.get("sl"),
-                "RR": res.get("rr"),
-                "WinRate": res.get("winrate", 0.0),
-                "Trades": res.get("trades", 0),
-                "Return%": res.get("return", 0.0),
-                "MaxDD%": res.get("maxdd", 0.0),
-                "SharpeLike": res.get("sharpe", 0.0),
+                "Side": pred.get("side", "Hold"),
+                "Probability": pred.get("probability", 0.0),
+                "Sentiment": pred.get("sentiment", 0.0),
+                "TP": pred.get("tp"),
+                "SL": pred.get("sl"),
+                "RR": pred.get("rr"),
+                "WinRate": back.get("winrate", 0.0),
+                "Trades": back.get("trades", 0),
+                "Return%": back.get("return", 0.0),
+                "MaxDD%": back.get("maxdd", 0.0),
+                "SharpeLike": back.get("sharpe", 0.0),
             })
+
         except Exception as e:
             _log(f"❌ Error analyzing {asset_name}: {e}")
             traceback.print_exc()
@@ -1045,89 +1269,115 @@ def summarize_assets(interval_key: str, risk: str, use_cache: bool = True) -> pd
 
     df_sum = pd.DataFrame(rows)
 
-    # Ensure numeric cleaning
-    num_cols = ["Probability", "Sentiment", "WinRate", "Trades", "Return%", "MaxDD%", "SharpeLike"]
-    for c in num_cols:
-        df_sum[c] = pd.to_numeric(df_sum[c], errors="coerce").fillna(0.0)
+    # Ensure numeric columns are actually numeric and not 'object'
+    numeric_cols = [
+        "Probability",
+        "Sentiment",
+        "WinRate",
+        "Trades",
+        "Return%",
+        "MaxDD%",
+        "SharpeLike",
+    ]
+    for col in numeric_cols:
+        df_sum[col] = pd.to_numeric(df_sum[col], errors="coerce").fillna(0.0)
 
-    # sort by Probability desc
+    # Sort by Probability descending so strongest conviction floats to top
     df_sum = df_sum.sort_values("Probability", ascending=False).reset_index(drop=True)
+
     return df_sum
 
-def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    For the Backtest tab / Scenario tab:
-      - get data + indicators
-      - run backtest
-      - return df (for chart) and stats dict
-    """
-    symbol = ASSET_SYMBOLS.get(asset, asset)
-
-    df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
-    df_ind = add_indicators(df_raw)
-    back = backtest_signals(df_ind, risk)
-
-    return df_ind, back
 
 def load_asset_with_indicators(asset: str, interval_key: str, use_cache: bool = True) -> Tuple[str, pd.DataFrame]:
     """
-    For per-asset charting in Streamlit tabs.
-    Returns (symbol, df_with_indicators).
+    Returns (symbol, df_with_indicators) for charting / price panel in the Asset Analysis tab.
     """
     symbol = ASSET_SYMBOLS.get(asset, asset)
     df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
     df_ind = add_indicators(df_raw)
     return symbol, df_ind
 
+
 def asset_prediction_single(asset: str, interval_key: str, risk: str, use_cache: bool = True) -> Dict[str, Any]:
     """
-    For 'Asset Analysis' tab: just produce latest signal dict.
+    Used in the "Asset Analysis" tab.
+    Produces latest side/prob/sentiment/tp/sl/rr for ONE named asset (e.g. "Gold").
     """
     symbol = ASSET_SYMBOLS.get(asset, asset)
     df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
     df_ind = add_indicators(df_raw)
     back = backtest_signals(df_ind, risk)
-    pred = _latest_prediction(symbol, interval_key, risk, recent_winrate=back["winrate"], use_cache=use_cache)
+
+    pred = _latest_prediction(
+        symbol=symbol,
+        interval_key=interval_key,
+        risk=risk,
+        recent_winrate=back["winrate"],
+        use_cache=use_cache,
+    )
     return pred
 
+
+def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str, use_cache: bool = True) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Used in the "Backtest & Performance" tab.
+    Returns:
+      df_ind (with indicators for chart / candlesticks)
+      stats  (winrate/trades/return/maxdd/sharpe-like)
+    """
+    symbol = ASSET_SYMBOLS.get(asset, asset)
+    df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
+    df_ind = add_indicators(df_raw)
+    stats = backtest_signals(df_ind, risk)
+    return df_ind, stats
+
 # ======================================================================================
-# DEBUG / DIAGNOSTICS HELPERS
+# DEBUGGING / DIAGNOSTIC HELPERS
 # ======================================================================================
 
 def debug_signal_breakdown(symbol: str, interval_key: str, risk: str = "Medium", use_cache: bool = True) -> Dict[str, Any]:
     """
-    Returns raw components used in final decision so you can debug accuracy.
-    Not shown in UI by default, but super useful in logs during development.
+    Developer-only breakdown of internal reasoning for a symbol.
+    This is not shown in the UI by default, but we can expose in a hidden "Debug" tab.
+
+    Returns:
+      rule_side / rule_conf
+      ml_prob
+      sentiment
+      fused_prob
+      tp/sl/rr
+      recent backtest stats context
     """
     df_raw = fetch_data(symbol, interval_key, use_cache=use_cache)
-    df = add_indicators(df_raw)
-    if df.empty or len(df) < 3:
+    df_ind = add_indicators(df_raw)
+    if df_ind.empty or len(df_ind) < 3:
         return {"error": "not enough data"}
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last = df_ind.iloc[-1]
+    prev = df_ind.iloc[-2]
 
     rule_side, rule_conf = compute_signal_row(prev, last)
     sent_score = _fetch_sentiment(symbol)
 
-    model = _train_ml_model(symbol, interval_key, df)
-    feats_all = _extract_ml_features(df)
+    model = _train_ml_model(symbol, interval_key, df_ind)
+    feats_all = _extract_ml_features(df_ind)
     row_feat = feats_all.iloc[-1]
     ml_prob = _ml_predict_prob(model, row_feat)
 
-    atr_now = _safe_float(last["atr"], _safe_float(last["Close"]) * 0.005)
-    price_now = _safe_float(last["Close"])
+    # backtest stats to understand regime performance
+    back = backtest_signals(df_ind, risk)
+
+    atr_now = _safe_float(last.get("atr"), _safe_float(last.get("Close"), 1.0) * 0.005)
+    price_now = _safe_float(last.get("Close"), 0.0)
     tp, sl = _compute_tp_sl(price_now, atr_now, rule_side, risk)
     rr = _calc_rr(price_now, tp, sl, rule_side)
 
-    # backtest snapshot for dynamic weighting
-    back = backtest_signals(df, risk)
     fused_prob = _fuse_prob(
         rule_prob=rule_conf,
         ml_prob=ml_prob,
         sentiment_score=sent_score,
-        adx_val=_safe_float(last["adx"], 0.0),
-        atr_pct=_safe_float(last["atr_rel"], 0.0),
+        adx_val=_safe_float(last.get("adx"), 0.0),
+        atr_pct=_safe_float(last.get("atr_rel"), 0.0),
         recent_winrate=back["winrate"],
     )
 
@@ -1141,9 +1391,11 @@ def debug_signal_breakdown(symbol: str, interval_key: str, risk: str = "Medium",
         "tp": tp,
         "sl": sl,
         "rr": rr,
-        "winrate_context": back["winrate"],
-        "maxdd_context": back["maxdd"],
-        "trades_context": back["trades"],
+        "recent_winrate": back["winrate"],
+        "recent_trades": back["trades"],
+        "recent_return": back["return"],
+        "recent_maxdd": back["maxdd"],
+        "recent_sharpe": back["sharpe"],
     }
 
 # ======================================================================================
@@ -1151,39 +1403,60 @@ def debug_signal_breakdown(symbol: str, interval_key: str, risk: str = "Medium",
 # ======================================================================================
 
 if __name__ == "__main__":
-    # Basic smoke test when running utils.py directly
+    """
+    Run `python utils.py` directly for a sanity check outside Streamlit.
+
+    This block:
+      - Fetches data for Gold on 1h
+      - Builds indicators
+      - Runs backtest_signals
+      - Generates prediction
+      - Summarizes all assets
+      - Prints debug breakdown
+    """
     test_symbol = "GC=F"
     test_interval = "1h"
     test_risk = "Medium"
 
-    _log("🔍 Self-test starting...")
-    df_test_raw = fetch_data(test_symbol, test_interval, use_cache=True)
-    _log(f"Fetched rows: {len(df_test_raw)}")
+    _log("🔍 Self-test starting (Smart v7.1)...")
 
-    df_test_ind = add_indicators(df_test_raw)
-    _log(f"With indicators rows: {len(df_test_ind)}")
-
-    bt_stats = backtest_signals(df_test_ind, test_risk)
-    _log(f"Backtest stats: {bt_stats}")
-
-    pred_info = _latest_prediction(
-        symbol=test_symbol,
-        interval_key=test_interval,
-        risk=test_risk,
-        recent_winrate=bt_stats["winrate"],
-        use_cache=True,
-    )
-    _log(f"Latest prediction: {json.dumps(pred_info, indent=2)}")
-
-    sum_df = summarize_assets(test_interval, test_risk, use_cache=True)
-    _log("Summary DF:")
     try:
-        _log(sum_df.to_string())
-    except Exception:
-        _log(str(sum_df))
+        df_test_raw = fetch_data(test_symbol, test_interval, use_cache=True)
+        _log(f"[SelfTest] fetched rows: {len(df_test_raw)}")
 
-    dbg = debug_signal_breakdown(test_symbol, test_interval, test_risk)
-    _log("Debug breakdown:")
-    _log(json.dumps(dbg, indent=2))
+        df_test_ind = add_indicators(df_test_raw)
+        _log(f"[SelfTest] with indicators rows: {len(df_test_ind)}")
 
-    _log("✅ utils.py Smart v7 full test complete.")
+        bt_stats = backtest_signals(df_test_ind, test_risk)
+        _log(f"[SelfTest] backtest stats: {bt_stats}")
+
+        pred_info = _latest_prediction(
+            symbol=test_symbol,
+            interval_key=test_interval,
+            risk=test_risk,
+            recent_winrate=bt_stats["winrate"],
+            use_cache=True,
+        )
+        _log("[SelfTest] latest prediction:")
+        _log(json.dumps(pred_info, indent=2))
+
+        sum_df = summarize_assets(test_interval, test_risk, use_cache=True)
+        _log("[SelfTest] Summary DF (head):")
+        try:
+            _log(sum_df.head().to_string())
+        except Exception:
+            _log(str(sum_df))
+
+        dbg = debug_signal_breakdown(test_symbol, test_interval, test_risk)
+        _log("[SelfTest] Debug breakdown:")
+        _log(json.dumps(dbg, indent=2))
+
+        _log("✅ utils.py Smart v7.1 self-test complete.")
+    except Exception as e:
+        _log("❌ Self-test failed!")
+        _log(str(e))
+        traceback.print_exc()
+
+# ======================================================================================
+# END OF FILE
+# ======================================================================================
