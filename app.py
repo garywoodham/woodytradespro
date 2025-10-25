@@ -1,4 +1,4 @@
-# app_v7_2.py - Woody Trades Pro dashboard (smart v7.2)
+# app_v7_2.py - Woody Trades Pro dashboard (smart v7.2 fixed)
 # Streamlit UI layer for utils_v7_2.py
 # Adds candlestick Buy/Sell markers using rule-engine signals
 
@@ -137,7 +137,7 @@ try:
         wr = pred_block.get("win_rate") or pred_block.get("winrate") or 0.0
         colC.metric(
             label="Win Rate (backtest)",
-            value=f\"{wr:.2f}%\",
+            value=f"{wr:.2f}%",
             help="Relaxed horizon backtest win %, weekend-safe synthetic trade if quiet.",
         )
 
@@ -154,16 +154,16 @@ try:
         tp_val = pred_block.get("tp")
         sl_val = pred_block.get("sl")
         rr_val = pred_block.get("rr")
-        colE.metric("TP", f\"{tp_val:.4f}\" if tp_val else "â")
-        colF.metric("SL", f\"{sl_val:.4f}\" if sl_val else "â")
-        colG.metric("R/R", f\"{rr_val:.2f}\" if rr_val else "â")
+        colE.metric("TP", f"{tp_val:.4f}" if tp_val else "â")
+        colF.metric("SL", f"{sl_val:.4f}" if sl_val else "â")
+        colG.metric("R/R", f"{rr_val:.2f}" if rr_val else "â")
 
         sent_val = pred_block.get("sentiment", None)
         if sent_val is None:
             sent_val = pred_block.get("Sentiment", None)
         colH.metric(
             "Sentiment",
-            f\"{sent_val:.2f}\" if sent_val is not None else "â",
+            f"{sent_val:.2f}" if sent_val is not None else "â",
             help="Stub sentiment: higher = more bullish tone.",
         )
 
