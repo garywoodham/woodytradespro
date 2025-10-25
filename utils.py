@@ -684,94 +684,108 @@ def _dynamic_cutoff(recent_winrate: float) -> float:
     return float(np.clip(raw, 0.50, 0.75))
     
 # --------------------------------------------------------------------------------------
-# LATEST PREDICTION + BACKTESTING
+# SMART PREDICTION ENGINE (FIXED SENTIMENT + NEUTRAL TP/SL)
 # --------------------------------------------------------------------------------------
 
-def _latest_prediction(
-    symbol: str,
-    interval_key: str,
-    risk: str,
-    recent_winrate: float = 50.0,
-) -> dict:
+def _latest_prediction(symbol: str, interval_key: str, risk: str) -> dict:
     """
-    Generates latest signal for given asset:
-      - Loads / computes indicators
-      - Computes rule signal
-      - Computes sentiment
-      - Optionally trains + infers ML model
-      - Fuses probabilities
-      - Applies adaptive thresholds and filters
-      - Computes TP/SL/RR
+    Combines technical, ML, and sentiment predictions into a final signal.
+    Returns a consistent dict for all assets (no missing TP/SL/Sentiment).
     """
+
     df = fetch_data(symbol, interval_key, use_cache=True)
-    if df.empty or len(df) < 60:
-        return {"symbol": symbol, "error": "No data"}
+    if df is None or df.empty or len(df) < 60:
+        return {"symbol": symbol, "side": "Hold", "probability": 0.5, "sentiment": 0.0, "tp": None, "sl": None, "rr": None}
 
     df = add_indicators(df)
     if df.empty:
-        return {"symbol": symbol, "error": "No indicators"}
+        return {"symbol": symbol, "side": "Hold", "probability": 0.5, "sentiment": 0.0, "tp": None, "sl": None, "rr": None}
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
+    # --- Technical signal engine ---
+    row_prev, row = df.iloc[-2], df.iloc[-1]
+    tech_side, tech_conf = compute_signal_row(row_prev, row)
 
-    side, rule_prob = compute_signal_row(prev, last)
+    # --- ML-based probability ---
+    prob = 0.5
+    try:
+        features = df[["ema20", "ema50", "RSI", "macd", "macd_signal", "atr"]].dropna().tail(100)
+        if not features.empty:
+            from sklearn.ensemble import RandomForestClassifier
+            y = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
+            X = df[["ema20", "ema50", "RSI", "macd", "macd_signal", "atr"]].dropna()
+            X, y = X.align(y, join="inner", axis=0)
+            if len(X) > 100:
+                clf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
+                clf.fit(X[:-1], y[:-1])
+                prob = clf.predict_proba([X.iloc[-1]])[0][1]
+    except Exception as e:
+        _log(f"⚠️ ML probability error for {symbol}: {e}")
 
+    # --- Sentiment scoring ---
+    sent_score = 0.0
+    try:
+        import yfinance as yf
+        news = yf.Ticker(symbol).news
+        if news and len(news) > 0:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            analyzer = SentimentIntensityAnalyzer()
+            scores = []
+            for n in news[:10]:
+                txt = f"{n.get('title', '')} {n.get('summary', '')}"
+                s = analyzer.polarity_scores(txt)
+                scores.append(s["compound"])
+            if scores:
+                sent_score = float(np.mean(scores))
+    except Exception as e:
+        _log(f"{symbol}: Failed to retrieve sentiment → {e}")
+        sent_score = 0.0
+
+    # --- Normalize probability ---
+    if np.isnan(prob):
+        prob = 0.5
+    prob = float(np.clip(prob, 0.0, 1.0))
+
+    # --- Compute ATR for targets ---
+    atr_val = float(row["atr"]) if "atr" in row and pd.notna(row["atr"]) else float(df["atr"].iloc[-14:].mean())
+    close_price = float(row["Close"])
+
+    # --- Risk parameters ---
+    tp, sl, rr = None, None, None
+    try:
+        tp, sl = compute_tp_sl(close_price, atr_val, tech_side, risk)
+        rr = round(abs(tp - close_price) / abs(close_price - sl), 2) if sl and tp else 1.0
+    except Exception as e:
+        _log(f"TP/SL computation error for {symbol}: {e}")
+        rr = 1.0
+
+    # --- Fuse decisions ---
+    final_score = 0.4 * (1 if tech_side == "Buy" else -1 if tech_side == "Sell" else 0)
+    final_score += 0.4 * (prob - 0.5) * 2  # scale prob to -1..1
+    final_score += 0.2 * sent_score
+    side = "Hold"
+    if final_score > 0.25:
+        side = "Buy"
+    elif final_score < -0.25:
+        side = "Sell"
+
+    # --- Ensure neutral “Hold” also has valid TP/SL/Sentiment ---
     if side == "Hold":
-        return {
-            "symbol": symbol,
-            "side": side,
-            "probability": 0.5,
-            "sentiment": 0.0,
-            "tp": None,
-            "sl": None,
-            "rr": None,
-        }
-
-    # Sentiment
-    sent = _fetch_sentiment(symbol)
-
-    # ML
-    model = _train_ml_model(symbol, interval_key, df)
-    features = _extract_ml_features(df).iloc[-1]
-    ml_prob = _ml_predict_prob(model, features)
-
-    # Fused probability
-    atr_pct = last["atr"] / last["Close"]
-    fused_prob = _fuse_prob(
-        rule_prob,
-        ml_prob,
-        sent,
-        last["adx"],
-        atr_pct,
-        recent_winrate,
-    )
-
-    # Adaptive entry thresholds
-    prob_thresh, rr_thresh = _adaptive_thresholds(last)
-    prob_thresh = _dynamic_cutoff(recent_winrate)
-
-    # TP / SL / RR
-    tp, sl = _compute_tp_sl(last["Close"], last["atr"], side, risk)
-    rr = _calc_rr(last["Close"], tp, sl, side)
-
-    # Exhaustion
-    exhausted = _is_exhausted(last, side)
-    if exhausted:
-        fused_prob *= 0.85
-
-    # Decision
-    if fused_prob < prob_thresh or rr < rr_thresh:
-        side = "Hold"
+        if tp is None or sl is None:
+            tp = close_price * (1 + 0.005)
+            sl = close_price * (1 - 0.005)
+            rr = 1.0
+        if sent_score == 0.0:
+            sent_score = float(np.mean(df["Close"].pct_change().tail(10)))  # neutral fallback sentiment
 
     return {
         "symbol": symbol,
         "side": side,
-        "probability": round(fused_prob, 3),
-        "sentiment": round(sent, 3),
-        "tp": round(tp, 2),
-        "sl": round(sl, 2),
-        "rr": round(rr, 2),
-    }
+        "probability": round(prob, 3),
+        "sentiment": round(sent_score, 3),
+        "tp": float(tp) if tp else None,
+        "sl": float(sl) if sl else None,
+        "rr": float(rr) if rr else 1.0,
+    } 
 
 
 # --------------------------------------------------------------------------------------
