@@ -11,7 +11,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from utils_v7_2 import (
+from utils import (
     summarize_assets,
     asset_prediction_and_backtest,
     load_asset_with_indicators,
