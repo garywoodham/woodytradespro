@@ -952,12 +952,15 @@ def asset_prediction_and_backtest(asset: str, interval_key: str, risk: str) -> T
     return df, back
 
 
-def load_asset_with_indicators(asset: str, interval_key: str) -> pd.DataFrame:
+def load_asset_with_indicators(asset: str, interval_key: str) -> Tuple[str, pd.DataFrame]:
     """
     Streamlit wrapper to load asset fully prepped with indicators.
+    Returns both symbol and DataFrame.
     """
     symbol = ASSET_SYMBOLS.get(asset, asset)
-    return add_indicators(fetch_data(symbol, interval_key, use_cache=True))
+    df = fetch_data(symbol, interval_key, use_cache=True)
+    df = add_indicators(df)
+    return symbol, df
 
 
 def asset_prediction_single(asset: str, interval_key: str, risk: str) -> dict:
