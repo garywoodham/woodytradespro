@@ -1,155 +1,235 @@
+# ======================================================================================
+# app.py — Smart v7 dashboard (Market Summary + Asset Analysis + Backtest)
+# ======================================================================================
+
+import os
+import traceback
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import traceback
+from datetime import datetime
+
+# --------------------------------------------------------------------------------------
+# ENVIRONMENT / WATCHER FIX
+# --------------------------------------------------------------------------------------
+# Prevent inotify watch-limit crash
+os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
+
+# Streamlit deprecation suppressions
+st.set_option("deprecation.showPyplotGlobalUse", False)
+st.set_page_config(page_title="Woody Trades Pro - Smart v7", layout="wide")
+
+# --------------------------------------------------------------------------------------
+# IMPORT UTILS
+# --------------------------------------------------------------------------------------
 from utils import (
     summarize_assets,
+    asset_prediction_single,
     asset_prediction_and_backtest,
     load_asset_with_indicators,
-    asset_prediction_single,
 )
-
-# --------------------------------------------------------------------------------------
-# PAGE CONFIG
-# --------------------------------------------------------------------------------------
-st.set_page_config(
-    page_title="WoodyTrades Pro",
-    page_icon="💹",
-    layout="wide"
-)
-
-st.title("💹 WoodyTrades Pro — Smart v6.3")
-st.markdown("### Adaptive ML & Sentiment-based Forecasting Dashboard")
 
 # --------------------------------------------------------------------------------------
 # SIDEBAR SETTINGS
 # --------------------------------------------------------------------------------------
-st.sidebar.header("⚙️ Configuration")
+st.sidebar.header("⚙️ Settings")
 
 interval_key = st.sidebar.selectbox(
-    "Interval",
-    options=["15m", "1h", "4h", "1d", "1wk"],
+    "Select timeframe",
+    options=["15m", "1h", "4h", "1d"],
     index=1,
-    key="interval_select"
+    key="interval_selectbox",
 )
 
-risk = st.sidebar.selectbox(
-    "Risk Level",
+risk_level = st.sidebar.selectbox(
+    "Select risk level",
     options=["Low", "Medium", "High"],
     index=1,
-    key="risk_select"
+    key="risk_selectbox",
 )
 
-tabs = st.tabs(["📊 Market Summary", "📈 Asset Analysis", "🧪 Backtest"])
+refresh_button = st.sidebar.button("🔄 Refresh Data", key="refresh_button")
 
 # --------------------------------------------------------------------------------------
-# TAB 1 — MARKET SUMMARY
+# MAIN TITLE
 # --------------------------------------------------------------------------------------
+st.title("📈 Woody Trades Pro — Smart v7 AI Market Dashboard")
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Interval: {interval_key} | Risk: {risk_level}")
+
+# --------------------------------------------------------------------------------------
+# TAB SETUP
+# --------------------------------------------------------------------------------------
+tabs = st.tabs([
+    "🌍 Market Summary",
+    "🔍 Asset Analysis",
+    "📊 Backtest & Performance"
+])
+
+# ======================================================================================
+# 🌍 TAB 1 — MARKET SUMMARY
+# ======================================================================================
 with tabs[0]:
-    st.subheader("📊 Market Overview")
-
-    @st.cache_data(show_spinner=True)
-    def load_summary(interval_key, risk):
-        return summarize_assets(interval_key, risk, use_cache=True)
+    st.subheader("🌍 Market Summary (Smart v7)")
 
     try:
-        df_summary = load_summary(interval_key, risk)
-        if isinstance(df_summary, pd.DataFrame) and not df_summary.empty:
-            st.dataframe(df_summary, width="stretch")
+        with st.spinner("Fetching and analyzing market data (smart v7)..."):
+            df_summary = summarize_assets(interval_key, risk_level, use_cache=not refresh_button)
+
+        if df_summary is not None and not df_summary.empty:
+            st.dataframe(
+                df_summary,
+                width='stretch',
+                hide_index=True,
+                use_container_width=False,
+            )
+
+            # Plot Probability vs Sentiment
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df_summary["Sentiment"],
+                y=df_summary["Probability"],
+                mode="markers+text",
+                text=df_summary["Asset"],
+                textposition="top center",
+            ))
+            fig.update_layout(
+                title="Market Sentiment vs Probability",
+                xaxis_title="Sentiment",
+                yaxis_title="Probability",
+                template="plotly_dark",
+                height=500,
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.warning("⚠️ No summary data available. Please retry.")
+            st.warning("No market summary data available.")
+
     except Exception as e:
         st.error(f"Error loading summary: {e}")
-        st.text(traceback.format_exc())
+        st.code(traceback.format_exc())
 
-# --------------------------------------------------------------------------------------
-# TAB 2 — ASSET ANALYSIS
-# --------------------------------------------------------------------------------------
+# ======================================================================================
+# 🔍 TAB 2 — ASSET ANALYSIS
+# ======================================================================================
 with tabs[1]:
-    st.subheader("📈 Asset Prediction and Analysis")
+    st.subheader("🔍 Asset Analysis")
 
     asset = st.selectbox(
-        "Select Asset",
+        "Choose Asset:",
+        list(df_summary["Asset"]) if 'df_summary' in locals() and not df_summary.empty else
         ["Gold", "NASDAQ 100", "S&P 500", "EUR/USD", "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"],
-        key="asset_select"
+        key="asset_selectbox",
     )
 
-    if st.button("🔍 Analyze Asset"):
-        with st.spinner(f"Analyzing {asset}..."):
-            try:
-                pred = asset_prediction_single(asset, interval_key, risk)
-                if pred and isinstance(pred, dict):
-                    st.write("### Signal Summary")
-                    st.json(pred)
+    if asset:
+        try:
+            with st.spinner(f"Analyzing {asset} ..."):
+                symbol, df = load_asset_with_indicators(asset, interval_key)
+                result = asset_prediction_single(asset, interval_key, risk_level)
 
-                    symbol, df = load_asset_with_indicators(asset, interval_key)
-                    if not df.empty:
-                        fig = go.Figure()
-                        fig.add_trace(go.Candlestick(
-                            x=df.index,
-                            open=df["Open"], high=df["High"],
-                            low=df["Low"], close=df["Close"],
-                            name="Price"
-                        ))
-                        fig.update_layout(
-                            title=f"{asset} ({symbol}) — {interval_key} Chart",
-                            xaxis_title="Date",
-                            yaxis_title="Price",
-                            width=1200, height=600,
-                            template="plotly_dark"
-                        )
-                        st.plotly_chart(fig, config={"responsive": True})
-                    else:
-                        st.warning("⚠️ No chart data available.")
+            if isinstance(result, dict):
+                st.markdown(f"### {asset} ({symbol}) — Current Signal")
+
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Side", result.get("side", "Hold"))
+                c2.metric("Probability", f"{result.get('probability', 0.0):.2f}")
+                c3.metric("Sentiment", f"{result.get('sentiment', 0.0):.2f}")
+                c4.metric("TP", f"{result.get('tp', 0.0):,.2f}")
+                c5.metric("SL", f"{result.get('sl', 0.0):,.2f}")
+                c6.metric("RR", f"{result.get('rr', 0.0):.2f}")
+
+                # Chart
+                if not df.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Candlestick(
+                        x=df.index,
+                        open=df["Open"],
+                        high=df["High"],
+                        low=df["Low"],
+                        close=df["Close"],
+                        name="Price",
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=df.index,
+                        y=df["ema20"],
+                        line=dict(width=1.5),
+                        name="EMA20",
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=df.index,
+                        y=df["ema50"],
+                        line=dict(width=1.5),
+                        name="EMA50",
+                    ))
+                    fig.update_layout(
+                        title=f"{asset} Price & EMA Overview",
+                        template="plotly_dark",
+                        height=600,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 else:
-                    st.warning("⚠️ Could not generate prediction.")
-            except Exception as e:
-                st.error(f"Error analyzing asset: {e}")
-                st.text(traceback.format_exc())
+                    st.warning("No chart data available.")
 
-# --------------------------------------------------------------------------------------
-# TAB 3 — BACKTEST
-# --------------------------------------------------------------------------------------
+        except Exception as e:
+            st.error(f"Error analyzing asset: {e}")
+            st.code(traceback.format_exc())
+
+# ======================================================================================
+# 📊 TAB 3 — BACKTEST
+# ======================================================================================
 with tabs[2]:
-    st.subheader("🧪 Backtest Results")
+    st.subheader("📊 Strategy Backtest & Performance")
 
     asset_bt = st.selectbox(
-        "Select Asset for Backtest",
+        "Select asset for backtest:",
+        list(df_summary["Asset"]) if 'df_summary' in locals() and not df_summary.empty else
         ["Gold", "NASDAQ 100", "S&P 500", "EUR/USD", "GBP/USD", "USD/JPY", "Crude Oil", "Bitcoin"],
-        key="bt_asset_select"
+        key="asset_backtest_selectbox",
     )
 
-    if st.button("▶ Run Backtest"):
-        with st.spinner(f"Running backtest for {asset_bt}..."):
-            try:
-                df_bt, stats = asset_prediction_and_backtest(asset_bt, interval_key, risk)
-                if isinstance(df_bt, pd.DataFrame) and not df_bt.empty:
-                    st.write("### Backtest Metrics")
-                    st.json(stats)
+    if asset_bt:
+        try:
+            with st.spinner(f"Running backtest for {asset_bt}..."):
+                df_bt, stats = asset_prediction_and_backtest(asset_bt, interval_key, risk_level)
 
-                    fig_bt = go.Figure()
-                    fig_bt.add_trace(go.Scatter(
-                        x=df_bt.index,
-                        y=df_bt["Close"],
-                        mode="lines",
-                        name="Price"
-                    ))
-                    fig_bt.update_layout(
-                        title=f"{asset_bt} ({interval_key}) — Backtest Price Curve",
-                        xaxis_title="Date",
-                        yaxis_title="Price",
-                        width=1200, height=600,
-                        template="plotly_dark"
-                    )
-                    st.plotly_chart(fig_bt, config={"responsive": True})
-                else:
-                    st.warning("⚠️ No backtest data available.")
-            except Exception as e:
-                st.error(f"Error during backtest: {e}")
-                st.text(traceback.format_exc())
+            if stats:
+                st.markdown("### 📈 Backtest Results")
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Win Rate", f"{stats.get('winrate', 0.0):.1f}%")
+                col2.metric("Trades", f"{stats.get('trades', 0)}")
+                col3.metric("Return", f"{stats.get('return', 0.0):.2f}%")
+                col4.metric("MaxDD", f"{stats.get('maxdd', 0.0):.2f}%")
+                col5.metric("Sharpe-like", f"{stats.get('sharpe', 0.0):.2f}")
 
-# --------------------------------------------------------------------------------------
+            # Draw price + EMA chart
+            if df_bt is not None and not df_bt.empty:
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Candlestick(
+                    x=df_bt.index,
+                    open=df_bt["Open"],
+                    high=df_bt["High"],
+                    low=df_bt["Low"],
+                    close=df_bt["Close"],
+                    name="Price",
+                ))
+                if "ema20" in df_bt.columns:
+                    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt["ema20"], name="EMA20"))
+                if "ema50" in df_bt.columns:
+                    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt["ema50"], name="EMA50"))
+                fig_bt.update_layout(
+                    title=f"{asset_bt} Price + EMA Backtest View",
+                    template="plotly_dark",
+                    height=600,
+                )
+                st.plotly_chart(fig_bt, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.warning("No backtest data available.")
+
+        except Exception as e:
+            st.error(f"Error during backtest: {e}")
+            st.code(traceback.format_exc())
+
+# ======================================================================================
 # FOOTER
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 st.markdown("---")
-st.caption("© 2025 WoodyTrades Pro — AI-enhanced Forecasting Engine (Smart v6.3)")
+st.caption("© 2025 Woody Trades Pro | Smart v7 AI system — all analytics, no guarantees.")
