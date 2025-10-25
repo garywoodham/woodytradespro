@@ -1,5 +1,6 @@
-# app.py - Woody Trades Pro dashboard
-# Streamlit UI layer for utils.py (smart v7+)
+# app_v7_2.py - Woody Trades Pro dashboard (smart v7.2)
+# Streamlit UI layer for utils_v7_2.py
+# Adds candlestick Buy/Sell markers using rule-engine signals
 
 import os
 import traceback
@@ -10,7 +11,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-from utils import (
+from utils_v7_2 import (
     summarize_assets,
     asset_prediction_and_backtest,
     load_asset_with_indicators,
@@ -25,7 +26,7 @@ os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
 
 # General Streamlit config
 st.set_page_config(
-    page_title="Woody Trades Pro - Smart v7",
+    page_title="Woody Trades Pro - Smart v7.2",
     layout="wide"
 )
 
@@ -61,11 +62,11 @@ asset_choice = st.sidebar.selectbox(
     help="Used in the Detailed / Scenarios sections below.",
 )
 
-st.sidebar.caption("v7 engine: blended signal, ATR TP/SL, relaxed backtest")
+st.sidebar.caption("v7.2 engine: blended signal, ATR TP/SL, relaxed backtest, weekend-safe, marker overlay")
 
 
 # ---------------------------------------------------------------------
-# Cached loaders inside app layer (so we don't refetch every rerun)
+# Cached loaders inside app layer
 # ---------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
@@ -78,6 +79,7 @@ def load_prediction_and_chart(asset: str, interval_key: str, risk: str):
 
 @st.cache_data(show_spinner=False)
 def load_price_df(asset: str, interval_key: str):
+    # NEW: returns symbol, df_with_indicators, signal_points
     return load_asset_with_indicators(asset, interval_key, use_cache=True)
 
 
@@ -85,14 +87,13 @@ def load_price_df(asset: str, interval_key: str):
 # 1) MARKET SUMMARY TAB / SECTION
 # ---------------------------------------------------------------------
 
-st.header("📊 Market Summary")
+st.header("ð Market Summary")
 
 try:
     df_summary = load_summary(interval_key, risk)
     if df_summary is None or df_summary.empty:
         st.warning("No summary data available.")
     else:
-        # Show raw dashboard table
         st.dataframe(
             df_summary,
             width="stretch",
@@ -108,7 +109,7 @@ except Exception as e:
 # 2) DETAILED VIEW FOR ONE ASSET
 # ---------------------------------------------------------------------
 
-st.header("🔍 Detailed View")
+st.header("ð Detailed View")
 
 try:
     pred_block, df_asset_ind = load_prediction_and_chart(asset_choice, interval_key, risk)
@@ -124,7 +125,7 @@ try:
             help="Buy / Sell / Hold from rule engine + overrides",
         )
 
-        # Probability
+        # Probability / Confidence
         prob_val = pred_block.get("probability") or pred_block.get("prob") or 0.0
         colB.metric(
             label="Confidence",
@@ -136,8 +137,8 @@ try:
         wr = pred_block.get("win_rate") or pred_block.get("winrate") or 0.0
         colC.metric(
             label="Win Rate (backtest)",
-            value=f"{wr:.2f}%",
-            help="Relaxed horizon backtest win %",
+            value=f\"{wr:.2f}%\",
+            help="Relaxed horizon backtest win %, weekend-safe synthetic trade if quiet.",
         )
 
         # Trades
@@ -153,53 +154,83 @@ try:
         tp_val = pred_block.get("tp")
         sl_val = pred_block.get("sl")
         rr_val = pred_block.get("rr")
-        colE.metric("TP", f"{tp_val:.4f}" if tp_val else "—")
-        colF.metric("SL", f"{sl_val:.4f}" if sl_val else "—")
-        colG.metric("R/R", f"{rr_val:.2f}" if rr_val else "—")
+        colE.metric("TP", f\"{tp_val:.4f}\" if tp_val else "â")
+        colF.metric("SL", f\"{sl_val:.4f}\" if sl_val else "â")
+        colG.metric("R/R", f\"{rr_val:.2f}\" if rr_val else "â")
 
         sent_val = pred_block.get("sentiment", None)
         if sent_val is None:
             sent_val = pred_block.get("Sentiment", None)
         colH.metric(
             "Sentiment",
-            f"{sent_val:.2f}" if sent_val is not None else "—",
+            f\"{sent_val:.2f}\" if sent_val is not None else "â",
             help="Stub sentiment: higher = more bullish tone.",
         )
 
     else:
         st.warning("No prediction block available for this asset.")
 
-    # Price chart
-    if isinstance(df_asset_ind, pd.DataFrame) and not df_asset_ind.empty:
+    # Price chart w/ Buy/Sell markers
+    symbol_for_asset, df_asset_full, sig_pts = load_price_df(asset_choice, interval_key)
+
+    if isinstance(df_asset_full, pd.DataFrame) and not df_asset_full.empty:
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
-            x=df_asset_ind.index,
-            open=df_asset_ind["Open"],
-            high=df_asset_ind["High"],
-            low=df_asset_ind["Low"],
-            close=df_asset_ind["Close"],
+            x=df_asset_full.index,
+            open=df_asset_full["Open"],
+            high=df_asset_full["High"],
+            low=df_asset_full["Low"],
+            close=df_asset_full["Close"],
             name="Price",
         ))
         # overlay EMAs if available
-        if "ema20" in df_asset_ind.columns:
+        if "ema20" in df_asset_full.columns:
             fig.add_trace(go.Scatter(
-                x=df_asset_ind.index,
-                y=df_asset_ind["ema20"],
+                x=df_asset_full.index,
+                y=df_asset_full["ema20"],
                 mode="lines",
                 name="EMA20",
             ))
-        if "ema50" in df_asset_ind.columns:
+        if "ema50" in df_asset_full.columns:
             fig.add_trace(go.Scatter(
-                x=df_asset_ind.index,
-                y=df_asset_ind["ema50"],
+                x=df_asset_full.index,
+                y=df_asset_full["ema50"],
                 mode="lines",
                 name="EMA50",
+            ))
+
+        # overlay Buy markers
+        if sig_pts["buy_times"]:
+            fig.add_trace(go.Scatter(
+                x=sig_pts["buy_times"],
+                y=sig_pts["buy_prices"],
+                mode="markers",
+                name="Buy",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=10,
+                    color="green",
+                ),
+            ))
+
+        # overlay Sell markers
+        if sig_pts["sell_times"]:
+            fig.add_trace(go.Scatter(
+                x=sig_pts["sell_times"],
+                y=sig_pts["sell_prices"],
+                mode="markers",
+                name="Sell",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=10,
+                    color="red",
+                ),
             ))
 
         fig.update_layout(
             margin=dict(l=10,r=10,t=30,b=10),
             height=400,
-            xaxis_title="Time",
+            xaxis_title=f"{asset_choice} ({symbol_for_asset})",
             yaxis_title="Price",
         )
 
@@ -216,19 +247,26 @@ except Exception as e:
 # 3) RAW DATA / DEBUG
 # ---------------------------------------------------------------------
 
-st.header("🛠 Debug / Raw Data")
+st.header("ð  Debug / Raw Data")
 
 with st.expander("Show model input data / indicators / backtest inputs"):
     try:
-        symbol_for_asset, df_asset_full = load_price_df(asset_choice, interval_key)
+        symbol_for_asset, df_asset_full, sig_pts = load_price_df(asset_choice, interval_key)
         st.write(f"Symbol: {symbol_for_asset}")
         st.dataframe(
             df_asset_full.tail(200),
             width="stretch",
         )
+        st.write("Signal markers (most recent 10):")
+        marker_preview = pd.DataFrame({
+            "type": (["BUY"] * len(sig_pts["buy_times"])) + (["SELL"] * len(sig_pts["sell_times"])),
+            "time": sig_pts["buy_times"] + sig_pts["sell_times"],
+            "price": sig_pts["buy_prices"] + sig_pts["sell_prices"],
+        }).sort_values("time").tail(10)
+        st.dataframe(marker_preview, hide_index=True)
     except Exception as e:
         st.error(f"Failed to load raw data: {e}")
         st.code(traceback.format_exc())
 
 
-st.caption("Engine smart v7 • blended rule+ML • relaxed backtest • ATR TP/SL • sentiment stub")
+st.caption("Engine smart v7.2 â¢ blended rule+ML â¢ relaxed backtest â¢ ATR TP/SL â¢ weekend-safe â¢ sentiment stub â¢ chart markers")
