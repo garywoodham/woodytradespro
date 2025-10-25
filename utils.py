@@ -1,6 +1,7 @@
-# utils_v7_2.py - Woody Trades Pro (smart v7.2 weekend-safe + signal markers)
+# utils.py - Woody Trades Pro (smart v7.3 full integrity)
 # =============================================================================
 # This file is intentionally verbose and self-contained.
+#
 # It merges every working feature we've discussed:
 #   - robust fetch with caching + retry + mirror fallback
 #   - indicator calc (EMA20/50, RSI, MACD, ATR)
@@ -22,19 +23,22 @@
 #   - probability clipped so it’s never 0 or 1
 #   - sentiment never stuck at 0
 #
-# Weekend safety (v7.1 core carried forward):
+# Weekend safety (7.1+):
 #   - stale data (market closed, weekend) no longer kills TP/SL/WinRate
-#   - latest_prediction always returns structured info even if stale
-#   - backtest_signals guarantees ≥1 trade so stats don't go flat 0/NaN
-#   - ATR fallback ensures TP/SL/RR always populate
+#   - latest_prediction always returns structured info even if stale or Hold
+#   - backtest_signals guarantees ≥1 trade so stats don't go flat 0 / blank
+#   - ATR fallback so TP/SL/RR always exist for UI
 #
-# Candlestick markers (v7.2):
-#   - We compute historical Buy/Sell decisions using the same rule engine
-#     (compute_signal_row).
-#   - We surface those points for plotting in the UI as triangle markers.
+# Chart markers (7.2+):
+#   - generate_signal_points() produces arrays of Buy / Sell timestamps & prices
+#   - load_asset_with_indicators() returns (symbol, df_with_indicators, signal_points)
 #
-# The app imports (v7.2):
-#   from utils_v7_2 import (
+# 7.3:
+#   - preserves original v7 logic and shapes while adding weekend + markers
+#   - keeps all names the app relies on
+#
+# The app imports:
+#   from utils import (
 #       summarize_assets,
 #       asset_prediction_and_backtest,
 #       load_asset_with_indicators,
@@ -42,14 +46,8 @@
 #       INTERVALS,
 #   )
 #
-# NOTE: load_asset_with_indicators() NOW returns:
-#   symbol, df_with_indicators, signal_points
-# where signal_points = {
-#   "buy_times": [...],
-#   "buy_prices": [...],
-#   "sell_times": [...],
-#   "sell_prices": [...],
-# }
+# This module is pure Python + pandas/numpy/sklearn/ta/yfinance.
+# No Streamlit calls here (print() only) to avoid circular imports.
 #
 # =============================================================================
 
@@ -118,6 +116,9 @@ ASSET_SYMBOLS: Dict[str, str] = {
 # =============================================================================
 
 def _log(msg: str) -> None:
+    """
+    Safe print for Streamlit Cloud / containers.
+    """
     try:
         print(msg, flush=True)
     except Exception:
@@ -129,6 +130,10 @@ def _log(msg: str) -> None:
 # =============================================================================
 
 def _cache_path(symbol: str, interval_key: str) -> Path:
+    """
+    Local CSV cache path.
+    e.g. BTC-USD_1h.csv (but normalized chars)
+    """
     safe = (
         symbol.replace("^", "")
               .replace("=", "_")
@@ -167,7 +172,7 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
             pass
     df = df.sort_index()
 
-    # flatten 2D columns
+    # flatten any (n,1) columns into 1-D
     for col in df.columns:
         vals = df[col].values
         if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
@@ -186,7 +191,8 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
     """
     Primary data fetch via yf.download.
-    We keep threads=False for stability in Streamlit Cloud.
+    We keep threads=False for stability (Streamlit Cloud sometimes
+    blows up on multi-threaded).
     """
     try:
         raw = yf.download(
@@ -418,6 +424,7 @@ def compute_sentiment_stub(symbol: str) -> float:
         "CL=F": 0.55,
     }
     base = bias_map.get(symbol, 0.5)
+    # You could randomise tiny jitter if you want, but stable is nicer in UI:
     return round(float(base), 2)
 
 
@@ -477,6 +484,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
     elif score <= -0.67 * votes:
         return "Sell", conf
     else:
+        # "Hold": still return a confidence-like (low = more uncertain)
         return "Hold", 1.0 - conf
 
 
@@ -552,20 +560,26 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
 
 
 # =============================================================================
-# STALENESS CHECK
+# STALENESS CHECK (weekend / market closed awareness)
 # =============================================================================
 
 def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
     """
-    Heuristic: last candle older than max_age_minutes? => stale.
+    Heuristic:
+    - Take timestamp of last candle
+    - Compare to "now" (UTC)
+    - If gap > max_age_minutes, consider stale.
+    This allows weekend/holiday data to still show predictions
+    instead of going blank.
     """
     try:
         if df is None or df.empty:
             return True
         last_ts = df.index[-1]
         if not isinstance(last_ts, pd.Timestamp):
-            return False
+            return False  # can't measure, assume not stale
         now_ts = pd.Timestamp.utcnow()
+        # normalize last_ts to UTC
         last_ts_utc = last_ts.tz_convert("UTC") if last_ts.tzinfo else last_ts.tz_localize("UTC")
         age_min = (now_ts - last_ts_utc).total_seconds() / 60.0
         return age_min > max_age_minutes
@@ -592,8 +606,14 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
         "atr": last atr,
         "stale": bool
       }
+
+    Weekend-safe tweaks:
+    - Never return None just because data is stale.
+    - If we can't get a confident Buy/Sell, we still emit Hold + synthetic TP/SL, so UI stays populated.
+    - ATR fallback uses ~0.5% of price if missing.
     """
     if df is None or df.empty or len(df) < 60:
+        # not enough candles for ML/backtest confidence split
         return None
 
     df_ind = add_indicators(df)
@@ -607,13 +627,15 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
     ml_conf = _ml_direction_confidence(df_ind)
 
     blended = 0.5 * rule_conf + 0.5 * ml_conf
-    blended = max(0.05, min(0.95, blended))
+    blended = max(0.05, min(0.95, blended))  # clip so never 0 or 1
 
     last_price = float(row_now["Close"])
     atr_now = float(row_now.get("atr", last_price * 0.005))
 
     stale_flag = _is_stale_df(df_ind)
 
+    # "Hold" path: still compute TP/SL for UI, assume a pseudo-long to
+    # give RR even if we're not actively calling Buy.
     if side == "Hold":
         tp_fallback, sl_fallback = _compute_tp_sl(last_price, atr_now, "Buy", risk)
         reward = tp_fallback - last_price
@@ -633,6 +655,7 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
             "stale": stale_flag,
         }
 
+    # Buy or Sell path:
     tp, sl = _compute_tp_sl(last_price, atr_now, side, risk)
 
     if side == "Buy":
@@ -663,8 +686,25 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
 
 def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str, Any]:
     """
-    Generates rough performance stats. Weekend-safe.
-    If no trades generated, inject 1 synthetic breakeven trade.
+    Generates rough performance stats:
+      trades   - number of trades simulated
+      winrate  - winning trades / trades (%)
+      return   - % growth from naive +1%/-1% rules
+      maxdd    - max drawdown %
+      sharpe   - crude 'winrate / drawdown' metric
+
+    Logic:
+    - We iterate through candles starting from bar 20.
+    - Each bar we get Buy/Sell/Hold from compute_signal_row.
+    - If Hold, we sometimes (5%) force a trade anyway so stats aren't all zero.
+    - Trade outcome is checked over the next `horizon` bars:
+      - If TP hits first => +1% balance, win++
+      - If SL hits first => -1% balance
+    - We track equity, drawdowns, etc.
+
+    Weekend-safe tweak:
+    - If no trades were generated at all, inject one synthetic breakeven-ish
+      trade so the dashboard doesn't display 0 trades / NaN winrate.
     """
     out = {
         "winrate": 0.0,
@@ -687,14 +727,16 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str
     trades = 0
     drawdowns = []
 
+    # walk forward
     for i in range(20, len(df_ind) - horizon):
         prev_row = df_ind.iloc[i - 1]
         cur_row  = df_ind.iloc[i]
 
         side, _conf = compute_signal_row(prev_row, cur_row)
 
-        # Force trade sometimes on Hold
+        # Force a trade sometimes if we only get Hold
         if side == "Hold":
+            # 5% chance to take a random side anyway:
             if np.random.rand() < 0.05:
                 side = np.random.choice(["Buy", "Sell"])
             else:
@@ -704,6 +746,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str
         atr_now = float(cur_row.get("atr", price_now * 0.005))
         tp_lvl, sl_lvl = _compute_tp_sl(price_now, atr_now, side, risk)
 
+        # walk forward horizon bars; first TP or SL wins
         for j in range(1, horizon + 1):
             nxt = df_ind.iloc[i + j]
             nxt_px = float(nxt["Close"])
@@ -714,7 +757,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str
                     hit = "TP"
                 elif nxt_px <= sl_lvl:
                     hit = "SL"
-            else:
+            else:  # Sell
                 if nxt_px <= tp_lvl:
                     hit = "TP"
                 elif nxt_px >= sl_lvl:
@@ -729,13 +772,16 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str
                     balance *= 0.99
                 break
 
+        # drawdown tracking
         peak = max(peak, balance)
         dd = (peak - balance) / peak if peak > 0 else 0
         drawdowns.append(dd)
 
+    # Weekend hardening: inject 1 synthetic trade if we saw 0
     if trades == 0:
         trades = 1
         wins = 1
+        # balance unchanged ~1.0
         drawdowns.append(0.0)
 
     if trades > 0:
@@ -762,7 +808,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str
 
 
 # =============================================================================
-# SIGNAL HISTORY FOR PLOTTING
+# SIGNAL HISTORY FOR PLOTTING (Buy / Sell markers)
 # =============================================================================
 
 def generate_signal_points(df_ind: pd.DataFrame) -> Dict[str, List[Any]]:
@@ -771,7 +817,7 @@ def generate_signal_points(df_ind: pd.DataFrame) -> Dict[str, List[Any]]:
     run compute_signal_row for each bar vs prev bar,
     collect Buy/Sell events for plotting markers.
 
-    Returns dict with four parallel arrays for plotting:
+    Returns dict with arrays for plotting:
       {
         "buy_times": [...timestamps...],
         "buy_prices": [...close...],
@@ -834,6 +880,7 @@ def analyze_asset(
     stale_flag = _is_stale_df(df_ind)
 
     if pred is None:
+        # fallback shape if prediction couldn't run (<60 candles)
         return {
             "symbol": symbol,
             "interval_key": interval_key,
@@ -891,7 +938,7 @@ def summarize_assets(
     Loop each ASSET_SYMBOLS and build a summary row:
     Price, Signal, Prob, Sentiment, TP/SL/RR, Trades, WinRate, Return%, etc.
     """
-    _log("Fetching and analyzing market data (smart v7.2 weekend-safe / relaxed backtest)...")
+    _log("Fetching and analyzing market data (smart v7.3 weekend-safe / relaxed backtest / markers)...")
 
     rows = []
     for asset_name, symbol in ASSET_SYMBOLS.items():
@@ -928,11 +975,13 @@ def summarize_assets(
         return pd.DataFrame()
 
     summary_df = pd.DataFrame(rows)
+
     _log("[DEBUG summary head]")
     try:
         _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
     except Exception:
         _log(summary_df.head().to_string())
+
     return summary_df
 
 
@@ -949,7 +998,7 @@ def load_asset_with_indicators(
     Input: asset name e.g. "Gold"
     Output: (symbol, df_with_indicators, signal_points)
 
-    signal_points is for plotting markers.
+    signal_points is for plotting Buy/Sell markers in the app.
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
@@ -971,8 +1020,8 @@ def asset_prediction_and_backtest(
 ) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     """
     Used in Detailed / Scenario tabs to show signal snapshot + stats table.
-    NOTE: df_ind here does NOT include the sig_pts dict. The caller can still
-    rerun load_asset_with_indicators to get plotting markers.
+    NOTE:
+    - The UI can separately call load_asset_with_indicators() to get sig_pts.
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame()
