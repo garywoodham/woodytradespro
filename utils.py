@@ -1564,3 +1564,4 @@ def summarize_assets(interval_key: str="1h", risk: str="Medium", use_cache: bool
     summary_df=pd.DataFrame(rows)
     summary_df.sort_values("Asset", inplace=True, ignore_index=True)
     return summary_df
+    
