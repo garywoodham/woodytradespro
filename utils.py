@@ -1,41 +1,45 @@
-# utils.py - Woody Trades Pro (smart v7.8.2 Regime Adaptive + Dynamic TP/SL + Adaptive Horizon)
+# utils.py - Woody Trades Pro (smart v7.9 Calibrated Confidence + EV/PF + Dynamic TP/SL)
 # =============================================================================
-# This module extends v7.8.1 with:
-#   - Dynamic, decoupled TP/SL sizing per trade (_compute_tp_sl_regime_dynamic)
-#       TP scales with trend strength (ADX + EMA slope)
-#       SL scales with realized volatility (ATR%)
-#   - Confidence-adaptive holding horizon in backtest
+# This version extends v7.8.3 with per-asset calibrated confidence:
 #
-# ALL PRIOR FUNCTIONALITY FROM v7.8.1 IS PRESERVED:
-#   - robust fetch with caching + retry + mirror fallback
-#   - indicator calc (EMA20/50, RSI, RSI quantile bands, MACD, ATR, atr_pct, ADX,
-#     engineered features like ema_diff, macd_slope, ema50_slope)
-#   - regime classification (trend_regime, range_regime)
-#   - higher timeframe confirmation (multi-timeframe bias)
-#   - ML ensemble with regime features and recent winrate hint
-#   - adaptive confidence blending (rule vs ML, weighted by recent winrate)
-#   - ensemble backtest, winrate_std, stale/weekend safety
-#   - sentiment stub
-#   - dynamic filter_level (Loose / Balanced / Strict) that adjusts:
-#       ADX_MIN_TREND
-#       VOL_REGIME_MIN_ATR_PCT
-#       CONF_EXEC_THRESHOLD
-#   - signal markers for chart Buy/Sell points
+# NEW IN v7.9
+#   - _apply_ml_calibration_to_prob(): adjusts ML probs using calibration cache.
+#   - _blend_confidence_calibrated(): adaptive weighting of rule vs ML based on
+#     recent asset performance and calibration history.
+#   - latest_prediction() now returns:
+#         "probability_raw" (pre-calibration blended)
+#         "probability_calibrated" (post-calibration)
+#         "probability" (alias = calibrated, for backward compatibility)
+#   - summarize_assets() / analyze_asset() / asset_prediction_and_backtest()
+#     all surface calibrated probability in the same "Probability" field.
 #
-# PUBLIC INTERFACES KEPT THE SAME (signatures maintained / superset):
-#   summarize_assets(...)
-#   analyze_asset(...)
-#   asset_prediction_and_backtest(...)
-#   load_asset_with_indicators(...)
-#   backtest_signals(...)
-#   ASSET_SYMBOLS
-#   INTERVALS
+# RETAINED FROM v7.8.3:
+#   - robust fetch/cache/mirror
+#   - indicators: EMA20/50, RSI (+quantiles), MACD, ATR, ATR%, ADX, slopes
+#   - regime classification (trend_regime / range_regime)
+#   - higher timeframe confirmation
+#   - dynamic TP/SL (trend strength vs vol)
+#   - adaptive holding horizon in backtest
+#   - EV% & ProfitFactor in backtest
+#   - per-asset calibration cache & threshold biasing
+#   - dynamic filter_level thresholds (Loose/Balanced/Strict)
+#   - stale data handling, forced trades, sentiment stub
+#   - candlestick Buy/Sell markers
+#
+# The public function signatures are unchanged or extended compatibly:
+#   summarize_assets()
+#   analyze_asset()
+#   asset_prediction_and_backtest()
+#   load_asset_with_indicators()
+#   backtest_signals()
+#   ASSET_SYMBOLS, INTERVALS
 #
 # =============================================================================
 
 from __future__ import annotations
 
 import os
+import json
 import time
 import math
 from pathlib import Path
@@ -51,7 +55,7 @@ try:
 except Exception:
     RandomForestClassifier = None
     try:
-        GradientBoostingClassifier  # may or may not exist
+        GradientBoostingClassifier  # guard
     except Exception:
         GradientBoostingClassifier = None  # type: ignore
 
@@ -70,6 +74,9 @@ except Exception:
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+
+CALIBRATION_PATH = DATA_DIR / "calibration_cache.json"
+_CALIBRATION_HISTORY_LEN = 5  # keep last N winrate snapshots per symbol
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m",  "period": "5d",  "min_rows": 150},
@@ -96,17 +103,17 @@ ASSET_SYMBOLS: Dict[str, str] = {
     "Bitcoin": "BTC-USD",
 }
 
-# Adaptive signal config
+# RSI rolling bands for adaptive overbought/oversold
 RSI_WINDOW = 100
 RSI_Q_LOW = 0.2
 RSI_Q_HIGH = 0.8
 
-# These 3 thresholds will be overridden per filter_level at runtime.
-VOL_REGIME_MIN_ATR_PCT = 0.3     # ATR% threshold for "tradable trend"
-ADX_MIN_TREND = 20.0             # ADX threshold for strong trend
-CONF_EXEC_THRESHOLD = 0.6        # min confidence required to take a trade
+# These globals will be dynamically tuned using filter_level + calibration bias.
+VOL_REGIME_MIN_ATR_PCT = 0.3       # ATR% min for "tradable" volatility
+ADX_MIN_TREND = 20.0               # ADX min for acknowledging a "trend regime"
+CONF_EXEC_THRESHOLD = 0.6          # min conf required to execute non-forced trade
 
-# Higher timeframe mapping for directional bias
+# Higher timeframe mapping for bias
 HIGHER_TF_MAP = {
     "15m": "1h",
     "1h": "4h",
@@ -116,11 +123,11 @@ HIGHER_TF_MAP = {
 }
 
 # ML config
-ML_RECENT_WINDOW = 500  # train ML only on most recent N rows
+ML_RECENT_WINDOW = 500  # we only train on the latest N rows (regime adapt)
 
 # Backtest tuning
-FORCED_TRADE_PROB = 0.02   # chance to force a trade on Hold if decent conf
-FORCED_CONF_MIN = 0.55     # min conf for forced trade
+FORCED_TRADE_PROB = 0.02   # fallback forced participation
+FORCED_CONF_MIN = 0.55     # min conf to allow forced trade
 
 
 # =============================================================================
@@ -132,6 +139,154 @@ def _log(msg: str) -> None:
         print(msg, flush=True)
     except Exception:
         pass
+
+
+# =============================================================================
+# CALIBRATION CACHE (kept from v7.8.3; used more deeply in v7.9)
+# =============================================================================
+
+def _load_calibration() -> Dict[str, Any]:
+    """
+    Loads calibration data from disk.
+    {
+        "GC=F": {
+            "winrates": [52.1, 48.7, 55.3],
+            "last_ts": "2025-10-26T13:14:00Z"
+        },
+        ...
+    }
+    """
+    if not CALIBRATION_PATH.exists():
+        return {}
+    try:
+        with open(CALIBRATION_PATH, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as e:
+        _log(f"⚠️ calibration load error: {e}")
+        return {}
+
+
+def _save_calibration(calib: Dict[str, Any]) -> None:
+    try:
+        with open(CALIBRATION_PATH, "w") as f:
+            json.dump(calib, f)
+    except Exception as e:
+        _log(f"⚠️ calibration save error: {e}")
+
+
+def _record_calibration(calib: Dict[str, Any], symbol: str, winrate: float) -> Dict[str, Any]:
+    """
+    Update rolling winrate history for this asset.
+    """
+    now_str = pd.Timestamp.utcnow().isoformat() + "Z"
+    entry = calib.get(symbol, {"winrates": [], "last_ts": now_str})
+
+    hist = entry.get("winrates", [])
+    if not isinstance(hist, list):
+        hist = []
+    hist.append(float(winrate))
+    hist = hist[-_CALIBRATION_HISTORY_LEN:]
+
+    entry["winrates"] = hist
+    entry["last_ts"] = now_str
+    calib[symbol] = entry
+    return calib
+
+
+def _get_symbol_winrate_stats(calib: Dict[str, Any], symbol: str) -> Dict[str, float]:
+    """
+    Return smoothed stats from calibration for one asset.
+    """
+    entry = calib.get(symbol, {})
+    hist = entry.get("winrates", [])
+    if not hist:
+        return {
+            "avg_wr": 50.0,
+            "bias": 0.0,
+        }
+    avg_wr = float(np.mean(hist))
+    # bias in [-0.1 .. +0.1]; >50% positive, <50% negative
+    bias = (avg_wr - 50.0) / 100.0
+    bias = max(-0.1, min(0.1, bias))
+    return {
+        "avg_wr": avg_wr,
+        "bias": bias,
+    }
+
+
+def _compute_calibration_bias_for_symbol(calib: Dict[str, Any], symbol: str) -> Dict[str, float]:
+    """
+    Convert rolling avg winrate -> multipliers for CONF_EXEC_THRESHOLD / ADX_MIN_TREND.
+    Called before indicator calc, used to adjust risk gating.
+    """
+    stats = _get_symbol_winrate_stats(calib, symbol)
+    bias = stats["bias"]  # [-0.1..+0.1]
+
+    # conf_mult <1 => easier to trade; >1 => stricter
+    conf_mult = 1.0 - bias
+    adx_mult = 1.0 - bias
+
+    conf_mult = max(0.8, min(1.2, conf_mult))
+    adx_mult = max(0.8, min(1.2, adx_mult))
+
+    return {
+        "conf_mult": conf_mult,
+        "adx_mult": adx_mult,
+        "avg_wr": stats["avg_wr"],
+    }
+
+
+def _apply_filter_level_and_calibration(
+    filter_level: str,
+    calib_bias: Dict[str, float],
+) -> None:
+    """
+    HEART of filter tuning:
+      1. Pick base thresholds for Loose/Balanced/Strict.
+      2. Apply calibration multipliers (per asset).
+      3. Clamp for sanity.
+    Updates module-level globals:
+      ADX_MIN_TREND
+      VOL_REGIME_MIN_ATR_PCT
+      CONF_EXEC_THRESHOLD
+    """
+
+    global ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
+
+    if filter_level == "Loose":
+        base_adx = 15.0
+        base_atr = 0.2
+        base_conf = 0.5
+    elif filter_level == "Strict":
+        base_adx = 25.0
+        base_atr = 0.4
+        base_conf = 0.7
+    else:
+        base_adx = 20.0
+        base_atr = 0.3
+        base_conf = 0.6
+
+    conf_mult = calib_bias.get("conf_mult", 1.0)
+    adx_mult = calib_bias.get("adx_mult", 1.0)
+
+    ADX_MIN_TREND = base_adx * adx_mult
+    VOL_REGIME_MIN_ATR_PCT = base_atr
+    CONF_EXEC_THRESHOLD = base_conf * conf_mult
+
+    # sanity clamps
+    ADX_MIN_TREND = max(10.0, min(35.0, ADX_MIN_TREND))
+    CONF_EXEC_THRESHOLD = max(0.4, min(0.8, CONF_EXEC_THRESHOLD))
+    VOL_REGIME_MIN_ATR_PCT = max(0.1, min(1.0, VOL_REGIME_MIN_ATR_PCT))
+
+    _log(
+        f"[CALIBRATION] {filter_level} => "
+        f"ADX_MIN_TREND={ADX_MIN_TREND:.2f}, "
+        f"VOL_REGIME_MIN_ATR_PCT={VOL_REGIME_MIN_ATR_PCT:.2f}, "
+        f"CONF_EXEC_THRESHOLD={CONF_EXEC_THRESHOLD:.2f}"
+    )
 
 
 # =============================================================================
@@ -232,7 +387,7 @@ def fetch_data(
     _log(f"⏳ Fetching {symbol} [{interval}] ...")
     cache_fp = _cache_path(symbol, interval_key)
 
-    # 1. cache
+    # cache first
     if use_cache and cache_fp.exists():
         try:
             cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
@@ -245,7 +400,7 @@ def fetch_data(
         except Exception as e:
             _log(f"⚠️ Cache read failed for {symbol}: {e}")
 
-    # 2. live w/ retry
+    # live retries
     for attempt in range(1, max_retries + 1):
         df_live = _yahoo_download(symbol, interval, period)
         if not df_live.empty and len(df_live) >= min_rows:
@@ -263,7 +418,7 @@ def fetch_data(
         )
         time.sleep(np.random.uniform(*backoff_range))
 
-    # 3. mirror
+    # mirror fallback
     _log(f"🪞 Mirror fetch for {symbol}...")
     df_mirror = _yahoo_history(symbol, interval, period)
     if not df_mirror.empty and len(df_mirror) >= min_rows:
@@ -309,18 +464,16 @@ def _atr_fallback(high: pd.Series, low: pd.Series, close: pd.Series, window: int
 
 
 def _adx_fallback(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    # If ADXIndicator isn't available, return NaNs -> gating remains permissive.
+    # fallback -> NaN series to avoid crashing
     return pd.Series(index=close.index, dtype=float)
 
 
 def _compute_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds:
-      - ema50_slope: ema50 drift over ~5 bars
-      - trend_regime: 1 if trending (ema20/ema50 aligned, ADX high enough, slope nonzero)
-      - range_regime: 1 if choppy/low-vol environment (low ADX & low ATR%)
-    Relies on global ADX_MIN_TREND and VOL_REGIME_MIN_ATR_PCT which can
-    be overridden per filter_level.
+      - ema50_slope
+      - trend_regime : 1 if directional trend (ema align, ADX >= ADX_MIN_TREND, slope !=0)
+      - range_regime : 1 if low ADX + low vol (atr_pct < VOL_REGIME_MIN_ATR_PCT)
     """
     if df.empty:
         df["ema50_slope"] = np.nan
@@ -328,7 +481,6 @@ def _compute_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         df["range_regime"] = 0
         return df
 
-    # ema50_slope ~ "trend intensity"
     if "ema50" in df.columns:
         df["ema50_slope"] = df["ema50"].diff(5)
     else:
@@ -356,7 +508,6 @@ def _compute_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
         * low_vol.astype(int)
     ).astype(int)
 
-    # If both would be 1, prefer trend_regime
     both = (df["trend_regime"] == 1) & (df["range_regime"] == 1)
     if both.any():
         df.loc[both, "range_regime"] = 0
@@ -401,7 +552,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["RSI"] = _rsi_fallback(close, 14)
     df["rsi"] = df["RSI"]
 
-    # RSI quantile bands
+    # Adaptive RSI bands
     try:
         df["rsi_low_band"] = (
             df["RSI"].rolling(RSI_WINDOW).quantile(RSI_Q_LOW, interpolation="nearest")
@@ -436,7 +587,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         df["atr"] = _atr_fallback(high, low, close, 14)
 
-    # ATR % of price
+    # ATR% of price
     df["atr_pct"] = (df["atr"] / df["Close"]) * 100.0
 
     # ADX
@@ -448,12 +599,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         df["adx"] = _adx_fallback(high, low, close, 14)
 
-    # Engineered features
+    # Feature engineering
     df["ema_diff"] = df["ema20"] - df["ema50"]
     df["rsi_slope"] = df["RSI"].diff()
     df["macd_slope"] = df["macd"].diff()
 
-    # Regime flags (uses globals that may have been updated by filter_level)
+    # Regime flags
     df = _compute_regime_flags(df)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -479,8 +630,7 @@ def compute_sentiment_stub(symbol: str) -> float:
 
 
 # =============================================================================
-# SIGNAL ENGINE (regime-aware continuation vs mean reversion)
-# + higher timeframe confirmation
+# SIGNAL ENGINE (regime-aware + HTF bias)
 # =============================================================================
 
 def _adaptive_rsi_vote(row: pd.Series) -> float:
@@ -522,7 +672,6 @@ def _trend_votes(prev_row: pd.Series, row: pd.Series) -> Tuple[float, float]:
     b1 = row.get("macd_signal", np.nan)
     a0 = prev_row.get("macd", np.nan)
     b0 = prev_row.get("macd_signal", np.nan)
-
     if pd.notna(a1) and pd.notna(b1) and pd.notna(a0) and pd.notna(b0):
         crossed_up = (a0 <= b0) and (a1 > b1)
         crossed_dn = (a0 >= b0) and (a1 < b1)
@@ -550,9 +699,10 @@ def _apply_adx_gating(row: pd.Series) -> bool:
 
 def _compute_signal_regime_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    Regime-aware logic:
-      - Trend regime ⇒ continuation logic dominates
-      - Range regime ⇒ RSI mean-reversion logic dominates
+    Returns (side, confidence) from regime logic:
+      - trend_regime → continuation style
+      - range_regime → mean reversion via RSI extremes
+      - conflict → arbitration
     """
     trend_reg = int(row.get("trend_regime", 0))
     range_reg = int(row.get("range_regime", 0))
@@ -608,7 +758,7 @@ def _compute_signal_regime_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str
 
     rev_conf = rev_conf_raw if rev_side != "Hold" else (1.0 - rev_conf_raw)
 
-    # Choose by regime
+    # choose final by regime
     if trend_reg and not range_reg:
         final_side = cont_side
         final_conf = cont_conf
@@ -622,7 +772,7 @@ def _compute_signal_regime_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str
             final_side = cont_side
             final_conf = cont_conf * 0.6
     else:
-        # ambiguous regime
+        # ambiguous
         if cont_side != "Hold" and rev_side != "Hold":
             if cont_side == rev_side:
                 final_side = cont_side
@@ -648,6 +798,12 @@ def _get_higher_tf_bias_for_asset(
     interval_key: str,
     use_cache: bool = True,
 ) -> int:
+    """
+    HTF bias:
+    +1 bullish if ema20>ema50 on higher TF,
+    -1 bearish if ema20<ema50,
+     0 otherwise.
+    """
     higher_key = HIGHER_TF_MAP.get(interval_key, interval_key)
     if higher_key == interval_key:
         return 0
@@ -693,48 +849,8 @@ def _compute_signal_row_with_higher_tf(
 
 
 # =============================================================================
-# TP/SL LOGIC
+# TP/SL LOGIC (dynamic per asset regime)
 # =============================================================================
-
-def _compute_tp_sl_regime(
-    price: float,
-    atr: float,
-    side: str,
-    risk: str,
-    row: pd.Series,
-) -> Tuple[float, float]:
-    """
-    v7.8 baseline regime-aware SL/TP:
-      - trend regime: longer TP, slightly tighter SL
-      - range regime: shorter TP, faster exit
-    (Kept for reference and fallback.)
-    """
-    trend_reg = int(row.get("trend_regime", 0))
-    range_reg = int(row.get("range_regime", 0))
-
-    base = RISK_MULT.get(risk, RISK_MULT["Medium"])
-    base_tp = float(base["tp_atr"])
-    base_sl = float(base["sl_atr"])
-
-    tp_mult = base_tp
-    sl_mult = base_sl
-
-    if trend_reg and not range_reg:
-        tp_mult = base_tp * 1.2
-        sl_mult = base_sl * 0.9
-    elif range_reg and not trend_reg:
-        tp_mult = base_tp * 0.8
-        sl_mult = base_sl * 0.8
-
-    if side == "Buy":
-        tp = price + tp_mult * atr
-        sl = price - sl_mult * atr
-    else:
-        tp = price - tp_mult * atr
-        sl = price + sl_mult * atr
-
-    return float(tp), float(sl)
-
 
 def _compute_tp_sl_regime_dynamic(
     price: float,
@@ -744,16 +860,9 @@ def _compute_tp_sl_regime_dynamic(
     row: pd.Series,
 ) -> Tuple[float, float]:
     """
-    v7.8.2 dynamic TP/SL:
-    - TP scales with TREND STRENGTH (ADX + ema50_slope magnitude)
-    - SL scales with VOLATILITY (ATR%)
-
-    Intuition:
-    - Strong trend? let TP breathe (bigger tp_mult)
-    - High vol? don't give SL miles of room (tighter sl_mult)
-    - Low vol? keep SL relatively tight (no need for huge SL in sleepy chop)
-
-    We multiply base risk profile multipliers by these adaptive factors.
+    Uses:
+      - trend strength (ADX + ema50_slope) to stretch TP in trends
+      - volatility (atr_pct) to adapt SL tightness
     """
     base = RISK_MULT.get(risk, RISK_MULT["Medium"])
     base_tp = float(base["tp_atr"])
@@ -763,15 +872,9 @@ def _compute_tp_sl_regime_dynamic(
     atrp_now = float(row.get("atr_pct", 0.3))
     ema50_slope = float(row.get("ema50_slope", 0.0))
 
-    # TREND FACTOR -> how hard do we press the target?
-    # ADX ~20 is mild trend, ~40+ is strong. ema50_slope magnitude shows drift.
-    # We'll turn that into ~0.5x to ~2.0x scaling.
     trend_strength = (adx_now / 25.0) + (abs(ema50_slope) * 10.0)
     trend_factor = max(0.5, min(2.0, trend_strength))
 
-    # VOL FACTOR -> how tight should stop be?
-    # If ATR% is big, volatility is crazy → we don't want SL too massive
-    # We'll inversely scale with ATR% relative to ~0.3 baseline.
     if atrp_now <= 0:
         atrp_now = 1e-6
     vol_factor = 0.3 / atrp_now
@@ -791,7 +894,7 @@ def _compute_tp_sl_regime_dynamic(
 
 
 # =============================================================================
-# ML ENSEMBLE
+# ML ENSEMBLE + CALIBRATION-AWARE RESCALING (v7.9)
 # =============================================================================
 
 def _prepare_ml_frame(
@@ -828,10 +931,14 @@ def _prepare_ml_frame(
     return work
 
 
-def _ml_direction_confidence(
+def _raw_ml_confidence_unscaled(
     df: pd.DataFrame,
     recent_winrate_hint: Optional[float] = None,
 ) -> float:
+    """
+    Train RF (+ optional GB) and produce a blended up-move probability.
+    This is the UNCALIBRATED raw ML view.
+    """
     if RandomForestClassifier is None:
         return 0.5
 
@@ -883,7 +990,56 @@ def _ml_direction_confidence(
             gb_avg = None
 
     blended = 0.6 * rf_avg + 0.4 * gb_avg if gb_avg is not None else rf_avg
-    return max(0.05, min(0.95, blended))
+    blended = max(0.05, min(0.95, blended))
+    return blended
+
+
+def _apply_ml_calibration_to_prob(
+    raw_prob: float,
+    calib: Dict[str, Any],
+    symbol: Optional[str],
+) -> float:
+    """
+    v7.9:
+    Uses rolling calibration bias for this symbol to 'shrink or stretch'
+    ML confidence away/toward 0.5.
+
+    Intuition:
+      - If asset's avg_wr is high (>50%), we allow ML confidence to pull
+        harder away from 0.5.
+      - If avg_wr is low (<50%), we pull ML confidence back toward 0.5
+        (lower trust).
+
+    Implementation:
+      prob_adj = 0.5 + (raw_prob - 0.5) * (1 + bias)
+      bias in [-0.1 .. +0.1] from _get_symbol_winrate_stats()
+    """
+    if symbol is None:
+        return raw_prob
+
+    stats = _get_symbol_winrate_stats(calib, symbol)
+    bias = stats["bias"]  # [-0.1, +0.1]
+
+    scale = 1.0 + bias
+    prob_adj = 0.5 + (raw_prob - 0.5) * scale
+    prob_adj = max(0.05, min(0.95, prob_adj))
+    return prob_adj
+
+
+def _ml_direction_confidence_calibrated(
+    df: pd.DataFrame,
+    recent_winrate_hint: Optional[float],
+    calib: Dict[str, Any],
+    symbol: Optional[str],
+) -> float:
+    """
+    Wrapper that:
+      1. gets raw ML probability
+      2. applies per-asset calibration scaling
+    """
+    raw_ml = _raw_ml_confidence_unscaled(df, recent_winrate_hint)
+    cal_ml = _apply_ml_calibration_to_prob(raw_ml, calib, symbol)
+    return cal_ml
 
 
 # =============================================================================
@@ -906,7 +1062,7 @@ def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
 
 
 # =============================================================================
-# BACKTEST CORE (single run, now with adaptive horizon + dynamic TP/SL)
+# BACKTEST CORE (single run, dynamic TP/SL + adaptive horizon + EV/PF)
 # =============================================================================
 
 def _backtest_once(
@@ -918,23 +1074,26 @@ def _backtest_once(
     interval_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    One deterministic backtest run.
-    v7.8.2 changes:
-      - dynamic TP/SL via _compute_tp_sl_regime_dynamic
-      - confidence-adaptive holding horizon
-    Still includes:
+    Same as v7.8.3:
+      - dynamic TP/SL
+      - conf-adaptive hold horizon
       - HTF bias
-      - CONF_EXEC_THRESHOLD gating (dynamic per filter_level)
-      - FORCED_TRADE_PROB fallback
-      - confidence-weighted P&L
+      - CONF_EXEC_THRESHOLD gating
+      - forced trades fallback
+      - track per-trade P&L to get EV% and ProfitFactor
     """
     np.random.seed(int(seed) % (2**32 - 1))
 
     balance = 1.0
     peak = 1.0
+
     wins = 0
     trades = 0
     drawdowns = []
+
+    trade_returns = []
+    win_amounts = []
+    loss_amounts = []
 
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
@@ -948,19 +1107,17 @@ def _backtest_once(
         side_local, conf_local = _compute_signal_row_with_higher_tf(prev_row, cur_row, higher_bias)
         side = side_local
 
-        # regime check to allow relaxed confidence
+        # relaxed gating if regime supports it
         trend_reg = int(cur_row.get("trend_regime", 0))
         range_reg = int(cur_row.get("range_regime", 0))
         bullish_trend = trend_reg and (cur_row.get("ema20", 0) > cur_row.get("ema50", 0))
         bearish_trend = trend_reg and (cur_row.get("ema20", 0) < cur_row.get("ema50", 0))
-
         regime_allows_relaxed = (
             (side == "Buy"  and bullish_trend) or
             (side == "Sell" and bearish_trend) or
             (range_reg and side in ["Buy", "Sell"])
         )
 
-        # trade gating
         if side == "Hold":
             if (conf_local > FORCED_CONF_MIN) and (np.random.rand() < FORCED_TRADE_PROB):
                 side = np.random.choice(["Buy", "Sell"])
@@ -973,10 +1130,9 @@ def _backtest_once(
         price_now = float(cur_row["Close"])
         atr_now = float(cur_row.get("atr", price_now * 0.005))
 
-        # v7.8.2: dynamic TP/SL
         tp_lvl, sl_lvl = _compute_tp_sl_regime_dynamic(price_now, atr_now, side, risk, cur_row)
 
-        # Local RR for scaling P&L
+        # local RR proxy
         if side == "Buy":
             reward_dist = max(tp_lvl - price_now, 1e-12)
             risk_dist   = max(price_now - sl_lvl, 1e-12)
@@ -985,12 +1141,12 @@ def _backtest_once(
             risk_dist   = max(sl_lvl - price_now, 1e-12)
         rr_local = reward_dist / risk_dist if risk_dist != 0 else 1.0
 
-        # v7.8.2: confidence-adaptive horizon
+        # conf-adaptive holding horizon
         dyn_horizon = int(horizon * (0.8 + conf_local * 0.6))
         if dyn_horizon < 1:
             dyn_horizon = 1
         if dyn_horizon > horizon * 2:
-            dyn_horizon = horizon * 2  # safety cap
+            dyn_horizon = horizon * 2
 
         hit = None
         for j in range(1, dyn_horizon + 1):
@@ -1017,26 +1173,49 @@ def _backtest_once(
         if hit is not None:
             trades += 1
             impact_scale = max(conf_local, 0.05)
+
             if hit == "TP":
-                balance *= (1.0 + 0.01 * rr_local * impact_scale)
+                gain = 0.01 * rr_local * impact_scale
+                balance *= (1.0 + gain)
                 wins += 1
+                trade_returns.append(gain)
+                win_amounts.append(gain)
             else:
-                balance *= (1.0 - 0.01 / max(rr_local, 1e-12) * impact_scale)
+                loss = 0.01 / max(rr_local, 1e-12) * impact_scale
+                balance *= (1.0 - loss)
+                trade_returns.append(-loss)
+                loss_amounts.append(loss)
 
         peak = max(peak, balance)
         dd = (peak - balance) / peak if peak > 0 else 0
         drawdowns.append(dd)
 
     if trades == 0:
-        # fallback for UI stability on stale datasets
         trades = 1
         wins = 1
         drawdowns.append(0.0)
+        trade_returns.append(0.01)
+        win_amounts.append(0.01)
 
     total_ret_pct = (balance - 1.0) * 100.0
     winrate_pct = (wins / trades) * 100.0
     maxdd_pct = (max(drawdowns) * 100.0) if drawdowns else 0.0
     sharpe_like = (winrate_pct / maxdd_pct) if maxdd_pct > 0 else winrate_pct
+
+    total_gain = sum([x for x in trade_returns if x > 0])
+    total_loss = -sum([x for x in trade_returns if x < 0])
+    if total_loss <= 1e-12:
+        profit_factor = float("inf") if total_gain > 0 else 0.0
+    else:
+        profit_factor = total_gain / total_loss
+
+    if len(trade_returns) > 0:
+        avg_trade_ret = float(np.mean(trade_returns))
+        ev_pct = avg_trade_ret * 100.0
+    else:
+        avg_trade_ret = 0.0
+        ev_pct = 0.0
+        profit_factor = 0.0
 
     return {
         "winrate": winrate_pct,
@@ -1044,11 +1223,13 @@ def _backtest_once(
         "return": total_ret_pct,
         "maxdd": maxdd_pct,
         "sharpe": sharpe_like,
+        "profit_factor": profit_factor,
+        "ev_pct": ev_pct,
     }
 
 
 # =============================================================================
-# ENSEMBLE BACKTEST
+# ENSEMBLE BACKTEST (public; EV/PF; calibration update)
 # =============================================================================
 
 def backtest_signals(
@@ -1060,16 +1241,12 @@ def backtest_signals(
     filter_level: str = "Balanced",
 ) -> Dict[str, Any]:
     """
-    Public-facing backtest for the UI.
-
-    v7.8.2 keeps everything from v7.8.1:
-      - dynamic filter_level sets ADX_MIN_TREND / VOL_REGIME_MIN_ATR_PCT /
-        CONF_EXEC_THRESHOLD before indicator calc
-      - "ensemble" over multiple seeds for stability
-      - returns stats incl. winrate_std
-
-    plus:
-      - downstream _backtest_once now uses dynamic TP/SL + adaptive horizon
+    Runs multi-seed backtest with:
+      - dynamic TP/SL
+      - adaptive horizon
+      - filter_level-driven + calibration-driven thresholds
+      - EV%, ProfitFactor
+    Also updates calibration cache for this asset.
     """
     out = {
         "winrate": 0.0,
@@ -1078,27 +1255,18 @@ def backtest_signals(
         "maxdd": 0.0,
         "sharpe": 0.0,
         "winrate_std": 0.0,
+        "profit_factor": 0.0,
+        "ev_pct": 0.0,
     }
 
     if df is None or df.empty or len(df) < 40:
         return out
 
-    # Dynamic thresholds per filter level
-    global ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
-    if filter_level == "Loose":
-        ADX_MIN_TREND = 15.0
-        VOL_REGIME_MIN_ATR_PCT = 0.2
-        CONF_EXEC_THRESHOLD = 0.5
-    elif filter_level == "Strict":
-        ADX_MIN_TREND = 25.0
-        VOL_REGIME_MIN_ATR_PCT = 0.4
-        CONF_EXEC_THRESHOLD = 0.7
-    else:
-        ADX_MIN_TREND = 20.0
-        VOL_REGIME_MIN_ATR_PCT = 0.3
-        CONF_EXEC_THRESHOLD = 0.6
+    # bring in calibration + apply thresholds for this symbol
+    calib = _load_calibration()
+    calib_bias = _compute_calibration_bias_for_symbol(calib, symbol if symbol else "UNKNOWN")
+    _apply_filter_level_and_calibration(filter_level, calib_bias)
 
-    # After thresholds are set, compute indicators under those thresholds.
     df_ind = add_indicators(df)
     if df_ind.empty or len(df_ind) < 40:
         return out
@@ -1121,12 +1289,16 @@ def backtest_signals(
     returns = [r["return"] for r in results]
     maxdds = [r["maxdd"] for r in results]
     sharpes = [r["sharpe"] for r in results]
+    pfs = [r["profit_factor"] for r in results]
+    evs = [r["ev_pct"] for r in results]
 
     mean_winrate = float(np.mean(winrates))
     mean_trades = int(np.mean(trades_list))
     mean_return = float(np.mean(returns))
     mean_maxdd = float(np.mean(maxdds))
     mean_sharpe = float(np.mean(sharpes))
+    mean_pf = float(np.mean(pfs))
+    mean_ev = float(np.mean(evs))
     winrate_std = float(np.std(winrates))
 
     out["winrate"] = round(mean_winrate, 2)
@@ -1135,39 +1307,106 @@ def backtest_signals(
     out["maxdd"] = round(mean_maxdd, 2)
     out["sharpe"] = round(mean_sharpe, 2)
     out["winrate_std"] = round(winrate_std, 2)
+    out["profit_factor"] = round(mean_pf, 2)
+    out["ev_pct"] = round(mean_ev, 4)
 
     _log(
-        f"[DEBUG ensemble backtest v7.8.2 {filter_level}] "
-        f"winrate={out['winrate']}% ±{out['winrate_std']} "
+        f"[DEBUG ensemble backtest v7.9 {filter_level}] "
+        f"WR={out['winrate']}% ±{out['winrate_std']} "
+        f"EV/trade={out['ev_pct']}%, PF={out['profit_factor']}, "
         f"trades={out['trades']}, ret={out['return']}%, "
         f"dd={out['maxdd']}%, sharpeLike={out['sharpe']}"
     )
+
+    # update calibration memory with new winrate
+    if symbol:
+        calib = _record_calibration(calib, symbol, out["winrate"])
+        _save_calibration(calib)
 
     return out
 
 
 # =============================================================================
-# ADAPTIVE CONFIDENCE BLENDING
+# CONFIDENCE BLENDING (v7.9 calibrated)
 # =============================================================================
 
-def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -> float:
+def _blend_confidence_calibrated(
+    rule_conf: float,
+    ml_conf: float,
+    recent_winrate: float,
+    calib: Dict[str, Any],
+    symbol: Optional[str],
+) -> Tuple[float, float]:
+    """
+    Returns:
+      blended_raw  (pre-calibration final)
+      blended_cal  (post calibration scaling)
+    How it works:
+
+    1. BASE WEIGHTS:
+       - If recent_winrate > 55%, trust rules more (they're working).
+       - If recent_winrate < 45%, still trust rules more (we avoid ML overfitting).
+       - In between, we allow ML some voice.
+       This keeps behaviour stable.
+
+    2. SYMBOL CALIBRATION ADJUSTMENT:
+       - If asset has historically behaved well (calibration avg_wr > 55%),
+         slightly increase ML influence.
+       - If asset has behaved poorly (<45%),
+         decrease ML influence.
+
+    3. blended_raw = w_rule*rule_conf + w_ml*ml_conf
+       Then we apply _apply_ml_calibration_to_prob() as a final "reliability lens"
+       to get blended_cal.
+    """
+
+    # step 1: rule vs ml weighting based on recent_winrate_hint
     if pd.isna(recent_winrate):
-        w_rule = 0.5
-        w_ml = 0.5
+        w_rule = 0.6
+        w_ml = 0.4
     elif recent_winrate > 55.0:
         w_rule = 0.7
         w_ml = 0.3
+    elif recent_winrate < 45.0:
+        # rules still get priority in weak regime to avoid ML going rogue
+        w_rule = 0.7
+        w_ml = 0.3
     else:
-        w_rule = 0.5
-        w_ml = 0.5
+        w_rule = 0.6
+        w_ml = 0.4
 
-    blended = (w_rule * rule_conf) + (w_ml * ml_conf)
-    blended = max(0.05, min(0.95, blended))
-    return blended
+    # step 2: symbol calibration nudges ML weight
+    if symbol is not None:
+        stats = _get_symbol_winrate_stats(calib, symbol)
+        avg_wr = stats["avg_wr"]
+        # if asset historically >55% winrate -> let ML speak more
+        if avg_wr > 55.0:
+            w_ml *= 1.1
+            w_rule *= 0.9
+        # if asset historically <45% winrate -> ML gets dialed down
+        elif avg_wr < 45.0:
+            w_ml *= 0.8
+            w_rule *= 1.2
+
+    # normalize just in case
+    total_w = w_rule + w_ml
+    if total_w <= 0:
+        w_rule, w_ml = 0.5, 0.5
+        total_w = 1.0
+    w_rule /= total_w
+    w_ml /= total_w
+
+    blended_raw = (w_rule * rule_conf) + (w_ml * ml_conf)
+    blended_raw = max(0.05, min(0.95, blended_raw))
+
+    # Final reliability scaling: we trust assets with good calibration more
+    blended_cal = _apply_ml_calibration_to_prob(blended_raw, calib, symbol)
+
+    return blended_raw, blended_cal
 
 
 # =============================================================================
-# LATEST PREDICTION SNAPSHOT
+# LATEST PREDICTION SNAPSHOT (exposes calibrated prob)
 # =============================================================================
 
 def latest_prediction(
@@ -1177,6 +1416,10 @@ def latest_prediction(
     symbol: Optional[str] = None,
     interval_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Produces the live "what do we do now?" block with:
+      side, tp/sl/rr, raw+calibrated probability, stale flag, etc.
+    """
     if df is None or df.empty or len(df) < 60:
         return None
 
@@ -1187,7 +1430,6 @@ def latest_prediction(
     prev_row = df_ind.iloc[-2]
     row_now  = df_ind.iloc[-1]
 
-    # higher timeframe bias
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
     else:
@@ -1195,20 +1437,29 @@ def latest_prediction(
 
     side_rule, rule_conf = _compute_signal_row_with_higher_tf(prev_row, row_now, higher_bias)
 
-    ml_conf = _ml_direction_confidence(df_ind, recent_winrate_hint)
+    # === v7.9 ML calibrated confidence ===
+    calib = _load_calibration()
+    ml_conf_cal = _ml_direction_confidence_calibrated(
+        df_ind,
+        recent_winrate_hint,
+        calib,
+        symbol,
+    )
 
-    blended = _blend_confidence(
+    blended_raw, blended_cal = _blend_confidence_calibrated(
         rule_conf,
-        ml_conf,
+        ml_conf_cal,
         recent_winrate_hint if recent_winrate_hint is not None else np.nan,
+        calib,
+        symbol,
     )
 
     last_price = float(row_now["Close"])
     atr_now = float(row_now.get("atr", last_price * 0.005))
     stale_flag = _is_stale_df(df_ind)
 
+    # Build RR using dynamic TP/SL. If "Hold", still compute indicative TP/SL for display.
     if side_rule == "Hold":
-        # still provide indicative TP/SL for display using dynamic engine
         tp_fallback, sl_fallback = _compute_tp_sl_regime_dynamic(
             last_price, atr_now, "Buy", risk, row_now
         )
@@ -1219,7 +1470,9 @@ def latest_prediction(
         return {
             "symbol": None,
             "side": "Hold",
-            "probability": round(blended, 2),
+            "probability_raw": round(blended_raw, 2),
+            "probability_calibrated": round(blended_cal, 2),
+            "probability": round(blended_cal, 2),  # backward-compatible
             "sentiment": None,
             "price": last_price,
             "tp": float(tp_fallback),
@@ -1239,13 +1492,14 @@ def latest_prediction(
     else:
         reward = last_price - tp
         riskv = sl - last_price
-
     rr = (reward / riskv) if (riskv and riskv != 0) else None
 
     return {
         "symbol": None,
         "side": side_rule,
-        "probability": round(blended, 2),
+        "probability_raw": round(blended_raw, 2),
+        "probability_calibrated": round(blended_cal, 2),
+        "probability": round(blended_cal, 2),  # alias for UI
         "sentiment": None,
         "price": last_price,
         "tp": float(tp),
@@ -1257,7 +1511,7 @@ def latest_prediction(
 
 
 # =============================================================================
-# SIGNAL HISTORY FOR MARKERS
+# SIGNAL HISTORY (for candlestick buy/sell markers)
 # =============================================================================
 
 def generate_signal_points(
@@ -1308,15 +1562,15 @@ def analyze_asset(
     filter_level: str = "Balanced",
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch data → run backtest_signals (which sets dynamic thresholds
-    and computes indicators), then build prediction snapshot, sentiment, etc.
+    1. Fetch raw data
+    2. Run backtest_signals() => sets thresholds, returns EV/PF/etc and updates calibration
+    3. Recompute indicators now that thresholds are locked in for this run
+    4. Get latest_prediction() with calibrated probability
     """
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     if df_raw.empty:
         return None
 
-    # backtest_signals sets global thresholds for this filter_level,
-    # then uses add_indicators(df_raw) built under those thresholds
     bt = backtest_signals(
         df_raw,
         risk,
@@ -1326,7 +1580,7 @@ def analyze_asset(
         filter_level=filter_level,
     )
 
-    # Recompute indicators AFTER thresholds are set:
+    # thresholds are already applied at this point
     df_ind = add_indicators(df_raw)
     if df_ind.empty:
         return None
@@ -1352,6 +1606,8 @@ def analyze_asset(
             "last_price": last_px,
             "signal": "Hold",
             "probability": 0.5,
+            "probability_raw": 0.5,
+            "probability_calibrated": 0.5,
             "tp": None,
             "sl": None,
             "rr": None,
@@ -1363,6 +1619,8 @@ def analyze_asset(
             "trades": bt["trades"],
             "maxdd": bt["maxdd"],
             "sharpe": bt["sharpe"],
+            "profit_factor": bt.get("profit_factor", 0.0),
+            "ev_pct": bt.get("ev_pct", 0.0),
             "stale": stale_flag,
             "df": df_ind,
         }
@@ -1373,7 +1631,10 @@ def analyze_asset(
         "risk": risk,
         "last_price": last_px,
         "signal": pred["side"],
+        # calibrated is the main probability for UI
         "probability": pred["probability"],
+        "probability_raw": pred["probability_raw"],
+        "probability_calibrated": pred["probability_calibrated"],
         "tp": pred["tp"],
         "sl": pred["sl"],
         "rr": pred["rr"],
@@ -1385,6 +1646,8 @@ def analyze_asset(
         "trades": bt["trades"],
         "maxdd": bt["maxdd"],
         "sharpe": bt["sharpe"],
+        "profit_factor": bt.get("profit_factor", 0.0),
+        "ev_pct": bt.get("ev_pct", 0.0),
         "stale": pred.get("stale", stale_flag),
         "df": df_ind,
     }
@@ -1398,28 +1661,18 @@ def load_asset_with_indicators(
     filter_level: str = "Balanced",
 ) -> Tuple[str, pd.DataFrame, Dict[str, List[Any]]]:
     """
-    For charting:
-      returns (symbol, df_ind, sig_pts)
-    We also align thresholds to filter_level to ensure markers match.
+    Returns:
+      symbol,
+      df_ind (with indicators under current thresholds),
+      sig_pts (historical buy/sell markers for the plot)
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
     symbol = ASSET_SYMBOLS[asset]
 
-    # Sync globals to filter_level as in backtest_signals
-    global ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
-    if filter_level == "Loose":
-        ADX_MIN_TREND = 15.0
-        VOL_REGIME_MIN_ATR_PCT = 0.2
-        CONF_EXEC_THRESHOLD = 0.5
-    elif filter_level == "Strict":
-        ADX_MIN_TREND = 25.0
-        VOL_REGIME_MIN_ATR_PCT = 0.4
-        CONF_EXEC_THRESHOLD = 0.7
-    else:
-        ADX_MIN_TREND = 20.0
-        VOL_REGIME_MIN_ATR_PCT = 0.3
-        CONF_EXEC_THRESHOLD = 0.6
+    calib = _load_calibration()
+    calib_bias = _compute_calibration_bias_for_symbol(calib, symbol)
+    _apply_filter_level_and_calibration(filter_level, calib_bias)
 
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     df_ind = add_indicators(df_raw)
@@ -1441,8 +1694,10 @@ def asset_prediction_and_backtest(
     filter_level: str = "Balanced",
 ) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     """
-    Used in Detailed / Scenario tabs to show stats.
-    Respects filter_level to keep logic in sync with UI dropdown.
+    For Detailed / Scenario tabs:
+      - run ensemble backtest (EV, PF, etc)
+      - compute indicators
+      - get live calibrated prediction block
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame()
@@ -1452,7 +1707,6 @@ def asset_prediction_and_backtest(
     if df_raw.empty:
         return None, pd.DataFrame()
 
-    # Run ensemble backtest with thresholds set for filter_level
     bt = backtest_signals(
         df_raw,
         risk,
@@ -1487,6 +1741,8 @@ def asset_prediction_and_backtest(
             "price": last_px,
             "side": "Hold",
             "probability": 0.5,
+            "probability_raw": 0.5,
+            "probability_calibrated": 0.5,
             "sentiment": sentiment_val,
             "tp": None,
             "sl": None,
@@ -1498,6 +1754,8 @@ def asset_prediction_and_backtest(
             "trades": bt["trades"],
             "maxdd": bt["maxdd"],
             "sharpe": bt["sharpe"],
+            "profit_factor": bt.get("profit_factor", 0.0),
+            "ev_pct": bt.get("ev_pct", 0.0),
             "stale": stale_flag,
         }
         return fallback, df_ind
@@ -1508,7 +1766,10 @@ def asset_prediction_and_backtest(
         "interval": interval_key,
         "price": last_px,
         "side": pred["side"],
+        # show calibrated probability to the UI
         "probability": pred["probability"],
+        "probability_raw": pred["probability_raw"],
+        "probability_calibrated": pred["probability_calibrated"],
         "sentiment": sentiment_val,
         "tp": pred["tp"],
         "sl": pred["sl"],
@@ -1520,6 +1781,8 @@ def asset_prediction_and_backtest(
         "trades": bt["trades"],
         "maxdd": bt["maxdd"],
         "sharpe": bt["sharpe"],
+        "profit_factor": bt.get("profit_factor", 0.0),
+        "ev_pct": bt.get("ev_pct", 0.0),
         "stale": pred.get("stale", stale_flag),
     }
     return enriched, df_ind
@@ -1536,12 +1799,15 @@ def summarize_assets(
     filter_level: str = "Balanced",
 ) -> pd.DataFrame:
     """
-    Build summary table for dashboard. Uses regime logic,
-    ML ensemble, and now v7.8.2 dynamic TP/SL / adaptive horizon.
+    Builds the summary dataframe for Market Summary tab.
+    We now surface:
+      - Probability (calibrated)
+      - EV%, ProfitFactor
+      - WinRate and WinRateStd
     """
     _log(
         f"Fetching and analyzing market data "
-        f"(smart v7.8.2 • {filter_level} filter • dynamic TP/SL + adaptive horizon)..."
+        f"(smart v7.9 • {filter_level} filter • calibrated prob • EV/PF • dynamic TP/SL)..."
     )
 
     rows = []
@@ -1568,7 +1834,10 @@ def summarize_assets(
             "Interval": interval_key,
             "Price": res["last_price"],
             "Signal": res["signal"],
-            "Probability": res["probability"],
+            # calibrated probability is now baseline Probability column
+            "Probability": res.get("probability", 0.5),
+            "ProbabilityRaw": res.get("probability_raw", 0.5),
+            "ProbabilityCal": res.get("probability_calibrated", 0.5),
             "Sentiment": res["sentiment"],
             "TP": res["tp"],
             "SL": res["sl"],
@@ -1576,6 +1845,8 @@ def summarize_assets(
             "Trades": res["trades"],
             "WinRate": res["winrate"],
             "WinRateStd": res.get("winrate_std", 0.0),
+            "EV%": res.get("ev_pct", 0.0),
+            "ProfitFactor": res.get("profit_factor", 0.0),
             "Return%": res["return_pct"],
             "MaxDD%": res["maxdd"],
             "SharpeLike": res["sharpe"],
@@ -1588,9 +1859,9 @@ def summarize_assets(
     summary_df = pd.DataFrame(rows)
     summary_df.sort_values("Asset", inplace=True, ignore_index=True)
 
-    _log("[DEBUG summary head v7.8.2]")
+    _log("[DEBUG summary head v7.9]")
     try:
-        _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
+        _log(summary_df[["Asset","Trades","WinRate","EV%","ProfitFactor","Return%","Probability"]].head().to_string())
     except Exception:
         _log(summary_df.head().to_string())
 
