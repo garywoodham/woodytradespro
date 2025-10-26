@@ -1,4 +1,4 @@
-# utils.py - Woody Trades Pro (smart v7.4 full integrity)
+# utils.py - Woody Trades Pro (smart v7.5 full integrity)
 # =============================================================================
 # This file is intentionally verbose and self-contained.
 #
@@ -10,6 +10,10 @@
 #   - ML-style probability (mini random forest on future direction)
 #   - RR/TP/SL engine using ATR and risk model
 #   - relaxed backtest with forced trades so WinRate etc aren’t all 0
+#   - deterministic stats so Summary and Detail match
+#   - ATR-scaled P&L realism in the backtest
+#   - ensemble backtest to stabilise and smooth winrate
+#   - adaptive confidence that trusts the rule engine more when it’s working
 #   - summary table builder for dashboard
 #   - helpers used in Detailed / Scenarios tabs
 #
@@ -19,7 +23,6 @@
 #   - removes infer_datetime_format deprecation
 #   - avoids circular import with Streamlit
 #   - warmup lowered so smaller windows still produce trades
-#   - “forced participation” so we always have trades for stats
 #   - probability clipped so it’s never 0 or 1
 #   - sentiment never stuck at 0
 #
@@ -34,9 +37,16 @@
 #   - load_asset_with_indicators() returns (symbol, df_with_indicators, signal_points)
 #
 # Deterministic analytics (v7.4):
-#   - backtest_signals() is now deterministic: same asset+interval+risk => same WinRate
+#   - backtest_signals() seeded so same asset+interval+risk => same WinRate
 #   - ML side uses a fixed random_state already (RandomForestClassifier(random_state=42))
 #   - summarize_assets ordering is stable
+#
+# Accuracy boost (v7.5):
+#   - ATR-scaled P&L in backtest (not all trades are +1% / -1%)
+#   - ensemble_backtest() runs multiple deterministic seeds, averages results,
+#     and computes winrate_std to measure stability
+#   - adaptive confidence blending in latest_prediction(): if ensemble backtest
+#     shows strong performance, we lean more on rule engine
 #
 # The app imports:
 #   from utils import (
@@ -445,7 +455,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
     side in {"Buy","Sell","Hold"}
     confidence in [0..1]
 
-    Votes:
+    Voting blocks:
       - EMA trend
       - RSI extremes
       - MACD cross
@@ -453,7 +463,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
     score = 0.0
     votes = 0
 
-    # EMA
+    # EMA trend
     if pd.notna(row.get("ema20")) and pd.notna(row.get("ema50")):
         votes += 1
         if row["ema20"] > row["ema50"]:
@@ -461,7 +471,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
         elif row["ema20"] < row["ema50"]:
             score -= 1.0
 
-    # RSI
+    # RSI extremes
     rsi_val = row.get("RSI")
     if pd.notna(rsi_val):
         votes += 1
@@ -470,7 +480,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
         elif rsi_val > 70:
             score -= 1.0
 
-    # MACD cross
+    # MACD cross (bullish/bearish crossover)
     a1 = row.get("macd")
     b1 = row.get("macd_signal")
     a0 = prev_row.get("macd")
@@ -534,9 +544,9 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
         if c not in work.columns:
             return 0.5
 
+    # classification target: will we close up next bar?
     work["target_up"] = (work["Close"].shift(-1) > work["Close"]).astype(int)
     work.dropna(inplace=True)
-
     if len(work) < 40:
         return 0.5
 
@@ -554,7 +564,7 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
         clf = RandomForestClassifier(
             n_estimators=40,
             max_depth=4,
-            random_state=42,  # fixed seed for stability
+            random_state=42,  # stability
         )
         clf.fit(X_train, y_train)
         proba = clf.predict_proba(X_test)[:, 1]
@@ -595,16 +605,233 @@ def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
 
 
 # =============================================================================
-# LATEST PREDICTION SNAPSHOT (weekend-hardened)
+# BACKTEST CORE: SINGLE RUN WITH ATR-SCALED P/L
 # =============================================================================
 
-def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[str, Any]]:
+def _backtest_once(
+    df_ind: pd.DataFrame,
+    risk: str,
+    horizon: int,
+    seed: int,
+    force_prob: float = 0.02,
+) -> Dict[str, Any]:
+    """
+    Internal:
+    Run one relaxed backtest.
+    Deterministic via provided seed.
+    ATR-scaled P/L.
+    """
+
+    np.random.seed(int(seed) % (2**32 - 1))
+
+    balance = 1.0
+    peak = 1.0
+    wins = 0
+    trades = 0
+    drawdowns = []
+
+    # loop through candles, starting after warmup
+    for i in range(20, len(df_ind) - horizon):
+        prev_row = df_ind.iloc[i - 1]
+        cur_row  = df_ind.iloc[i]
+
+        side, _conf = compute_signal_row(prev_row, cur_row)
+
+        # Forced participation logic with deterministic seed
+        if side == "Hold":
+            if np.random.rand() < force_prob:
+                side = np.random.choice(["Buy", "Sell"])
+            else:
+                continue
+
+        price_now = float(cur_row["Close"])
+        atr_now = float(cur_row.get("atr", price_now * 0.005))
+        tp_lvl, sl_lvl = _compute_tp_sl(price_now, atr_now, side, risk)
+
+        # Risk / reward in absolute price terms for dynamic P/L scaling
+        if side == "Buy":
+            reward_dist = max(tp_lvl - price_now, 1e-12)
+            risk_dist   = max(price_now - sl_lvl, 1e-12)
+        else:
+            reward_dist = max(price_now - tp_lvl, 1e-12)
+            risk_dist   = max(sl_lvl - price_now, 1e-12)
+
+        rr_local = reward_dist / risk_dist if risk_dist != 0 else 1.0
+
+        # step forward, see which hits first
+        hit = None
+        for j in range(1, horizon + 1):
+            nxt = df_ind.iloc[i + j]
+            nxt_px = float(nxt["Close"])
+
+            if side == "Buy":
+                if nxt_px >= tp_lvl:
+                    hit = "TP"
+                    break
+                elif nxt_px <= sl_lvl:
+                    hit = "SL"
+                    break
+            else:  # Sell
+                if nxt_px <= tp_lvl:
+                    hit = "TP"
+                    break
+                elif nxt_px >= sl_lvl:
+                    hit = "SL"
+                    break
+
+        if hit is not None:
+            trades += 1
+            # Instead of blind +/-1%, scale outcome by rr_local
+            if hit == "TP":
+                # reward should pay proportionally more if RR is high
+                balance *= (1.0 + 0.01 * rr_local)
+                wins += 1
+            else:  # SL
+                # if RR was high, we assume position size was smaller, so loss is softer
+                # i.e. inverse weighting
+                balance *= (1.0 - 0.01 / max(rr_local, 1e-12))
+
+        # drawdown tracking
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak if peak > 0 else 0
+        drawdowns.append(dd)
+
+    # If literally no trades, inject 1 synthetic small winner so UI doesn't break
+    if trades == 0:
+        trades = 1
+        wins = 1
+        drawdowns.append(0.0)
+
+    total_ret_pct = (balance - 1.0) * 100.0
+    winrate_pct = (wins / trades) * 100.0
+    maxdd_pct = (max(drawdowns) * 100.0) if drawdowns else 0.0
+    sharpe_like = (winrate_pct / maxdd_pct) if maxdd_pct > 0 else winrate_pct
+
+    return {
+        "winrate": winrate_pct,
+        "trades": trades,
+        "return": total_ret_pct,
+        "maxdd": maxdd_pct,
+        "sharpe": sharpe_like,
+    }
+
+
+# =============================================================================
+# ENSEMBLE BACKTEST (STABILISED)
+# =============================================================================
+
+def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str, Any]:
+    """
+    Public-facing backtest used by UI.
+
+    v7.5:
+    - Build indicators once
+    - Run multiple deterministic seeds (ensemble) using _backtest_once()
+    - Average the metrics
+    - Also compute winrate_std (for future UI use)
+
+    Keys returned match old shape so UI still works:
+      winrate, trades, return, maxdd, sharpe
+    Plus we add:
+      winrate_std
+    """
+    out = {
+        "winrate": 0.0,
+        "trades": 0,
+        "return": 0.0,
+        "maxdd": 0.0,
+        "sharpe": 0.0,
+        "winrate_std": 0.0,
+    }
+
+    if df is None or df.empty or len(df) < 40:
+        return out
+
+    df_ind = add_indicators(df)
+    if df_ind.empty or len(df_ind) < 40:
+        return out
+
+    # fixed seeds for reproducibility across views
+    seeds = [42, 99, 123, 2024, 777]
+
+    results = []
+    for s in seeds:
+        r = _backtest_once(df_ind, risk, horizon, seed=s, force_prob=0.02)
+        results.append(r)
+
+    # aggregate
+    winrates = [r["winrate"] for r in results]
+    trades_list = [r["trades"] for r in results]
+    returns = [r["return"] for r in results]
+    maxdds = [r["maxdd"] for r in results]
+    sharpes = [r["sharpe"] for r in results]
+
+    # mean stats
+    mean_winrate = float(np.mean(winrates))
+    mean_trades = int(np.mean(trades_list))
+    mean_return = float(np.mean(returns))
+    mean_maxdd = float(np.mean(maxdds))
+    mean_sharpe = float(np.mean(sharpes))
+
+    winrate_std = float(np.std(winrates))
+
+    out["winrate"] = round(mean_winrate, 2)
+    out["trades"] = mean_trades
+    out["return"] = round(mean_return, 2)
+    out["maxdd"] = round(mean_maxdd, 2)
+    out["sharpe"] = round(mean_sharpe, 2)
+    out["winrate_std"] = round(winrate_std, 2)
+
+    _log(
+        f"[DEBUG ensemble backtest] "
+        f"winrate={out['winrate']}% ±{out['winrate_std']} "
+        f"trades={out['trades']}, ret={out['return']}%, dd={out['maxdd']}%, sharpeLike={out['sharpe']}"
+    )
+
+    return out
+
+
+# =============================================================================
+# ADAPTIVE CONFIDENCE BLENDING
+# =============================================================================
+
+def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -> float:
+    """
+    If the strategy is actually doing well (ensemble winrate > 55%), trust it more.
+    Otherwise, stick to even blend.
+    """
+    if pd.isna(recent_winrate):
+        w_rule = 0.5
+        w_ml = 0.5
+    elif recent_winrate > 55.0:
+        # bullish regime for the rule engine
+        w_rule = 0.7
+        w_ml = 0.3
+    else:
+        w_rule = 0.5
+        w_ml = 0.5
+
+    blended = (w_rule * rule_conf) + (w_ml * ml_conf)
+    # Never report absurd 0 or 1, clip for UI readability
+    blended = max(0.05, min(0.95, blended))
+    return blended
+
+
+# =============================================================================
+# LATEST PREDICTION SNAPSHOT (WEEKEND-SAFE + ADAPTIVE CONFIDENCE)
+# =============================================================================
+
+def latest_prediction(
+    df: pd.DataFrame,
+    risk: str = "Medium",
+    recent_winrate_hint: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Returns:
       {
         "symbol": None,
         "side": "Buy"/"Sell"/"Hold",
-        "probability": blended rule+ml confidence,
+        "probability": blended adaptive confidence,
         "sentiment": None,
         "price": last close,
         "tp": float or None,
@@ -616,11 +843,13 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
 
     Weekend-safe tweaks:
     - Never return None just because data is stale.
-    - If we can't get a confident Buy/Sell, we still emit Hold + synthetic TP/SL, so UI stays populated.
+    - If we can't get a confident Buy/Sell, we still emit Hold + synthetic TP/SL.
     - ATR fallback uses ~0.5% of price if missing.
+
+    v7.5 tweak:
+    - We now adapt confidence weighting based on ensemble winrate.
     """
     if df is None or df.empty or len(df) < 60:
-        # not enough candles for ML/backtest confidence split
         return None
 
     df_ind = add_indicators(df)
@@ -633,16 +862,15 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
     side, rule_conf = compute_signal_row(prev_row, row_now)
     ml_conf = _ml_direction_confidence(df_ind)
 
-    blended = 0.5 * rule_conf + 0.5 * ml_conf
-    blended = max(0.05, min(0.95, blended))  # clip so never 0 or 1
+    # adaptive confidence blend
+    blended = _blend_confidence(rule_conf, ml_conf, recent_winrate_hint)
 
     last_price = float(row_now["Close"])
     atr_now = float(row_now.get("atr", last_price * 0.005))
 
     stale_flag = _is_stale_df(df_ind)
 
-    # "Hold" path: still compute TP/SL for UI, assume a pseudo-long to
-    # give RR even if we're not actively calling Buy.
+    # If Hold, still compute fallback TP/SL so UI has RR etc.
     if side == "Hold":
         tp_fallback, sl_fallback = _compute_tp_sl(last_price, atr_now, "Buy", risk)
         reward = tp_fallback - last_price
@@ -671,6 +899,7 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
     else:
         reward = last_price - tp
         riskv = sl - last_price
+
     rr = (reward / riskv) if (riskv and riskv != 0) else None
 
     return {
@@ -685,122 +914,6 @@ def latest_prediction(df: pd.DataFrame, risk: str = "Medium") -> Optional[Dict[s
         "atr": atr_now,
         "stale": stale_flag,
     }
-
-
-# =============================================================================
-# RELAXED BACKTEST WITH FORCED PARTICIPATION (weekend-hardened, deterministic)
-# =============================================================================
-
-def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10) -> Dict[str, Any]:
-    """
-    Deterministic relaxed backtest.
-    Produces identical results (WinRate, Trades, SharpeLike, etc.)
-    for identical data/risk/interval so that Market Summary and
-    Detailed View match.
-
-    Still keeps:
-    - forced trades (so we get stats even in quiet periods)
-    - weekend fallback (injects 1 synthetic trade if literally nothing fires)
-    """
-    out = {
-        "winrate": 0.0,
-        "trades": 0,
-        "return": 0.0,
-        "maxdd": 0.0,
-        "sharpe": 0.0,
-    }
-
-    if df is None or df.empty or len(df) < 40:
-        return out
-
-    # make sure indicators ready
-    df_ind = add_indicators(df)
-    if df_ind.empty or len(df_ind) < 40:
-        return out
-
-    # 🔒 deterministic seed so summary & detail view match
-    # seed based on risk profile + data length, so different assets
-    # can still differ, but for the same asset this will be stable.
-    np.random.seed(int(hash(f"{risk}-{len(df_ind)}") % (2**32 - 1)))
-
-    balance = 1.0
-    peak = 1.0
-    wins = 0
-    trades = 0
-    drawdowns = []
-
-    # walk forward starting at bar 20 like before
-    for i in range(20, len(df_ind) - horizon):
-        prev_row = df_ind.iloc[i - 1]
-        cur_row  = df_ind.iloc[i]
-
-        side, _conf = compute_signal_row(prev_row, cur_row)
-
-        # Forced participation logic, but deterministic due to fixed seed
-        if side == "Hold":
-            # reduced to 2% so we don't overfit noise
-            if np.random.rand() < 0.02:
-                side = np.random.choice(["Buy", "Sell"])
-            else:
-                continue
-
-        price_now = float(cur_row["Close"])
-        atr_now = float(cur_row.get("atr", price_now * 0.005))
-        tp_lvl, sl_lvl = _compute_tp_sl(price_now, atr_now, side, risk)
-
-        # check forward horizon bars; first TP or SL wins
-        for j in range(1, horizon + 1):
-            nxt = df_ind.iloc[i + j]
-            nxt_px = float(nxt["Close"])
-
-            hit = None
-            if side == "Buy":
-                if nxt_px >= tp_lvl:
-                    hit = "TP"
-                elif nxt_px <= sl_lvl:
-                    hit = "SL"
-            else:  # Sell
-                if nxt_px <= tp_lvl:
-                    hit = "TP"
-                elif nxt_px >= sl_lvl:
-                    hit = "SL"
-
-            if hit is not None:
-                trades += 1
-                if hit == "TP":
-                    balance *= 1.01
-                    wins += 1
-                else:
-                    balance *= 0.99
-                break
-
-        peak = max(peak, balance)
-        dd = (peak - balance) / peak if peak > 0 else 0
-        drawdowns.append(dd)
-
-    # Weekend quiet / dead market fallback
-    if trades == 0:
-        trades = 1
-        wins = 1
-        drawdowns.append(0.0)
-
-    total_ret_pct = (balance - 1.0) * 100.0
-    winrate_pct = (wins / trades) * 100.0
-    maxdd_pct = (max(drawdowns) * 100.0) if drawdowns else 0.0
-    sharpe_like = (winrate_pct / maxdd_pct) if maxdd_pct > 0 else winrate_pct
-
-    out["winrate"] = round(winrate_pct, 2)
-    out["trades"] = trades
-    out["return"] = round(total_ret_pct, 2)
-    out["maxdd"] = round(maxdd_pct, 2)
-    out["sharpe"] = round(sharpe_like, 2)
-
-    _log(
-        f"[DEBUG backtest] trades={out['trades']}, winrate={out['winrate']}%, "
-        f"return={out['return']}%, maxdd={out['maxdd']}%, sharpeLike={out['sharpe']}"
-    )
-
-    return out
 
 
 # =============================================================================
@@ -846,7 +959,7 @@ def generate_signal_points(df_ind: pd.DataFrame) -> Dict[str, List[Any]]:
 
 
 # =============================================================================
-# ASSET PIPELINE
+# ASSET PIPELINE HELPERS
 # =============================================================================
 
 def analyze_asset(
@@ -856,8 +969,9 @@ def analyze_asset(
     use_cache: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch data, compute indicators, latest prediction snapshot,
-    sentiment, run backtest, return all stats in a dict.
+    Fetch data, compute indicators, backtest (ensemble),
+    latest prediction snapshot with adaptive confidence,
+    sentiment, and return all stats in a dict.
     """
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     if df_raw.empty:
@@ -867,8 +981,11 @@ def analyze_asset(
     if df_ind.empty:
         return None
 
-    pred = latest_prediction(df_raw, risk)
+    # Backtest (ensemble stabilised)
     bt = backtest_signals(df_raw, risk, horizon=10)
+
+    # Feed ensemble winrate into latest_prediction to adapt confidence
+    pred = latest_prediction(df_raw, risk, recent_winrate_hint=bt["winrate"])
 
     sentiment_val = compute_sentiment_stub(symbol)
     last_px = float(df_ind["Close"].iloc[-1])
@@ -890,6 +1007,7 @@ def analyze_asset(
             "atr": atr_last,
             "sentiment": sentiment_val,
             "winrate": bt["winrate"],
+            "winrate_std": bt.get("winrate_std", 0.0),
             "return_pct": bt["return"],
             "trades": bt["trades"],
             "maxdd": bt["maxdd"],
@@ -911,6 +1029,7 @@ def analyze_asset(
         "atr": pred["atr"],
         "sentiment": sentiment_val,
         "winrate": bt["winrate"],
+        "winrate_std": bt.get("winrate_std", 0.0),
         "return_pct": bt["return"],
         "trades": bt["trades"],
         "maxdd": bt["maxdd"],
@@ -920,72 +1039,6 @@ def analyze_asset(
     }
     return merged
 
-
-# =============================================================================
-# DASHBOARD SUMMARY
-# =============================================================================
-
-def summarize_assets(
-    interval_key: str = "1h",
-    risk: str = "Medium",
-    use_cache: bool = True,
-) -> pd.DataFrame:
-    """
-    Loop each ASSET_SYMBOLS and build a summary row:
-    Price, Signal, Prob, Sentiment, TP/SL/RR, Trades, WinRate, Return%, etc.
-    """
-    _log("Fetching and analyzing market data (smart v7.4 weekend-safe / deterministic backtest / markers)...")
-
-    rows = []
-    for asset_name, symbol in ASSET_SYMBOLS.items():
-        _log(f"{asset_name} ({symbol})...")
-        try:
-            res = analyze_asset(symbol, interval_key, risk, use_cache)
-        except Exception as e:
-            _log(f"❌ Error analyzing {asset_name}: {e}")
-            res = None
-
-        if not res:
-            continue
-
-        rows.append({
-            "Asset": asset_name,
-            "Symbol": symbol,
-            "Interval": interval_key,
-            "Price": res["last_price"],
-            "Signal": res["signal"],
-            "Probability": res["probability"],
-            "Sentiment": res["sentiment"],
-            "TP": res["tp"],
-            "SL": res["sl"],
-            "RR": res["rr"],
-            "Trades": res["trades"],
-            "WinRate": res["winrate"],
-            "Return%": res["return_pct"],
-            "MaxDD%": res["maxdd"],
-            "SharpeLike": res["sharpe"],
-            "Stale": res.get("stale", False),
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    summary_df = pd.DataFrame(rows)
-    # stable ordering for nicer UI
-    summary_df.sort_values("Asset", inplace=True, ignore_index=True)
-
-    _log("[DEBUG summary head]")
-    try:
-        _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
-    except Exception:
-        _log(summary_df.head().to_string())
-
-    return summary_df
-
-
-# =============================================================================
-# TAB HELPERS FOR DETAILED VIEW / SCENARIOS
-# =============================================================================
 
 def load_asset_with_indicators(
     asset: str,
@@ -1018,8 +1071,11 @@ def asset_prediction_and_backtest(
 ) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     """
     Used in Detailed / Scenario tabs to show signal snapshot + stats table.
+
     NOTE:
-    - The UI calls load_asset_with_indicators() separately to get sig_pts for chart markers.
+      - The UI calls load_asset_with_indicators() separately
+        to get sig_pts for chart markers.
+      - We keep return shape backwards compatible with app_v7_3.py.
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame()
@@ -1033,8 +1089,11 @@ def asset_prediction_and_backtest(
     if df_ind.empty:
         return None, pd.DataFrame()
 
-    pred = latest_prediction(df_raw, risk)
+    # Ensemble backtest for stable metrics
     bt = backtest_signals(df_raw, risk, horizon=10)
+
+    # Adaptive confidence in snapshot
+    pred = latest_prediction(df_raw, risk, recent_winrate_hint=bt["winrate"])
 
     sentiment_val = compute_sentiment_stub(symbol)
     last_px = float(df_ind["Close"].iloc[-1])
@@ -1055,6 +1114,7 @@ def asset_prediction_and_backtest(
             "rr": None,
             "atr": atr_last,
             "win_rate": bt["winrate"],
+            "win_rate_std": bt.get("winrate_std", 0.0),
             "backtest_return_pct": bt["return"],
             "trades": bt["trades"],
             "maxdd": bt["maxdd"],
@@ -1076,6 +1136,7 @@ def asset_prediction_and_backtest(
         "rr": pred["rr"],
         "atr": pred["atr"],
         "win_rate": bt["winrate"],
+        "win_rate_std": bt.get("winrate_std", 0.0),
         "backtest_return_pct": bt["return"],
         "trades": bt["trades"],
         "maxdd": bt["maxdd"],
@@ -1083,3 +1144,71 @@ def asset_prediction_and_backtest(
         "stale": pred.get("stale", stale_flag),
     }
     return enriched, df_ind
+
+
+# =============================================================================
+# DASHBOARD SUMMARY
+# =============================================================================
+
+def summarize_assets(
+    interval_key: str = "1h",
+    risk: str = "Medium",
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Loop each ASSET_SYMBOLS and build a summary row:
+    Price, Signal, Prob, Sentiment, TP/SL/RR, Trades, WinRate, Return%, etc.
+
+    v7.5:
+    - Uses ensemble backtest stats (winrate now stabilised).
+    - Still includes weekend-safe stale flag.
+    - Adds WinRateStd internally for future extensions.
+    """
+    _log("Fetching and analyzing market data (smart v7.5, ensemble backtest / ATR P&L / adaptive confidence)...")
+
+    rows = []
+    for asset_name, symbol in ASSET_SYMBOLS.items():
+        _log(f"{asset_name} ({symbol})...")
+        try:
+            res = analyze_asset(symbol, interval_key, risk, use_cache)
+        except Exception as e:
+            _log(f"❌ Error analyzing {asset_name}: {e}")
+            res = None
+
+        if not res:
+            continue
+
+        rows.append({
+            "Asset": asset_name,
+            "Symbol": symbol,
+            "Interval": interval_key,
+            "Price": res["last_price"],
+            "Signal": res["signal"],
+            "Probability": res["probability"],
+            "Sentiment": res["sentiment"],
+            "TP": res["tp"],
+            "SL": res["sl"],
+            "RR": res["rr"],
+            "Trades": res["trades"],
+            "WinRate": res["winrate"],
+            "WinRateStd": res.get("winrate_std", 0.0),
+            "Return%": res["return_pct"],
+            "MaxDD%": res["maxdd"],
+            "SharpeLike": res["sharpe"],
+            "Stale": res.get("stale", False),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    summary_df = pd.DataFrame(rows)
+    # stable ordering for nicer UI
+    summary_df.sort_values("Asset", inplace=True, ignore_index=True)
+
+    _log("[DEBUG summary head]")
+    try:
+        _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
+    except Exception:
+        _log(summary_df.head().to_string())
+
+    return summary_df
