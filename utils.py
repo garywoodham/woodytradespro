@@ -1,4 +1,4 @@
-# utils.py - Woody Trades Pro (smart v7.7 full integrity)
+# utils.py - Woody Trades Pro (smart v7.7.2 full integrity)
 # =============================================================================
 # This file is intentionally verbose and self-contained.
 #
@@ -10,13 +10,14 @@
 #       * dynamic RSI thresholds (rolling quantiles)
 #       * volatility regime gating via ATR% of price
 #       * ADX trend-strength gating
-#       * NEW in v7.7: higher timeframe trend confirmation
+#       * higher timeframe confirmation (1h→4h, 4h→1d, etc.)
 #   - ML-style probability
 #       * RandomForest + GradientBoosting ensemble on engineered features
 #       * rolling-window training for regime adaptiveness
 #   - RR/TP/SL engine using ATR and risk model
-#   - relaxed backtest with ATR-scaled P&L and deterministic seeds
+#   - relaxed deterministic backtest with ATR-scaled P&L
 #       * ensemble backtest for stable win rate + std
+#       * v7.7.2: confidence-weighted P&L, probabilistic participation
 #   - adaptive confidence (weights rule vs ML based on recent performance)
 #   - weekend-safe fallback logic so UI never goes blank
 #   - chart marker support for Buy/Sell points
@@ -32,7 +33,7 @@
 #   - sentiment never stuck at 0
 #
 # Weekend safety:
-#   - stale data (market closed, weekend) no longer kills TP/SL/WinRate
+#   - stale data (market closed/weekend) no longer kills TP/SL/WinRate
 #   - latest_prediction always returns structured info even if stale or Hold
 #   - deterministic ensemble backtest guarantees ≥1 trade so stats don't go blank
 #   - ATR fallback so TP/SL/RR always exist for UI
@@ -41,6 +42,7 @@
 #   v7.5: ATR-scaled P&L, ensemble backtest, adaptive confidence.
 #   v7.6: Adaptive RSI, ATR% gating, ADX gating.
 #   v7.7: Higher timeframe confirmation + ML ensemble w/ engineered features.
+#   v7.7.2: Confidence-weighted P&L and smarter forced participation in backtest.
 #
 # The app imports:
 #   from utils import (
@@ -74,7 +76,7 @@ try:
 except Exception:
     RandomForestClassifier = None
     try:
-        GradientBoostingClassifier  # may not exist in this env
+        GradientBoostingClassifier  # may not exist
     except Exception:
         GradientBoostingClassifier = None  # type: ignore
 
@@ -94,6 +96,7 @@ except Exception:
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
+# IMPORTANT: "4h" now uses "4h" instead of "240m" (Yahoo quirk fix)
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m",  "period": "5d",  "min_rows": 150},
     "1h":  {"interval": "1h",   "period": "2mo", "min_rows": 250},
@@ -127,7 +130,7 @@ RSI_Q_HIGH = 0.8            # 80th percentile RSI = "overbought" threshold
 VOL_REGIME_MIN_ATR_PCT = 0.3  # if ATR% of price < this, we call it dead/chop
 ADX_MIN_TREND = 20.0          # if ADX < this, trend-follow votes are downweighted
 
-# Higher timeframe mapping for v7.7
+# Higher timeframe mapping (v7.7+)
 HIGHER_TF_MAP = {
     "15m": "1h",
     "1h": "4h",
@@ -136,8 +139,12 @@ HIGHER_TF_MAP = {
     "1wk": "1wk",  # top of the stack just maps to itself
 }
 
-# ML config v7.7
+# ML config v7.7+
 ML_RECENT_WINDOW = 500  # only train ML models on the most recent N rows
+
+# Backtest participation tuning (v7.7.2)
+FORCED_TRADE_PROB = 0.02     # base random chance to "force" a trade
+FORCED_CONF_MIN = 0.55       # only force if local confidence > this
 
 
 # =============================================================================
@@ -335,6 +342,7 @@ def fetch_data(
 
 # =============================================================================
 # INDICATORS (EMA20/50, RSI, RSI quantile bands, MACD, ATR, ATR%, ADX)
+# plus engineered features for ML
 # =============================================================================
 
 def _ema_fallback(series: pd.Series, span: int) -> pd.Series:
@@ -511,13 +519,13 @@ def compute_sentiment_stub(symbol: str) -> float:
         "CL=F": 0.55,
     }
     base = bias_map.get(symbol, 0.5)
-    # Stable value (no jitter) for UI clarity
+    # Stable (no jitter) for UI clarity
     return round(float(base), 2)
 
 
 # =============================================================================
 # ADAPTIVE SIGNAL ENGINE (RSI quantiles, ATR% gating, ADX gating)
-# PLUS higher timeframe confirmation (v7.7)
+# + higher timeframe confirmation
 # =============================================================================
 
 def _adaptive_rsi_vote(row: pd.Series) -> float:
@@ -597,8 +605,6 @@ def _apply_volatility_gating(row: pd.Series) -> bool:
     """
     Returns True if volatility is acceptable (ATR% is above a floor),
     otherwise False meaning "market is too dead / avoid trend trades".
-
-    This stops us from trend-following in ultra-chop.
     """
     atr_pct = row.get("atr_pct", np.nan)
     if pd.isna(atr_pct):
@@ -619,25 +625,23 @@ def _apply_adx_gating(row: pd.Series) -> bool:
 
 def _compute_signal_local_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    Core v7.6 adaptive signal logic (RSI bands, ATR regime, ADX).
+    Core (v7.6+) adaptive signal logic using RSI bands, ATR regime, ADX.
     Returns (side, conf) with side in {"Buy","Sell","Hold"}.
     """
-    # votes contributed
     score = 0.0
     votes = 0
 
-    # 1) Adaptive RSI vote (always allowed, even in low vol or low ADX)
+    # 1) Adaptive RSI vote (can trigger even in chop)
     rsi_vote = _adaptive_rsi_vote(row)
     if rsi_vote != 0.0:
         votes += 1
         score += rsi_vote
 
-    # 2) Trend / MACD votes (but only if regime not dead)
+    # 2) Trend / MACD votes (only if market regime looks tradeable)
     vol_ok = _apply_volatility_gating(row)
     adx_ok = _apply_adx_gating(row)
 
     trend_vote, macd_vote = _trend_votes(prev_row, row)
-    # Only add these votes if market structure supports them
     if vol_ok and adx_ok:
         if trend_vote != 0.0:
             votes += 1
@@ -645,15 +649,12 @@ def _compute_signal_local_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str,
         if macd_vote != 0.0:
             votes += 1
             score += macd_vote
-    else:
-        # In dead chop: allow RSI-based reversal trades,
-        # but do NOT let weak EMA/MACD continuation spam entries.
-        pass
+    # else: in low-vol chop we do NOT add weak EMA/MACD continuation votes
 
-    # final confidence (how aligned are the votes)
+    # confidence = how aligned are the votes
     conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
 
-    # decide final side
+    # raw side
     if votes > 0 and score >= 0.67 * votes:
         side = "Buy"
     elif votes > 0 and score <= -0.67 * votes:
@@ -661,7 +662,7 @@ def _compute_signal_local_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str,
     else:
         side = "Hold"
 
-    # if we ended up Hold, invert conf so Hold with 1.0 means "uncertain/no edge"
+    # "Hold" means uncertainty: invert conf so Hold has smaller final conf
     if side == "Hold":
         conf = 1.0 - conf
 
@@ -678,12 +679,10 @@ def _get_higher_tf_bias_for_asset(
       +1 bullish (ema20 > ema50),
       -1 bearish (ema20 < ema50),
        0 neutral or unavailable.
-
-    We map current interval_key -> a higher_tf_key using HIGHER_TF_MAP.
     """
     higher_key = HIGHER_TF_MAP.get(interval_key, interval_key)
 
-    # if same key, we can't step up, so neutral
+    # if same key, we can't step up -> neutral
     if higher_key == interval_key:
         return 0
 
@@ -710,28 +709,26 @@ def _compute_signal_row_with_higher_tf(
     higher_bias: int,
 ) -> Tuple[str, float]:
     """
-    Take the local signal (v7.6 logic) and then apply higher timeframe
+    Take the local signal and then apply higher timeframe
     directional bias. If conflict, downgrade to Hold and reduce confidence.
     """
     side_local, conf_local = _compute_signal_local_row(prev_row, row)
 
-    # If higher bias is 0 (neutral/unavailable), just return local as-is
     if higher_bias == 0:
         return side_local, conf_local
 
-    # If higher timeframe is bullish (+1), we prefer Buy and suppress Sell
     if higher_bias > 0:
+        # bigger-trend bullish: don't allow Sell
         if side_local == "Sell":
             return "Hold", conf_local * 0.5
         return side_local, conf_local
 
-    # If higher timeframe is bearish (-1), we prefer Sell and suppress Buy
     if higher_bias < 0:
+        # bigger-trend bearish: don't allow Buy
         if side_local == "Buy":
             return "Hold", conf_local * 0.5
         return side_local, conf_local
 
-    # fallback (shouldn't hit)
     return side_local, conf_local
 
 
@@ -752,7 +749,7 @@ def _compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[floa
 
 
 # =============================================================================
-# ML-STYLE CONFIDENCE (v7.7 ensemble w/ engineered features)
+# ML-STYLE CONFIDENCE (RF + GBM ensemble with engineered features)
 # =============================================================================
 
 def _prepare_ml_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -777,11 +774,11 @@ def _prepare_ml_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if c not in work.columns:
             return None
 
-    # keep only the most recent N rows for training
+    # keep only recent slice
     if len(work) > ML_RECENT_WINDOW:
         work = work.iloc[-ML_RECENT_WINDOW:].copy()
 
-    # classification target: will we close up next bar?
+    # target_up
     work["target_up"] = (work["Close"].shift(-1) > work["Close"]).astype(int)
 
     work.dropna(inplace=True)
@@ -827,8 +824,8 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
+    # RandomForest
     try:
-        # RandomForest (stable, low variance)
         rf = RandomForestClassifier(
             n_estimators=40,
             max_depth=4,
@@ -853,12 +850,10 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
             gb_avg = None
 
     if gb_avg is not None:
-        # blend RF and GB (RF 60%, GB 40%)
         blended = 0.6 * rf_avg + 0.4 * gb_avg
     else:
         blended = rf_avg
 
-    # safety clip for UI
     blended = max(0.05, min(0.95, blended))
     return blended
 
@@ -892,7 +887,7 @@ def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
 
 
 # =============================================================================
-# BACKTEST CORE: SINGLE RUN WITH ATR-SCALED P/L (deterministic)
+# BACKTEST CORE: SINGLE RUN WITH CONFIDENCE-WEIGHTED ATR P&L (v7.7.2)
 # =============================================================================
 
 def _backtest_once(
@@ -900,7 +895,6 @@ def _backtest_once(
     risk: str,
     horizon: int,
     seed: int,
-    force_prob: float = 0.02,
     symbol: Optional[str] = None,
     interval_key: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -908,10 +902,20 @@ def _backtest_once(
     Internal:
     Run one relaxed backtest.
     Deterministic via provided seed.
-    ATR-scaled P/L.
-    Uses higher timeframe confirmation via _compute_signal_row_with_higher_tf.
+    ATR-scaled P&L that is now *confidence-weighted*.
+    Also uses smarter "forced" participation (v7.7.2).
+
+    Steps:
+    - Get higher timeframe bias once for this run.
+    - Walk candles.
+    - Compute side/conf with _compute_signal_row_with_higher_tf.
+    - If side == "Hold", *maybe* force a trade, but ONLY if confidence
+      is decent (> FORCED_CONF_MIN) AND rng passes.
+    - Apply TP/SL simulation.
+    - P&L impact is scaled by both rr_local and signal confidence.
     """
 
+    # deterministic seed => consistent Forced trade sampling
     np.random.seed(int(seed) % (2**32 - 1))
 
     balance = 1.0
@@ -920,26 +924,23 @@ def _backtest_once(
     trades = 0
     drawdowns = []
 
-    # Pre-compute higher TF bias once, per run, if symbol/interval_key known.
-    # We treat this bias as "current market regime bias" and apply everywhere.
+    # Pre-compute higher TF bias once, per run
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
     else:
         higher_bias = 0
 
-    # loop through candles, starting after warmup
     for i in range(20, len(df_ind) - horizon):
         prev_row = df_ind.iloc[i - 1]
         cur_row  = df_ind.iloc[i]
 
+        # get directional call + confidence
         side_local, conf_local = _compute_signal_row_with_higher_tf(prev_row, cur_row, higher_bias)
-
         side = side_local
-        _conf = conf_local
 
-        # Forced participation logic with deterministic seed
+        # smarter "forced participation"
         if side == "Hold":
-            if np.random.rand() < force_prob:
+            if (conf_local > FORCED_CONF_MIN) and (np.random.rand() < FORCED_TRADE_PROB):
                 side = np.random.choice(["Buy", "Sell"])
             else:
                 continue
@@ -958,7 +959,7 @@ def _backtest_once(
 
         rr_local = reward_dist / risk_dist if risk_dist != 0 else 1.0
 
-        # step forward, see TP or SL first
+        # See TP/SL first
         hit = None
         for j in range(1, horizon + 1):
             nxt = df_ind.iloc[i + j]
@@ -981,19 +982,22 @@ def _backtest_once(
 
         if hit is not None:
             trades += 1
-            # ATR-scaled reward/loss
+
+            # v7.7.2: confidence-weighted P&L
+            impact_scale = max(conf_local, 0.05)  # don't let zero wipe effect
+
             if hit == "TP":
-                balance *= (1.0 + 0.01 * rr_local)
+                balance *= (1.0 + 0.01 * rr_local * impact_scale)
                 wins += 1
             else:
-                balance *= (1.0 - 0.01 / max(rr_local, 1e-12))
+                balance *= (1.0 - 0.01 / max(rr_local, 1e-12) * impact_scale)
 
         # drawdown tracking
         peak = max(peak, balance)
         dd = (peak - balance) / peak if peak > 0 else 0
         drawdowns.append(dd)
 
-    # weekend / silent-market fallback
+    # weekend / silent-market fallback so UI still shows stats
     if trades == 0:
         trades = 1
         wins = 1
@@ -1014,21 +1018,28 @@ def _backtest_once(
 
 
 # =============================================================================
-# ENSEMBLE BACKTEST (STABILISED, USED BY UI)
+# ENSEMBLE BACKTEST (stable across Summary & Detailed views)
 # =============================================================================
 
-def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10,
-                     symbol: Optional[str] = None,
-                     interval_key: Optional[str] = None) -> Dict[str, Any]:
+def backtest_signals(
+    df: pd.DataFrame,
+    risk: str,
+    horizon: int = 10,
+    symbol: Optional[str] = None,
+    interval_key: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Public-facing backtest used by UI.
 
-    v7.5+v7.6+v7.7:
+    v7.7.2:
     - Build indicators once
-    - Run multiple deterministic seeds (ensemble) using _backtest_once()
+    - Run multiple deterministic seeds using _backtest_once()
+    - Each run uses:
+        * higher timeframe bias
+        * confidence-weighted P&L
+        * probabilistic forced trades gated by confidence
     - Average metrics
     - Compute winrate_std
-    - Uses higher timeframe bias for every run
     """
     out = {
         "winrate": 0.0,
@@ -1046,8 +1057,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10,
     if df_ind.empty or len(df_ind) < 40:
         return out
 
-    # fixed seeds for reproducibility across views
-    seeds = [42, 99, 123, 2024, 777]
+    seeds = [42, 99, 123, 2024, 777]  # stable
 
     results = []
     for s in seeds:
@@ -1056,13 +1066,11 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10,
             risk,
             horizon,
             seed=s,
-            force_prob=0.02,
             symbol=symbol,
             interval_key=interval_key,
         )
         results.append(r)
 
-    # aggregate
     winrates = [r["winrate"] for r in results]
     trades_list = [r["trades"] for r in results]
     returns = [r["return"] for r in results]
@@ -1084,7 +1092,7 @@ def backtest_signals(df: pd.DataFrame, risk: str, horizon: int = 10,
     out["winrate_std"] = round(winrate_std, 2)
 
     _log(
-        f"[DEBUG ensemble backtest] "
+        f"[DEBUG ensemble backtest v7.7.2] "
         f"winrate={out['winrate']}% ±{out['winrate_std']} "
         f"trades={out['trades']}, ret={out['return']}%, dd={out['maxdd']}%, sharpeLike={out['sharpe']}"
     )
@@ -1105,7 +1113,6 @@ def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -
         w_rule = 0.5
         w_ml = 0.5
     elif recent_winrate > 55.0:
-        # bullish/working regime for the rule engine
         w_rule = 0.7
         w_ml = 0.3
     else:
@@ -1113,13 +1120,12 @@ def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -
         w_ml = 0.5
 
     blended = (w_rule * rule_conf) + (w_ml * ml_conf)
-    # clip for UI consistency
-    blended = max(0.05, min(0.95, blended))
+    blended = max(0.05, min(0.95, blended))  # clip for UI consistency
     return blended
 
 
 # =============================================================================
-# LATEST PREDICTION SNAPSHOT (weekend-safe + adaptive confidence + higher TF)
+# LATEST PREDICTION SNAPSHOT
 # =============================================================================
 
 def latest_prediction(
@@ -1130,7 +1136,7 @@ def latest_prediction(
     interval_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns:
+    Returns a dict:
       {
         "symbol": None,
         "side": "Buy"/"Sell"/"Hold",
@@ -1145,16 +1151,11 @@ def latest_prediction(
       }
 
     Weekend-safe:
-    - Never return None just because data is stale.
-    - If we can't get a confident Buy/Sell, we still emit Hold + synthetic TP/SL.
-    - ATR fallback uses ~0.5% of price if missing.
-
-    v7.6:
-    - Adaptive RSI, ATR regime gating, ADX gating.
-
-    v7.7:
-    - Higher timeframe confirmation (suppresses counter-trend trades).
-    - ML ensemble (RF + GBM) for conviction.
+    - still returns even if data stale
+    - fallback TP/SL for Hold
+    - ATR fallback
+    - integrated higher timeframe confirmation
+    - integrated ML ensemble for conviction
     """
     if df is None or df.empty or len(df) < 60:
         return None
@@ -1172,13 +1173,13 @@ def latest_prediction(
     else:
         higher_bias = 0
 
-    # local rule-based signal w/ higher timeframe enforcement
+    # rule + higher TF filter
     side_rule, rule_conf = _compute_signal_row_with_higher_tf(prev_row, row_now, higher_bias)
 
     # ML conviction using ensemble
     ml_conf = _ml_direction_confidence(df_ind)
 
-    # adaptive confidence blend
+    # adaptive blend
     blended = _blend_confidence(rule_conf, ml_conf, recent_winrate_hint)
 
     last_price = float(row_now["Close"])
@@ -1186,7 +1187,6 @@ def latest_prediction(
 
     stale_flag = _is_stale_df(df_ind)
 
-    # "Hold" path: still compute fallback TP/SL so UI has RR etc.
     if side_rule == "Hold":
         tp_fallback, sl_fallback = _compute_tp_sl(last_price, atr_now, "Buy", risk)
         reward = tp_fallback - last_price
@@ -1233,7 +1233,7 @@ def latest_prediction(
 
 
 # =============================================================================
-# SIGNAL HISTORY FOR PLOTTING (Buy / Sell markers)
+# SIGNAL HISTORY FOR PLOTTING MARKERS
 # =============================================================================
 
 def generate_signal_points(
@@ -1245,14 +1245,6 @@ def generate_signal_points(
     Walk through df_ind (which already has indicators),
     run higher-timeframe-aware signal logic for each bar vs prev bar,
     collect Buy/Sell events for plotting markers.
-
-    Returns dict with arrays for plotting:
-      {
-        "buy_times": [...timestamps...],
-        "buy_prices": [...close...],
-        "sell_times": [...timestamps...],
-        "sell_prices": [...close...],
-      }
     """
     out = {
         "buy_times": [],
@@ -1309,12 +1301,16 @@ def analyze_asset(
     if df_ind.empty:
         return None
 
-    # Ensemble backtest for stable metrics (with higher TF bias)
-    bt = backtest_signals(df_raw, risk, horizon=10,
-                          symbol=symbol,
-                          interval_key=interval_key)
+    # Ensemble backtest for stable metrics (v7.7.2 logic)
+    bt = backtest_signals(
+        df_raw,
+        risk,
+        horizon=10,
+        symbol=symbol,
+        interval_key=interval_key,
+    )
 
-    # Adaptive confidence in snapshot (with higher TF bias and ML ensemble)
+    # Adaptive confidence in snapshot (higher TF, ML ensemble)
     pred = latest_prediction(
         df_raw,
         risk,
@@ -1384,8 +1380,6 @@ def load_asset_with_indicators(
     """
     Input: asset name e.g. "Gold"
     Output: (symbol, df_with_indicators, signal_points)
-
-    signal_points is for plotting Buy/Sell markers in the app.
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
@@ -1394,7 +1388,11 @@ def load_asset_with_indicators(
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     df_ind = add_indicators(df_raw)
 
-    sig_pts = generate_signal_points(df_ind, symbol=symbol, interval_key=interval_key)
+    sig_pts = generate_signal_points(
+        df_ind,
+        symbol=symbol,
+        interval_key=interval_key,
+    )
 
     return symbol, df_ind, sig_pts
 
@@ -1407,11 +1405,7 @@ def asset_prediction_and_backtest(
 ) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     """
     Used in Detailed / Scenario tabs to show signal snapshot + stats table.
-
-    NOTE:
-      - The UI calls load_asset_with_indicators() separately
-        to get sig_pts for chart markers.
-      - We keep return shape backwards compatible with app_v7_3.py.
+    The UI separately calls load_asset_with_indicators() for chart markers.
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame()
@@ -1425,12 +1419,16 @@ def asset_prediction_and_backtest(
     if df_ind.empty:
         return None, pd.DataFrame()
 
-    # Ensemble backtest for stable metrics (uses higher TF bias now)
-    bt = backtest_signals(df_raw, risk, horizon=10,
-                          symbol=symbol,
-                          interval_key=interval_key)
+    # Ensemble backtest for stable metrics (v7.7.2)
+    bt = backtest_signals(
+        df_raw,
+        risk,
+        horizon=10,
+        symbol=symbol,
+        interval_key=interval_key,
+    )
 
-    # Adaptive confidence snapshot w/ higher timeframe confirmation + ML ensemble
+    # Adaptive confidence snapshot (HTF + ML ensemble)
     pred = latest_prediction(
         df_raw,
         risk,
@@ -1503,14 +1501,13 @@ def summarize_assets(
     Loop each ASSET_SYMBOLS and build a summary row:
     Price, Signal, Prob, Sentiment, TP/SL/RR, Trades, WinRate, Return%, etc.
 
-    v7.7:
-    - Uses higher timeframe-aware prediction + ensemble ML confidence.
-    - Uses ensemble backtest stats (WinRate stabilised).
-    - Includes winrate_std internally for potential display.
-    - Adaptive RSI / ATR regime / ADX / HTF confirmation all active.
-    - Weekend safety intact.
+    v7.7.2:
+    - Uses HTF-aware prediction + ML ensemble
+    - Uses confidence-weighted backtest stats
+    - Includes winrate_std
+    - Weekend safety intact
     """
-    _log("Fetching and analyzing market data (smart v7.7 HTF-confirmed + ML ensemble + adaptive filters)...")
+    _log("Fetching and analyzing market data (smart v7.7.2 HTF+ML+confP&L)...")
 
     rows = []
     for asset_name, symbol in ASSET_SYMBOLS.items():
@@ -1548,10 +1545,9 @@ def summarize_assets(
         return pd.DataFrame()
 
     summary_df = pd.DataFrame(rows)
-    # stable ordering for nicer UI
     summary_df.sort_values("Asset", inplace=True, ignore_index=True)
 
-    _log("[DEBUG summary head]")
+    _log("[DEBUG summary head v7.7.2]")
     try:
         _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
     except Exception:
