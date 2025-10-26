@@ -1,11 +1,11 @@
 # app.py - Woody Trades Pro dashboard
-# Smart v8.1 UI
+# Smart v8.2 UI
 #
-# - Keeps v8.0 features
-# - Adds Structure Overlay mode (Off / Buy Dips / Breakouts / Both)
-# - Passes structure_mode to utils
-# - Plots structure markers: dip buys / breakouts / breakdowns
-# - Overlays support/resistance dashed lines
+# v8.2 highlights:
+# - Engine now uses 5-fold cross-validated ML confidence (more stable)
+# - Structure Overlay (Buy Dips / Breakouts / Both) still included
+# - Weekend Mode, Adaptive TP/SL, Calibration Bias, Confidence Filter, etc.
+# - Candlestick chart overlays signals, dip buys, breakouts, support/resistance
 #
 import os
 import traceback
@@ -24,20 +24,16 @@ from utils import (
     INTERVALS,
 )
 
-# Streamlit watcher hardening
 os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
 
 st.set_page_config(
-    page_title="Woody Trades Pro - Smart v8.1",
+    page_title="Woody Trades Pro - Smart v8.2",
     layout="wide"
 )
 
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------
 # Sidebar controls
-# ---------------------------------------------------------------------
-
 st.sidebar.title("Settings")
 
 interval_key = st.sidebar.selectbox(
@@ -64,7 +60,7 @@ asset_choice = st.sidebar.selectbox(
     help="Used in the Detailed / Scenarios sections below.",
 )
 
-st.sidebar.caption("v8.1 engine: weekend-aware, adaptive TP/SL, HTF bias, calibrated ML, structure confluence")
+st.sidebar.caption("v8.2: 5-fold CV ML, structure confluence, adaptive TP/SL, calibration, PF/EV backtest")
 
 st.sidebar.subheader("Engine Controls")
 
@@ -107,10 +103,7 @@ structure_mode = st.sidebar.selectbox(
     help="Require structure confluence (support dips / breakouts). Fewer trades but higher quality."
 )
 
-# ---------------------------------------------------------------------
 # Cached loaders
-# ---------------------------------------------------------------------
-
 @st.cache_data(show_spinner=False)
 def load_summary(
     interval_key: str,
@@ -133,7 +126,6 @@ def load_summary(
         tp_sl_mode=tp_sl_mode,
         structure_mode=structure_mode,
     )
-
 
 @st.cache_data(show_spinner=False)
 def load_prediction_and_chart(
@@ -160,7 +152,6 @@ def load_prediction_and_chart(
         structure_mode=structure_mode,
     )
 
-
 @st.cache_data(show_spinner=False)
 def load_price_df(
     asset: str,
@@ -170,7 +161,6 @@ def load_price_df(
     calibration_enabled: bool,
     structure_mode: str,
 ):
-    # updated utils returns (symbol, df_with_ind, sig_points_dict)
     symbol, df_ind, sig_points = load_asset_with_indicators(
         asset,
         interval_key,
@@ -182,11 +172,7 @@ def load_price_df(
     )
     return symbol, df_ind, sig_points
 
-
-# ---------------------------------------------------------------------
-# 1) MARKET SUMMARY SECTION
-# ---------------------------------------------------------------------
-
+# 1) MARKET SUMMARY
 st.header("ð Market Summary")
 
 try:
@@ -205,9 +191,10 @@ try:
         st.warning("No summary data available.")
     else:
         st.caption(
-            f"Engine v8.1 â¢ Weekend={'ON' if weekend_mode else 'OFF'} â¢ TP/SL={tp_sl_mode} â¢ "
+            f"Engine v8.2 â¢ Weekend={'ON' if weekend_mode else 'OFF'} â¢ TP/SL={tp_sl_mode} â¢ "
             f"Filter={filter_level} â¢ Calib={'ON' if calibration_enabled else 'OFF'} â¢ "
-            f"Forced={'ON' if forced_trades_enabled else 'OFF'} â¢ Structure={structure_mode}"
+            f"Forced={'ON' if forced_trades_enabled else 'OFF'} â¢ Structure={structure_mode} â¢ "
+            f"ML=5-fold CV"
         )
 
         st.dataframe(
@@ -220,11 +207,7 @@ except Exception as e:
     st.error(f"Error loading summary: {e}")
     st.code(traceback.format_exc())
 
-
-# ---------------------------------------------------------------------
-# 2) DETAILED VIEW FOR ONE ASSET
-# ---------------------------------------------------------------------
-
+# 2) DETAILED VIEW
 st.header("ð Detailed View")
 
 try:
@@ -243,14 +226,12 @@ try:
     colA, colB, colC, colD = st.columns(4)
 
     if pred_block:
-        # Signal
         colA.metric(
             label="Signal",
             value=pred_block.get("side") or pred_block.get("signal") or "Hold",
             help="Buy / Sell / Hold after HTF bias + structure confluence.",
         )
 
-        # Confidence
         prob_val = (
             pred_block.get("probability")
             or pred_block.get("probability_calibrated")
@@ -260,10 +241,9 @@ try:
         colB.metric(
             label="Confidence",
             value=f"{(prob_val*100 if prob_val<=1 else prob_val):.2f}%",
-            help="Blended rule+ML conviction (calibrated if enabled).",
+            help="Blended rule+ML conviction (calibrated if enabled). Uses 5-fold CV ML.",
         )
 
-        # Win rate
         wr = pred_block.get("win_rate") or pred_block.get("winrate") or 0.0
         wr_std = pred_block.get("win_rate_std") or pred_block.get("winrate_std") or 0.0
         colC.metric(
@@ -272,7 +252,6 @@ try:
             help=f"Mean win% across ensemble seeds. Â±{wr_std:.2f} stdev.",
         )
 
-        # Trades
         tr = pred_block.get("trades") or 0
         colD.metric(
             label="Trades (backtest)",
@@ -280,7 +259,6 @@ try:
             help="Avg trades simulated across ensemble runs.",
         )
 
-        # TP/SL/RR etc.
         colE, colF, colG, colH = st.columns(4)
         tp_val = pred_block.get("tp")
         sl_val = pred_block.get("sl")
@@ -298,7 +276,6 @@ try:
             help="Stubbed sentiment: higher = more bullish tone.",
         )
 
-        # Third row: PF / EV / Stale / Interval
         colI, colJ, colK, colL = st.columns(4)
         pf_val = pred_block.get("profit_factor", "â")
         ev_val = pred_block.get("ev_pct", "â")
@@ -327,9 +304,7 @@ try:
     else:
         st.warning("No prediction block available for this asset.")
 
-    # ------------------------------------------
-    # Price chart (candles + EMA + markers + S/R)
-    # ------------------------------------------
+    # Price chart
     symbol_for_asset, df_asset_full, sig_points = load_price_df(
         asset_choice,
         interval_key,
@@ -342,7 +317,6 @@ try:
     if isinstance(df_asset_full, pd.DataFrame) and not df_asset_full.empty:
         fig = go.Figure()
 
-        # Candle trace
         fig.add_trace(go.Candlestick(
             x=df_asset_full.index,
             open=df_asset_full["Open"],
@@ -352,7 +326,6 @@ try:
             name="Price",
         ))
 
-        # EMA overlays
         if "ema20" in df_asset_full.columns:
             fig.add_trace(go.Scatter(
                 x=df_asset_full.index,
@@ -370,7 +343,6 @@ try:
                 line=dict(width=1.2),
             ))
 
-        # Structure: support/resistance dashed lines
         if sig_points and len(sig_points.get("time_index", [])) > 0:
             ti = sig_points["time_index"]
             sup = sig_points["support_series"]
@@ -391,7 +363,6 @@ try:
                 line=dict(width=1, dash="dot", color="darkgray"),
             ))
 
-        # Buy/Sell markers after full confluence
         if sig_points and len(sig_points.get("buy_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["buy_times"],
@@ -420,7 +391,6 @@ try:
                 ),
             ))
 
-        # Dip buy markers
         if sig_points and len(sig_points.get("dip_buy_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["dip_buy_times"],
@@ -435,7 +405,6 @@ try:
                 ),
             ))
 
-        # Bull breakout markers
         if sig_points and len(sig_points.get("bull_breakout_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["bull_breakout_times"],
@@ -450,7 +419,6 @@ try:
                 ),
             ))
 
-        # Bear breakdown markers
         if sig_points and len(sig_points.get("bear_breakdown_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["bear_breakdown_times"],
@@ -489,11 +457,7 @@ except Exception as e:
     st.error(f"Error loading detail view: {e}")
     st.code(traceback.format_exc())
 
-
-# ---------------------------------------------------------------------
 # 3) RAW DATA / DEBUG
-# ---------------------------------------------------------------------
-
 st.header("ð  Debug / Raw Data")
 
 with st.expander("Show model input data / indicators / backtest inputs"):
@@ -508,5 +472,4 @@ with st.expander("Show model input data / indicators / backtest inputs"):
         st.code(traceback.format_exc())
 
 st.caption(
-    "Engine smart v8.1 â¢ weekend-aware skip â¢ adaptive TP/SL â¢ HTF bias â¢ structure confluence â¢ calibrated ML â¢ ensemble backtest (PF / EV%)"
-)
+    "Engine smart v8.2 â¢ weekend-aware skip â¢ adaptive TP/SL â¢ HTF bias â¢ structure confluence â¢ 5-fold CV ML â¢ calibrated confidence â¢ ensemble backtest (PF / EV%)"
