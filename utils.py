@@ -1,61 +1,39 @@
-# utils.py - Woody Trades Pro (smart v7.7.2 full integrity)
+# utils.py - Woody Trades Pro (smart v7.8 Regime Adaptive full integrity)
 # =============================================================================
-# This file is intentionally verbose and self-contained.
+# This module is the evolution of v7.7.2 with regime awareness.
 #
-# It merges every working feature we've discussed so far:
+# ALL PRIOR FUNCTIONALITY IS PRESERVED:
 #   - robust fetch with caching + retry + mirror fallback
-#   - indicator calc (EMA20/50, RSI, RSI quantile bands, MACD, ATR, ATR%, ADX)
+#   - indicator calc (EMA20/50, RSI, RSI quantile bands, MACD, ATR, ATR%, ADX,
+#     engineered features like ema_diff, macd_slope, etc.)
 #   - sentiment stub per asset
-#   - adaptive rule-based signal engine (Buy / Sell / Hold)
-#       * dynamic RSI thresholds (rolling quantiles)
-#       * volatility regime gating via ATR% of price
-#       * ADX trend-strength gating
-#       * higher timeframe confirmation (1h→4h, 4h→1d, etc.)
-#   - ML-style probability
-#       * RandomForest + GradientBoosting ensemble on engineered features
-#       * rolling-window training for regime adaptiveness
-#   - RR/TP/SL engine using ATR and risk model
-#   - relaxed deterministic backtest with ATR-scaled P&L
-#       * ensemble backtest for stable win rate + std
-#       * v7.7.2: confidence-weighted P&L, probabilistic participation
-#   - adaptive confidence (weights rule vs ML based on recent performance)
-#   - weekend-safe fallback logic so UI never goes blank
-#   - chart marker support for Buy/Sell points
-#   - summary table builder for dashboard
-#   - helpers used in Detailed / Scenarios tabs, unchanged signatures
+#   - higher timeframe confirmation (multi-timeframe bias)
+#   - ML ensemble (RandomForest + GradientBoosting) using rolling-window data
+#   - ATR-based TP/SL and RR
+#   - Stale/weekend safety
+#   - Deterministic ensemble backtest and winrate_std
+#   - Confidence blending with recent winrate
+#   - Candlestick Buy/Sell marker extraction
 #
-# Stabilisation fixes included:
-#   - handles 2D columns (n,1) from yfinance
-#   - cleans MultiIndex columns
-#   - avoids circular import with Streamlit
-#   - warmup lowered so smaller windows still produce trades
-#   - probability clipped so it’s never 0 or 1
-#   - sentiment never stuck at 0
+# NEW IN v7.8:
+#   - Regime classification:
+#       trend_regime, range_regime, ema50_slope
+#   - Regime-aware signal engine:
+#       * trend continuation logic in trending markets
+#       * RSI mean-reversion logic in ranging markets
+#       * fallback to previous adaptive logic where unknown
+#   - Regime-aware TP/SL:
+#       * asymmetrical ATR multiples depending on trend vs range
+#   - ML context upgrade:
+#       * ML now sees regime features, slope, recent_winrate_hint
+#   - Backtest execution gating:
+#       * skip low-confidence trades unless regime is strongly aligned
 #
-# Weekend safety:
-#   - stale data (market closed/weekend) no longer kills TP/SL/WinRate
-#   - latest_prediction always returns structured info even if stale or Hold
-#   - deterministic ensemble backtest guarantees ≥1 trade so stats don't go blank
-#   - ATR fallback so TP/SL/RR always exist for UI
+# We DO NOT remove:
+#   - public signatures used by the Streamlit app (summarize_assets, etc.)
+#   - dict keys / columns expected by the UI
 #
-# Accuracy evolution:
-#   v7.5: ATR-scaled P&L, ensemble backtest, adaptive confidence.
-#   v7.6: Adaptive RSI, ATR% gating, ADX gating.
-#   v7.7: Higher timeframe confirmation + ML ensemble w/ engineered features.
-#   v7.7.2: Confidence-weighted P&L and smarter forced participation in backtest.
-#
-# The app imports:
-#   from utils import (
-#       summarize_assets,
-#       asset_prediction_and_backtest,
-#       load_asset_with_indicators,
-#       ASSET_SYMBOLS,
-#       INTERVALS,
-#   )
-#
-# This module is pure Python + pandas/numpy/sklearn/ta/yfinance.
-# No Streamlit calls here (print() only) to avoid circular imports.
-#
+# This file is still Streamlit-free. Safe for import from app.py.
 # =============================================================================
 
 from __future__ import annotations
@@ -70,13 +48,13 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Optional ML-ish models
+# ML models
 try:
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 except Exception:
     RandomForestClassifier = None
     try:
-        GradientBoostingClassifier  # may not exist
+        GradientBoostingClassifier  # might not exist in env
     except Exception:
         GradientBoostingClassifier = None  # type: ignore
 
@@ -96,7 +74,7 @@ except Exception:
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# IMPORTANT: "4h" now uses "4h" instead of "240m" (Yahoo quirk fix)
+# "4h" must be "4h" (not "240m") for yfinance now
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m",  "period": "5d",  "min_rows": 150},
     "1h":  {"interval": "1h",   "period": "2mo", "min_rows": 250},
@@ -122,29 +100,30 @@ ASSET_SYMBOLS: Dict[str, str] = {
     "Bitcoin": "BTC-USD",
 }
 
-# Adaptive signal config (v7.6+)
+# Adaptive signal config
 RSI_WINDOW = 100            # lookback for dynamic RSI bands
-RSI_Q_LOW = 0.2             # 20th percentile RSI = "oversold" threshold
-RSI_Q_HIGH = 0.8            # 80th percentile RSI = "overbought" threshold
+RSI_Q_LOW = 0.2             # 20th percentile RSI => adaptive oversold
+RSI_Q_HIGH = 0.8            # 80th percentile RSI => adaptive overbought
 
-VOL_REGIME_MIN_ATR_PCT = 0.3  # if ATR% of price < this, we call it dead/chop
-ADX_MIN_TREND = 20.0          # if ADX < this, trend-follow votes are downweighted
+VOL_REGIME_MIN_ATR_PCT = 0.3  # if ATR% < this => "dead / chop" for trend following
+ADX_MIN_TREND = 20.0          # ADX threshold suggesting directional strength
 
-# Higher timeframe mapping (v7.7+)
+# Higher timeframe mapping for directional bias
 HIGHER_TF_MAP = {
     "15m": "1h",
     "1h": "4h",
     "4h": "1d",
     "1d": "1wk",
-    "1wk": "1wk",  # top of the stack just maps to itself
+    "1wk": "1wk",
 }
 
-# ML config v7.7+
-ML_RECENT_WINDOW = 500  # only train ML models on the most recent N rows
+# ML config
+ML_RECENT_WINDOW = 500  # train ML only on most recent N rows (regime adaptive)
 
-# Backtest participation tuning (v7.7.2)
-FORCED_TRADE_PROB = 0.02     # base random chance to "force" a trade
-FORCED_CONF_MIN = 0.55       # only force if local confidence > this
+# Backtest tuning
+FORCED_TRADE_PROB = 0.02     # base chance to "force" a trade when Hold
+FORCED_CONF_MIN = 0.55       # only force if confidence above this
+CONF_EXEC_THRESHOLD = 0.6    # skip trades entirely below this conf unless regime says "this is our jam"
 
 
 # =============================================================================
@@ -153,7 +132,7 @@ FORCED_CONF_MIN = 0.55       # only force if local confidence > this
 
 def _log(msg: str) -> None:
     """
-    Safe print for Streamlit Cloud / containers.
+    Safe print for container / Streamlit Cloud.
     """
     try:
         print(msg, flush=True)
@@ -168,7 +147,6 @@ def _log(msg: str) -> None:
 def _cache_path(symbol: str, interval_key: str) -> Path:
     """
     Local CSV cache path.
-    e.g. BTC-USD_1h.csv (but normalized chars)
     """
     safe = (
         symbol.replace("^", "")
@@ -181,17 +159,16 @@ def _cache_path(symbol: str, interval_key: str) -> Path:
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Make sure df has columns we need (Open/High/Low/Close/Volume),
-    1-D columns (no (n,1)), clean datetime index, no inf/NaN explosions.
+    Make sure df has (Open/High/Low/Close/Volume),
+    flatten yfinance multiindex, fix 2D cols, sort by datetime,
+    ffill/bfill, drop all-NaN rows.
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
 
-    # yfinance often returns MultiIndex columns like ('Close','GC=F')
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # keep canonical cols if they exist
     keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
     if not keep:
         # last resort rename
@@ -200,7 +177,6 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
     df = df[keep].copy()
 
-    # index -> datetime
     if not isinstance(df.index, pd.DatetimeIndex):
         try:
             df.index = pd.to_datetime(df.index)
@@ -208,7 +184,6 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
             pass
     df = df.sort_index()
 
-    # flatten any (n,1) columns into 1-D
     for col in df.columns:
         vals = df[col].values
         if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
@@ -220,15 +195,14 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.ffill().bfill()
     df = df.dropna(how="all")
+    df = df[~df.index.duplicated(keep="last")]
 
     return df
 
 
 def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
     """
-    Primary data fetch via yf.download.
-    We keep threads=False for stability (Streamlit Cloud sometimes
-    blows up on multi-threaded).
+    Primary fetch via yf.download.
     """
     try:
         raw = yf.download(
@@ -246,7 +220,7 @@ def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
 
 def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
     """
-    Mirror fetch via yf.Ticker(...).history() as a fallback.
+    Mirror fetch via yf.Ticker(...).history() as fallback.
     """
     try:
         tk = yf.Ticker(symbol)
@@ -255,7 +229,6 @@ def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
         if not df.empty:
             return df
 
-        # fallback attempt without auto_adjust
         raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
         return _normalize_ohlcv(raw2)
     except Exception as e:
@@ -271,11 +244,11 @@ def fetch_data(
     backoff_range: Tuple[float, float] = (2.5, 6.0),
 ) -> pd.DataFrame:
     """
-    Unified fetch:
-    1. Try cache (CSV). If enough rows, return.
-    2. Retry live download up to max_retries.
-    3. Mirror fallback.
-    4. Cache successful result.
+    Unified fetch with:
+      1. cache check
+      2. retry loop
+      3. mirror fallback
+      4. cache write
     """
     if interval_key not in INTERVALS:
         raise KeyError(
@@ -289,7 +262,6 @@ def fetch_data(
     _log(f"⏳ Fetching {symbol} [{interval}] ...")
     cache_fp = _cache_path(symbol, interval_key)
 
-    # 1. cache first
     if use_cache and cache_fp.exists():
         try:
             cached = pd.read_csv(
@@ -302,11 +274,10 @@ def fetch_data(
                 _log(f"✅ Using cached {symbol} ({len(cached)} rows).")
                 return cached
             else:
-                _log(f"ℹ️ cache for {symbol} only {len(cached)} rows (<{min_rows})")
+                _log(f"ℹ️ Cache for {symbol} only {len(cached)} rows (<{min_rows})")
         except Exception as e:
             _log(f"⚠️ Cache read failed for {symbol}: {e}")
 
-    # 2. live retries
     for attempt in range(1, max_retries + 1):
         df_live = _yahoo_download(symbol, interval, period)
         if not df_live.empty and len(df_live) >= min_rows:
@@ -324,7 +295,6 @@ def fetch_data(
         )
         time.sleep(np.random.uniform(*backoff_range))
 
-    # 3. mirror
     _log(f"🪞 Mirror fetch for {symbol}...")
     df_mirror = _yahoo_history(symbol, interval, period)
     if not df_mirror.empty and len(df_mirror) >= min_rows:
@@ -341,8 +311,8 @@ def fetch_data(
 
 
 # =============================================================================
-# INDICATORS (EMA20/50, RSI, RSI quantile bands, MACD, ATR, ATR%, ADX)
-# plus engineered features for ML
+# INDICATORS (EMA20/50, RSI, RSI quantile bands, MACD, ATR, atr_pct, ADX)
+# plus engineered features and NEW regime flags
 # =============================================================================
 
 def _ema_fallback(series: pd.Series, span: int) -> pd.Series:
@@ -375,33 +345,90 @@ def _atr_fallback(high: pd.Series, low: pd.Series, close: pd.Series, window: int
 
 
 def _adx_fallback(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    """
-    Fallback if ta.ADXIndicator isn't available.
-    We'll just return NaNs so logic downstream can gracefully skip ADX gating.
-    """
+    # If ADXIndicator is missing, just NaNs so downstream gating is permissive
     return pd.Series(index=close.index, dtype=float)
+
+
+def _compute_regime_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - ema50_slope: slope of ema50 (trend direction / strength proxy)
+      - trend_regime: 1 if market is trending (ema20 vs ema50 aligned,
+                      ADX high, slope not tiny)
+      - range_regime: 1 if chop regime (low ADX, low atr_pct etc)
+
+    These drive regime-aware signal generation + TP/SL logic.
+    """
+    if df.empty:
+        df["ema50_slope"] = np.nan
+        df["trend_regime"] = 0
+        df["range_regime"] = 0
+        return df
+
+    # ema50_slope: difference of ema50 over N bars (scaled)
+    # We'll use a small window like 5 bars to detect drift direction.
+    if "ema50" in df.columns:
+        df["ema50_slope"] = df["ema50"].diff(5)
+    else:
+        df["ema50_slope"] = np.nan
+
+    # Trend regime:
+    # conditions we like:
+    #  - ema20 > ema50 (bull trend) or ema20 < ema50 (bear trend)
+    #  - ADX >= ADX_MIN_TREND
+    #  - abs(ema50_slope) > small epsilon
+    slope_ok = df["ema50_slope"].abs() > 1e-6
+    ema20 = df.get("ema20", pd.Series(index=df.index, dtype=float))
+    ema50 = df.get("ema50", pd.Series(index=df.index, dtype=float))
+    adx = df.get("adx", pd.Series(index=df.index, dtype=float))
+
+    ema_aligned = (ema20 > ema50) | (ema20 < ema50)
+    strong_adx = adx >= ADX_MIN_TREND
+
+    df["trend_regime"] = (
+        ema_aligned.astype(int)
+        * strong_adx.astype(int)
+        * slope_ok.astype(int)
+    ).astype(int)
+
+    # Range regime:
+    # "Chop" is roughly low ADX and low ATR% of price
+    atr_pct = df.get("atr_pct", pd.Series(index=df.index, dtype=float))
+    weak_adx = adx < ADX_MIN_TREND
+    low_vol  = atr_pct < VOL_REGIME_MIN_ATR_PCT
+    df["range_regime"] = (
+        weak_adx.astype(int)
+        * low_vol.astype(int)
+    ).astype(int)
+
+    # Safety: if both flags accidentally 1, choose the dominant one.
+    both_1 = (df["trend_regime"] == 1) & (df["range_regime"] == 1)
+    if both_1.any():
+        # heuristically prefer trend_regime when both light up,
+        # kill range_regime there
+        df.loc[both_1, "range_regime"] = 0
+
+    return df
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds:
+    Adds all indicators + regime flags:
       - ema20, ema50
-      - RSI (14)
-      - Rolling RSI quantile bands (rsi_low_band, rsi_high_band)
+      - RSI, rsi_low_band, rsi_high_band
       - MACD line/signal/hist
-      - ATR (14), atr_pct (ATR / Close * 100)
-      - ADX (trend strength)
-      - Engineered features for ML ensemble:
-          * ema_diff = ema20 - ema50
-          * rsi_slope = RSI.diff()
-          * macd_slope = macd.diff()
-    Also duplicates RSI->rsi for legacy usage.
+      - ATR, atr_pct
+      - ADX
+      - ema_diff, rsi_slope, macd_slope
+      - ema50_slope
+      - trend_regime (1/0)
+      - range_regime (1/0)
+
+    This is the single source of truth for downstream logic.
     """
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
-
-    # Safety: remove duplicate timestamps if any
     df = df[~df.index.duplicated(keep="last")]
 
     for col in ["Close", "High", "Low"]:
@@ -416,15 +443,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high = df["High"]
     low = df["Low"]
 
-    # EMA
+    # EMA20 / EMA50
     try:
         if EMAIndicator is None:
             raise RuntimeError("ta not available")
         df["ema20"] = EMAIndicator(close=close, window=20).ema_indicator()
         df["ema50"] = EMAIndicator(close=close, window=50).ema_indicator()
     except Exception:
-        df["ema20"] = _ema_fallback(close, 20)
-        df["ema50"] = _ema_fallback(close, 50)
+        df["ema20"] = close.ewm(span=20, adjust=False).mean()
+        df["ema50"] = close.ewm(span=50, adjust=False).mean()
 
     # RSI
     try:
@@ -435,7 +462,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["RSI"] = _rsi_fallback(close, 14)
     df["rsi"] = df["RSI"]
 
-    # RSI quantile bands for adaptive oversold/overbought
+    # RSI quantile bands
     try:
         df["rsi_low_band"] = (
             df["RSI"]
@@ -474,27 +501,25 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         df["atr"] = _atr_fallback(high, low, close, 14)
 
-    # ATR % of price (vol regime feature)
+    # ATR % of price
     df["atr_pct"] = (df["atr"] / df["Close"]) * 100.0
 
-    # ADX (trend strength)
+    # ADX
     try:
         if ADXIndicator is None:
             raise RuntimeError("ta not available")
-        adx_calc = ADXIndicator(
-            high=high,
-            low=low,
-            close=close,
-            window=14,
-        )
+        adx_calc = ADXIndicator(high=high, low=low, close=close, window=14)
         df["adx"] = adx_calc.adx()
     except Exception:
         df["adx"] = _adx_fallback(high, low, close, 14)
 
-    # Engineered features for ML ensemble
+    # Engineered features
     df["ema_diff"] = df["ema20"] - df["ema50"]
     df["rsi_slope"] = df["RSI"].diff()
     df["macd_slope"] = df["macd"].diff()
+
+    # Regime flags
+    df = _compute_regime_flags(df)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.ffill(inplace=True)
@@ -510,8 +535,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_sentiment_stub(symbol: str) -> float:
     """
-    Fake sentiment placeholder. Keeps UI alive.
-    0.5 = neutral. Risk-on assets get a mild bullish bias.
+    Stub sentiment.
     """
     bias_map = {
         "BTC-USD": 0.65,
@@ -519,22 +543,17 @@ def compute_sentiment_stub(symbol: str) -> float:
         "CL=F": 0.55,
     }
     base = bias_map.get(symbol, 0.5)
-    # Stable (no jitter) for UI clarity
     return round(float(base), 2)
 
 
 # =============================================================================
-# ADAPTIVE SIGNAL ENGINE (RSI quantiles, ATR% gating, ADX gating)
-# + higher timeframe confirmation
+# SIGNAL ENGINE (regime-aware) + higher timeframe confirmation
 # =============================================================================
 
 def _adaptive_rsi_vote(row: pd.Series) -> float:
     """
-    Returns +1 for bullish oversold bounce, -1 for bearish overbought fade,
-    0 otherwise, using adaptive RSI quantile bands if available.
-
-    Fallback logic:
-    - If adaptive bands are NaN (early bars), revert to RSI<30 and RSI>70.
+    +1 if oversold bounce, -1 if overbought fade, 0 otherwise.
+    Uses dynamic RSI bands if available, else classic 30/70.
     """
     rsi_val = row.get("RSI", np.nan)
     low_band = row.get("rsi_low_band", np.nan)
@@ -543,16 +562,14 @@ def _adaptive_rsi_vote(row: pd.Series) -> float:
     if pd.isna(rsi_val):
         return 0.0
 
-    # If we have dynamic bands, use them
     if not pd.isna(low_band) and not pd.isna(high_band):
         if rsi_val <= low_band:
-            return 1.0   # bullish
+            return 1.0
         elif rsi_val >= high_band:
-            return -1.0  # bearish
+            return -1.0
         else:
             return 0.0
 
-    # Fallback: classical thresholds
     if rsi_val < 30:
         return 1.0
     elif rsi_val > 70:
@@ -563,19 +580,12 @@ def _adaptive_rsi_vote(row: pd.Series) -> float:
 def _trend_votes(prev_row: pd.Series, row: pd.Series) -> Tuple[float, float]:
     """
     Returns (trend_score, macd_score)
-
-    trend_score:
-      +1 if ema20 > ema50 (bull trend)
-      -1 if ema20 < ema50 (bear trend)
-
-    macd_score:
-      +1 if bullish crossover just happened
-      -1 if bearish crossover just happened
+    trend_score: +1 bull if ema20>ema50, -1 bear if ema20<ema50
+    macd_score: +1 on bullish cross, -1 on bearish cross
     """
     trend_score = 0.0
     macd_score = 0.0
 
-    # EMA directional vote
     e20 = row.get("ema20", np.nan)
     e50 = row.get("ema50", np.nan)
     if pd.notna(e20) and pd.notna(e50):
@@ -584,7 +594,6 @@ def _trend_votes(prev_row: pd.Series, row: pd.Series) -> Tuple[float, float]:
         elif e20 < e50:
             trend_score = -1.0
 
-    # MACD cross vote
     a1 = row.get("macd", np.nan)
     b1 = row.get("macd_signal", np.nan)
     a0 = prev_row.get("macd", np.nan)
@@ -603,19 +612,17 @@ def _trend_votes(prev_row: pd.Series, row: pd.Series) -> Tuple[float, float]:
 
 def _apply_volatility_gating(row: pd.Series) -> bool:
     """
-    Returns True if volatility is acceptable (ATR% is above a floor),
-    otherwise False meaning "market is too dead / avoid trend trades".
+    True if ATR% looks tradeable for trend continuation.
     """
     atr_pct = row.get("atr_pct", np.nan)
     if pd.isna(atr_pct):
-        return True  # can't decide -> don't block
+        return True
     return float(atr_pct) >= VOL_REGIME_MIN_ATR_PCT
 
 
 def _apply_adx_gating(row: pd.Series) -> bool:
     """
-    Returns True if ADX suggests an actual trend (ADX >= ADX_MIN_TREND).
-    If ADX is missing, default True (don't block).
+    True if ADX says there's actually a trend.
     """
     adx_val = row.get("adx", np.nan)
     if pd.isna(adx_val):
@@ -623,50 +630,129 @@ def _apply_adx_gating(row: pd.Series) -> bool:
     return float(adx_val) >= ADX_MIN_TREND
 
 
-def _compute_signal_local_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
+def _compute_signal_regime_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    Core (v7.6+) adaptive signal logic using RSI bands, ATR regime, ADX.
-    Returns (side, conf) with side in {"Buy","Sell","Hold"}.
+    v7.8 regime-aware logic.
+    We separate ideas:
+      - Trend regime prefers continuation in the trend direction,
+        uses trend_votes & macd_votes more heavily,
+        and suppresses countertrend RSI fades unless RSI is *extreme*.
+      - Range regime prefers RSI mean reversion,
+        suppresses breakout continuation logic.
+
+    Returns (side, conf) like before.
     """
-    score = 0.0
-    votes = 0
 
-    # 1) Adaptive RSI vote (can trigger even in chop)
-    rsi_vote = _adaptive_rsi_vote(row)
-    if rsi_vote != 0.0:
-        votes += 1
-        score += rsi_vote
+    trend_reg = int(row.get("trend_regime", 0))
+    range_reg = int(row.get("range_regime", 0))
 
-    # 2) Trend / MACD votes (only if market regime looks tradeable)
+    # We'll build two "candidate" signals:
+    #  - cont_side, cont_conf from continuation logic
+    #  - mean_side, mean_conf from RSI reversal logic
+    # Then pick based on regime flags.
+
+    # --- continuation logic (trend following)
+    cont_score = 0.0
+    cont_votes = 0
+
     vol_ok = _apply_volatility_gating(row)
     adx_ok = _apply_adx_gating(row)
+    tr_vote, macd_vote = _trend_votes(prev_row, row)
 
-    trend_vote, macd_vote = _trend_votes(prev_row, row)
     if vol_ok and adx_ok:
-        if trend_vote != 0.0:
-            votes += 1
-            score += trend_vote
+        if tr_vote != 0.0:
+            cont_votes += 1
+            cont_score += tr_vote
         if macd_vote != 0.0:
-            votes += 1
-            score += macd_vote
-    # else: in low-vol chop we do NOT add weak EMA/MACD continuation votes
+            cont_votes += 1
+            cont_score += macd_vote
 
-    # confidence = how aligned are the votes
-    conf = 0.0 if votes == 0 else min(1.0, abs(score) / votes)
-
-    # raw side
-    if votes > 0 and score >= 0.67 * votes:
-        side = "Buy"
-    elif votes > 0 and score <= -0.67 * votes:
-        side = "Sell"
+    if cont_votes > 0:
+        cont_conf_raw = min(1.0, abs(cont_score) / cont_votes)
+        if cont_score >= 0.67 * cont_votes:
+            cont_side = "Buy"
+        elif cont_score <= -0.67 * cont_votes:
+            cont_side = "Sell"
+        else:
+            cont_side = "Hold"
     else:
-        side = "Hold"
+        cont_conf_raw = 0.0
+        cont_side = "Hold"
 
-    # "Hold" means uncertainty: invert conf so Hold has smaller final conf
-    if side == "Hold":
-        conf = 1.0 - conf
+    if cont_side == "Hold":
+        cont_conf = 1.0 - cont_conf_raw
+    else:
+        cont_conf = cont_conf_raw
 
-    return side, conf
+    # --- mean reversion logic (RSI reversal)
+    rev_score = 0.0
+    rev_votes = 0
+    rsi_vote = _adaptive_rsi_vote(row)
+    if rsi_vote != 0.0:
+        rev_votes += 1
+        rev_score += rsi_vote
+
+    if rev_votes > 0:
+        rev_conf_raw = min(1.0, abs(rev_score) / rev_votes)
+        if rev_score > 0:
+            rev_side = "Buy"
+        elif rev_score < 0:
+            rev_side = "Sell"
+        else:
+            rev_side = "Hold"
+    else:
+        rev_conf_raw = 0.0
+        rev_side = "Hold"
+
+    if rev_side == "Hold":
+        rev_conf = 1.0 - rev_conf_raw
+    else:
+        rev_conf = rev_conf_raw
+
+    # Decision based on regime
+    # trend_regime prefers continuation logic
+    # range_regime prefers mean-reversion logic
+    # neither -> fallback to blended original style
+
+    if trend_reg and not range_reg:
+        # continuation is primary
+        final_side = cont_side
+        final_conf = cont_conf
+        # If continuation says Hold, allow RSI fade only if it's opposite
+        if final_side == "Hold" and rev_side != "Hold":
+            final_side = rev_side
+            final_conf = rev_conf * 0.6  # downgrade RSI in a trend
+    elif range_reg and not trend_reg:
+        # range -> mean reversion is primary
+        final_side = rev_side
+        final_conf = rev_conf
+        # If RSI says Hold, maybe allow continuation but weaker
+        if final_side == "Hold" and cont_side != "Hold":
+            final_side = cont_side
+            final_conf = cont_conf * 0.6
+    else:
+        # ambiguous regime or both zero: blend
+        # We'll roughly average confidences if both give signals.
+        if cont_side != "Hold" and rev_side != "Hold":
+            if cont_side == rev_side:
+                # both agree -> boost
+                final_side = cont_side
+                final_conf = min(1.0, 0.5 * (cont_conf + rev_conf) + 0.25)
+            else:
+                # disagree -> Hold with low-ish confidence
+                final_side = "Hold"
+                final_conf = 0.5 * abs(cont_conf - rev_conf)
+        elif cont_side != "Hold":
+            final_side = cont_side
+            final_conf = cont_conf
+        elif rev_side != "Hold":
+            final_side = rev_side
+            final_conf = rev_conf
+        else:
+            final_side = "Hold"
+            final_conf = 0.5  # shrug
+
+    return final_side, final_conf
 
 
 def _get_higher_tf_bias_for_asset(
@@ -678,11 +764,9 @@ def _get_higher_tf_bias_for_asset(
     Returns higher timeframe directional bias:
       +1 bullish (ema20 > ema50),
       -1 bearish (ema20 < ema50),
-       0 neutral or unavailable.
+       0 neutral / can't decide.
     """
     higher_key = HIGHER_TF_MAP.get(interval_key, interval_key)
-
-    # if same key, we can't step up -> neutral
     if higher_key == interval_key:
         return 0
 
@@ -709,22 +793,24 @@ def _compute_signal_row_with_higher_tf(
     higher_bias: int,
 ) -> Tuple[str, float]:
     """
-    Take the local signal and then apply higher timeframe
-    directional bias. If conflict, downgrade to Hold and reduce confidence.
+    v7.8:
+    - Use regime-aware local logic (_compute_signal_regime_row)
+    - Then apply higher timeframe directional bias filter
+      (suppress countertrend trades).
     """
-    side_local, conf_local = _compute_signal_local_row(prev_row, row)
+    side_local, conf_local = _compute_signal_regime_row(prev_row, row)
 
     if higher_bias == 0:
         return side_local, conf_local
 
     if higher_bias > 0:
-        # bigger-trend bullish: don't allow Sell
+        # bullish bias: suppress Sell
         if side_local == "Sell":
             return "Hold", conf_local * 0.5
         return side_local, conf_local
 
     if higher_bias < 0:
-        # bigger-trend bearish: don't allow Buy
+        # bearish bias: suppress Buy
         if side_local == "Buy":
             return "Hold", conf_local * 0.5
         return side_local, conf_local
@@ -732,9 +818,14 @@ def _compute_signal_row_with_higher_tf(
     return side_local, conf_local
 
 
-def _compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
+# =============================================================================
+# REGIME-AWARE TP/SL
+# =============================================================================
+
+def _compute_tp_sl_base(price: float, atr: float, side: str, risk: str) -> Tuple[float, float]:
     """
-    ATR-based TP/SL using RISK_MULT.
+    Backward-compatible baseline TP/SL using RISK_MULT.
+    (This stays for fallback / Hold.)
     """
     m = RISK_MULT.get(risk, RISK_MULT["Medium"])
     tp_k = float(m["tp_atr"])
@@ -748,37 +839,92 @@ def _compute_tp_sl(price: float, atr: float, side: str, risk: str) -> Tuple[floa
     return float(tp), float(sl)
 
 
-# =============================================================================
-# ML-STYLE CONFIDENCE (RF + GBM ensemble with engineered features)
-# =============================================================================
-
-def _prepare_ml_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def _compute_tp_sl_regime(
+    price: float,
+    atr: float,
+    side: str,
+    risk: str,
+    row: pd.Series,
+) -> Tuple[float, float]:
     """
-    Prepare a supervised learning frame with engineered features and
-    a binary target 'target_up' = 1 if next close > current close.
+    v7.8:
+    Adjust TP/SL asymmetrically depending on regime.
+    - trending: let winners run, cut losers quicker
+    - ranging: take profit earlier, also cut quickly
+    If we can't decide regime, fall back to baseline.
+    """
+    trend_reg = int(row.get("trend_regime", 0))
+    range_reg = int(row.get("range_regime", 0))
 
-    Uses only the most recent ML_RECENT_WINDOW rows to adapt to
-    the current regime.
+    # baseline multipliers from RISK_MULT
+    base = RISK_MULT.get(risk, RISK_MULT["Medium"])
+    base_tp = float(base["tp_atr"])
+    base_sl = float(base["sl_atr"])
+
+    tp_mult = base_tp
+    sl_mult = base_sl
+
+    if trend_reg and not range_reg:
+        # In trend: try to stretch TP vs SL
+        tp_mult = base_tp * 1.2  # slightly farther target
+        sl_mult = base_sl * 0.9  # slightly tighter stop
+    elif range_reg and not trend_reg:
+        # In range: get in/out faster, symmetric-ish
+        tp_mult = base_tp * 0.8
+        sl_mult = base_sl * 0.8
+
+    if side == "Buy":
+        tp = price + tp_mult * atr
+        sl = price - sl_mult * atr
+    else:
+        tp = price - tp_mult * atr
+        sl = price + sl_mult * atr
+
+    return float(tp), float(sl)
+
+
+# =============================================================================
+# ML CONFIDENCE (ensemble) with regime features
+# =============================================================================
+
+def _prepare_ml_frame(
+    df: pd.DataFrame,
+    recent_winrate_hint: Optional[float] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Build supervised ML table with engineered features + regime info.
+    Adds recent_winrate_hint as a constant column so the model can learn
+    regime interaction with strategy performance.
+
+    Only keeps the most recent ML_RECENT_WINDOW rows.
     """
     if df is None or df.empty:
         return None
 
     work = df.copy()
 
+    # Build a "recent_winrate_hint" column broadcast across rows
+    # If not provided, assume 50.
+    hint_val = float(recent_winrate_hint) if recent_winrate_hint is not None else 50.0
+    work["recent_winrate_hint"] = hint_val
+
+    # required cols for ML
     needed_cols = [
-        "RSI", "ema20", "ema50", "macd", "macd_signal",
-        "atr_pct", "adx", "ema_diff", "rsi_slope", "macd_slope",
+        "RSI", "ema20", "ema50", "ema_diff", "ema50_slope",
+        "macd", "macd_signal", "macd_slope",
+        "atr_pct", "adx",
+        "trend_regime", "range_regime",
+        "rsi_slope",
+        "recent_winrate_hint",
         "Close",
     ]
     for c in needed_cols:
         if c not in work.columns:
             return None
 
-    # keep only recent slice
     if len(work) > ML_RECENT_WINDOW:
         work = work.iloc[-ML_RECENT_WINDOW:].copy()
 
-    # target_up
     work["target_up"] = (work["Close"].shift(-1) > work["Close"]).astype(int)
 
     work.dropna(inplace=True)
@@ -788,30 +934,29 @@ def _prepare_ml_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return work
 
 
-def _ml_direction_confidence(df: pd.DataFrame) -> float:
+def _ml_direction_confidence(
+    df: pd.DataFrame,
+    recent_winrate_hint: Optional[float] = None,
+) -> float:
     """
-    Returns average probability of "up" on recent candles using
-    an ensemble of:
-      - RandomForestClassifier
-      - GradientBoostingClassifier (if available)
-
-    Falls back to 0.5 on any failure.
-
-    Training:
-      - last ML_RECENT_WINDOW rows (recent regime)
-      - 80/20 temporal split
+    Ensemble ML probability of next candle being up.
+    Uses RandomForest + GradientBoosting if available.
+    Includes regime and recent_winrate_hint features.
     """
-    # must have sklearn
     if RandomForestClassifier is None:
         return 0.5
 
-    work = _prepare_ml_frame(df)
+    work = _prepare_ml_frame(df, recent_winrate_hint)
     if work is None:
         return 0.5
 
     feat_cols = [
-        "RSI", "ema20", "ema50", "macd", "macd_signal",
-        "atr_pct", "adx", "ema_diff", "rsi_slope", "macd_slope",
+        "RSI", "ema20", "ema50", "ema_diff", "ema50_slope",
+        "macd", "macd_signal", "macd_slope",
+        "atr_pct", "adx",
+        "trend_regime", "range_regime",
+        "rsi_slope",
+        "recent_winrate_hint",
     ]
 
     X = work[feat_cols]
@@ -854,31 +999,24 @@ def _ml_direction_confidence(df: pd.DataFrame) -> float:
     else:
         blended = rf_avg
 
-    blended = max(0.05, min(0.95, blended))
-    return blended
+    return max(0.05, min(0.95, blended))
 
 
 # =============================================================================
-# STALENESS CHECK (weekend / market closed awareness)
+# STALENESS CHECK
 # =============================================================================
 
 def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
     """
-    Heuristic:
-    - Take timestamp of last candle
-    - Compare to "now" (UTC)
-    - If gap > max_age_minutes, consider stale.
-    This allows weekend/holiday data to still show predictions
-    instead of going blank.
+    Heuristic to avoid nuking UI on weekends/holidays.
     """
     try:
         if df is None or df.empty:
             return True
         last_ts = df.index[-1]
         if not isinstance(last_ts, pd.Timestamp):
-            return False  # can't measure, assume not stale
+            return False
         now_ts = pd.Timestamp.utcnow()
-        # normalize last_ts to UTC
         last_ts_utc = last_ts.tz_convert("UTC") if last_ts.tzinfo else last_ts.tz_localize("UTC")
         age_min = (now_ts - last_ts_utc).total_seconds() / 60.0
         return age_min > max_age_minutes
@@ -887,7 +1025,8 @@ def _is_stale_df(df: pd.DataFrame, max_age_minutes: float = 180.0) -> bool:
 
 
 # =============================================================================
-# BACKTEST CORE: SINGLE RUN WITH CONFIDENCE-WEIGHTED ATR P&L (v7.7.2)
+# BACKTEST CORE (single run, deterministic seed)
+# Regime-aware TP/SL, confidence gating, confidence-weighted P&L.
 # =============================================================================
 
 def _backtest_once(
@@ -899,23 +1038,17 @@ def _backtest_once(
     interval_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Internal:
-    Run one relaxed backtest.
-    Deterministic via provided seed.
-    ATR-scaled P&L that is now *confidence-weighted*.
-    Also uses smarter "forced" participation (v7.7.2).
+    One deterministic run of the relaxed backtest.
 
-    Steps:
-    - Get higher timeframe bias once for this run.
-    - Walk candles.
-    - Compute side/conf with _compute_signal_row_with_higher_tf.
-    - If side == "Hold", *maybe* force a trade, but ONLY if confidence
-      is decent (> FORCED_CONF_MIN) AND rng passes.
-    - Apply TP/SL simulation.
-    - P&L impact is scaled by both rr_local and signal confidence.
+    v7.8 changes:
+    - Use regime-aware + HTF-filtered signal
+    - Skip trades with low confidence (<CONF_EXEC_THRESHOLD)
+      unless they're aligned with a strong regime
+    - Regime-aware TP/SL (_compute_tp_sl_regime)
+    - Confidence-weighted ATR P&L remains in effect
+    - Forced participation still exists but is gated harder
     """
 
-    # deterministic seed => consistent Forced trade sampling
     np.random.seed(int(seed) % (2**32 - 1))
 
     balance = 1.0
@@ -924,7 +1057,6 @@ def _backtest_once(
     trades = 0
     drawdowns = []
 
-    # Pre-compute higher TF bias once, per run
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
     else:
@@ -934,22 +1066,42 @@ def _backtest_once(
         prev_row = df_ind.iloc[i - 1]
         cur_row  = df_ind.iloc[i]
 
-        # get directional call + confidence
         side_local, conf_local = _compute_signal_row_with_higher_tf(prev_row, cur_row, higher_bias)
         side = side_local
 
-        # smarter "forced participation"
+        # Decide if regime is strong in the direction:
+        trend_reg = int(cur_row.get("trend_regime", 0))
+        range_reg = int(cur_row.get("range_regime", 0))
+        bullish_trend = trend_reg and (cur_row.get("ema20", 0) > cur_row.get("ema50", 0))
+        bearish_trend = trend_reg and (cur_row.get("ema20", 0) < cur_row.get("ema50", 0))
+
+        # regime_allows_relaxed means we can allow slightly < threshold confidences
+        regime_allows_relaxed = (
+            (side == "Buy"  and bullish_trend) or
+            (side == "Sell" and bearish_trend) or
+            (range_reg and side in ["Buy","Sell"])
+        )
+
+        # Core skip logic:
         if side == "Hold":
+            # maybe force a trade ONLY if confidence decent and RNG hits
             if (conf_local > FORCED_CONF_MIN) and (np.random.rand() < FORCED_TRADE_PROB):
                 side = np.random.choice(["Buy", "Sell"])
             else:
                 continue
+        else:
+            # side is Buy/Sell
+            if conf_local < CONF_EXEC_THRESHOLD and not regime_allows_relaxed:
+                # skip weak confidence unless regime says "this is our jam"
+                continue
 
         price_now = float(cur_row["Close"])
         atr_now = float(cur_row.get("atr", price_now * 0.005))
-        tp_lvl, sl_lvl = _compute_tp_sl(price_now, atr_now, side, risk)
 
-        # Risk / reward in absolute price terms for dynamic P/L scaling
+        # Use regime-aware TP/SL:
+        tp_lvl, sl_lvl = _compute_tp_sl_regime(price_now, atr_now, side, risk, cur_row)
+
+        # Distance for RR local
         if side == "Buy":
             reward_dist = max(tp_lvl - price_now, 1e-12)
             risk_dist   = max(price_now - sl_lvl, 1e-12)
@@ -959,7 +1111,7 @@ def _backtest_once(
 
         rr_local = reward_dist / risk_dist if risk_dist != 0 else 1.0
 
-        # See TP/SL first
+        # Step fwd horizon bars, see hit TP or SL first
         hit = None
         for j in range(1, horizon + 1):
             nxt = df_ind.iloc[i + j]
@@ -972,7 +1124,7 @@ def _backtest_once(
                 elif nxt_px <= sl_lvl:
                     hit = "SL"
                     break
-            else:  # Sell
+            else:
                 if nxt_px <= tp_lvl:
                     hit = "TP"
                     break
@@ -983,22 +1135,19 @@ def _backtest_once(
         if hit is not None:
             trades += 1
 
-            # v7.7.2: confidence-weighted P&L
-            impact_scale = max(conf_local, 0.05)  # don't let zero wipe effect
-
+            impact_scale = max(conf_local, 0.05)
             if hit == "TP":
                 balance *= (1.0 + 0.01 * rr_local * impact_scale)
                 wins += 1
             else:
                 balance *= (1.0 - 0.01 / max(rr_local, 1e-12) * impact_scale)
 
-        # drawdown tracking
         peak = max(peak, balance)
         dd = (peak - balance) / peak if peak > 0 else 0
         drawdowns.append(dd)
 
-    # weekend / silent-market fallback so UI still shows stats
     if trades == 0:
+        # weekend / no-trade fallback so UI doesn't flatline
         trades = 1
         wins = 1
         drawdowns.append(0.0)
@@ -1018,7 +1167,7 @@ def _backtest_once(
 
 
 # =============================================================================
-# ENSEMBLE BACKTEST (stable across Summary & Detailed views)
+# ENSEMBLE BACKTEST (public) - averages runs across seeds
 # =============================================================================
 
 def backtest_signals(
@@ -1029,17 +1178,13 @@ def backtest_signals(
     interval_key: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Public-facing backtest used by UI.
+    Public-facing backtest used by the UI.
 
-    v7.7.2:
-    - Build indicators once
-    - Run multiple deterministic seeds using _backtest_once()
-    - Each run uses:
-        * higher timeframe bias
-        * confidence-weighted P&L
-        * probabilistic forced trades gated by confidence
-    - Average metrics
-    - Compute winrate_std
+    v7.8:
+    - regime-aware entries, TP/SL, and skip logic
+    - HTF directional bias
+    - confidence-weighted P&L
+    - returns mean stats + winrate_std for stability
     """
     out = {
         "winrate": 0.0,
@@ -1057,7 +1202,7 @@ def backtest_signals(
     if df_ind.empty or len(df_ind) < 40:
         return out
 
-    seeds = [42, 99, 123, 2024, 777]  # stable
+    seeds = [42, 99, 123, 2024, 777]
 
     results = []
     for s in seeds:
@@ -1092,9 +1237,10 @@ def backtest_signals(
     out["winrate_std"] = round(winrate_std, 2)
 
     _log(
-        f"[DEBUG ensemble backtest v7.7.2] "
+        f"[DEBUG ensemble backtest v7.8 regime] "
         f"winrate={out['winrate']}% ±{out['winrate_std']} "
-        f"trades={out['trades']}, ret={out['return']}%, dd={out['maxdd']}%, sharpeLike={out['sharpe']}"
+        f"trades={out['trades']}, ret={out['return']}%, "
+        f"dd={out['maxdd']}%, sharpeLike={out['sharpe']}"
     )
 
     return out
@@ -1106,8 +1252,7 @@ def backtest_signals(
 
 def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -> float:
     """
-    If the strategy is actually doing well (ensemble winrate > 55%), trust rule engine more.
-    Otherwise, keep even weighting.
+    If strategy is doing well (ensemble winrate >55%) trust the rule engine more.
     """
     if pd.isna(recent_winrate):
         w_rule = 0.5
@@ -1120,7 +1265,7 @@ def _blend_confidence(rule_conf: float, ml_conf: float, recent_winrate: float) -
         w_ml = 0.5
 
     blended = (w_rule * rule_conf) + (w_ml * ml_conf)
-    blended = max(0.05, min(0.95, blended))  # clip for UI consistency
+    blended = max(0.05, min(0.95, blended))
     return blended
 
 
@@ -1136,26 +1281,8 @@ def latest_prediction(
     interval_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns a dict:
-      {
-        "symbol": None,
-        "side": "Buy"/"Sell"/"Hold",
-        "probability": blended adaptive confidence,
-        "sentiment": None,
-        "price": last close,
-        "tp": float or None,
-        "sl": float or None,
-        "rr": reward/risk ratio or None,
-        "atr": last atr,
-        "stale": bool
-      }
-
-    Weekend-safe:
-    - still returns even if data stale
-    - fallback TP/SL for Hold
-    - ATR fallback
-    - integrated higher timeframe confirmation
-    - integrated ML ensemble for conviction
+    Builds the live "signal block" for Detailed View.
+    Weekend-safe, still returns even if stale.
     """
     if df is None or df.empty or len(df) < 60:
         return None
@@ -1167,28 +1294,28 @@ def latest_prediction(
     prev_row = df_ind.iloc[-2]
     row_now  = df_ind.iloc[-1]
 
-    # higher timeframe directional bias
+    # higher timeframe bias
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
     else:
         higher_bias = 0
 
-    # rule + higher TF filter
+    # regime-aware + higher-tf filtered signal
     side_rule, rule_conf = _compute_signal_row_with_higher_tf(prev_row, row_now, higher_bias)
 
-    # ML conviction using ensemble
-    ml_conf = _ml_direction_confidence(df_ind)
+    # ML conviction (now regime-aware)
+    ml_conf = _ml_direction_confidence(df_ind, recent_winrate_hint)
 
     # adaptive blend
-    blended = _blend_confidence(rule_conf, ml_conf, recent_winrate_hint)
+    blended = _blend_confidence(rule_conf, ml_conf, recent_winrate_hint if recent_winrate_hint is not None else np.nan)
 
     last_price = float(row_now["Close"])
     atr_now = float(row_now.get("atr", last_price * 0.005))
-
     stale_flag = _is_stale_df(df_ind)
 
+    # We now use regime-aware TP/SL
     if side_rule == "Hold":
-        tp_fallback, sl_fallback = _compute_tp_sl(last_price, atr_now, "Buy", risk)
+        tp_fallback, sl_fallback = _compute_tp_sl_regime(last_price, atr_now, "Buy", risk, row_now)
         reward = tp_fallback - last_price
         riskv = last_price - sl_fallback
         rr_est = (reward / riskv) if (riskv and riskv != 0) else None
@@ -1206,8 +1333,7 @@ def latest_prediction(
             "stale": stale_flag,
         }
 
-    # Buy or Sell path:
-    tp, sl = _compute_tp_sl(last_price, atr_now, side_rule, risk)
+    tp, sl = _compute_tp_sl_regime(last_price, atr_now, side_rule, risk, row_now)
 
     if side_rule == "Buy":
         reward = tp - last_price
@@ -1242,9 +1368,8 @@ def generate_signal_points(
     interval_key: Optional[str] = None,
 ) -> Dict[str, List[Any]]:
     """
-    Walk through df_ind (which already has indicators),
-    run higher-timeframe-aware signal logic for each bar vs prev bar,
-    collect Buy/Sell events for plotting markers.
+    Walk df_ind to get historical Buy/Sell timestamps & prices for chart markers.
+    Uses regime-aware + higher-timeframe confirmation logic.
     """
     out = {
         "buy_times": [],
@@ -1256,7 +1381,6 @@ def generate_signal_points(
     if df_ind is None or df_ind.empty or len(df_ind) < 3:
         return out
 
-    # compute higher bias once for historical marker plotting
     if symbol is not None and interval_key is not None:
         higher_bias = _get_higher_tf_bias_for_asset(symbol, interval_key, use_cache=True)
     else:
@@ -1289,9 +1413,13 @@ def analyze_asset(
     use_cache: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch data, compute indicators, backtest (ensemble),
-    latest prediction snapshot with adaptive confidence,
-    sentiment, and return all stats in a dict.
+    High-level wrapper:
+      - fetch data
+      - indicators
+      - ensemble backtest (regime-aware)
+      - latest_prediction (regime-aware, ML-enhanced)
+      - sentiment
+      - stale flag
     """
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=use_cache)
     if df_raw.empty:
@@ -1301,7 +1429,6 @@ def analyze_asset(
     if df_ind.empty:
         return None
 
-    # Ensemble backtest for stable metrics (v7.7.2 logic)
     bt = backtest_signals(
         df_raw,
         risk,
@@ -1310,7 +1437,6 @@ def analyze_asset(
         interval_key=interval_key,
     )
 
-    # Adaptive confidence in snapshot (higher TF, ML ensemble)
     pred = latest_prediction(
         df_raw,
         risk,
@@ -1325,7 +1451,6 @@ def analyze_asset(
     stale_flag = _is_stale_df(df_ind)
 
     if pred is None:
-        # fallback shape if prediction couldn't run (<60 candles)
         return {
             "symbol": symbol,
             "interval_key": interval_key,
@@ -1378,8 +1503,8 @@ def load_asset_with_indicators(
     use_cache: bool = True,
 ) -> Tuple[str, pd.DataFrame, Dict[str, List[Any]]]:
     """
-    Input: asset name e.g. "Gold"
-    Output: (symbol, df_with_indicators, signal_points)
+    For charting tab:
+    returns (symbol, df_ind, signal_points)
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
@@ -1404,8 +1529,8 @@ def asset_prediction_and_backtest(
     use_cache: bool = True,
 ) -> Tuple[Optional[Dict[str, Any]], pd.DataFrame]:
     """
-    Used in Detailed / Scenario tabs to show signal snapshot + stats table.
-    The UI separately calls load_asset_with_indicators() for chart markers.
+    Used in Detailed / Scenario tabs to show per-asset stats.
+    Return format unchanged so Streamlit callers still work.
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame()
@@ -1419,7 +1544,6 @@ def asset_prediction_and_backtest(
     if df_ind.empty:
         return None, pd.DataFrame()
 
-    # Ensemble backtest for stable metrics (v7.7.2)
     bt = backtest_signals(
         df_raw,
         risk,
@@ -1428,7 +1552,6 @@ def asset_prediction_and_backtest(
         interval_key=interval_key,
     )
 
-    # Adaptive confidence snapshot (HTF + ML ensemble)
     pred = latest_prediction(
         df_raw,
         risk,
@@ -1498,16 +1621,14 @@ def summarize_assets(
     use_cache: bool = True,
 ) -> pd.DataFrame:
     """
-    Loop each ASSET_SYMBOLS and build a summary row:
-    Price, Signal, Prob, Sentiment, TP/SL/RR, Trades, WinRate, Return%, etc.
+    Loop over ASSET_SYMBOLS and assemble the Market Summary table.
 
-    v7.7.2:
-    - Uses HTF-aware prediction + ML ensemble
-    - Uses confidence-weighted backtest stats
-    - Includes winrate_std
-    - Weekend safety intact
+    v7.8:
+    - regime-aware backtest & prediction
+    - includes winrate_std for stability read
+    - still weekend-safe
     """
-    _log("Fetching and analyzing market data (smart v7.7.2 HTF+ML+confP&L)...")
+    _log("Fetching and analyzing market data (smart v7.8 Regime Adaptive)...")
 
     rows = []
     for asset_name, symbol in ASSET_SYMBOLS.items():
@@ -1547,7 +1668,7 @@ def summarize_assets(
     summary_df = pd.DataFrame(rows)
     summary_df.sort_values("Asset", inplace=True, ignore_index=True)
 
-    _log("[DEBUG summary head v7.7.2]")
+    _log("[DEBUG summary head v7.8]")
     try:
         _log(summary_df[["Asset", "Trades", "WinRate", "Return%"]].head().to_string())
     except Exception:
