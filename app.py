@@ -472,7 +472,5 @@ with st.expander("Show model input data / indicators / backtest inputs"):
         st.code(traceback.format_exc())
 
 st.caption(
-    "Engine Smart v8.2 • 5-Fold ML Cross-Validation • "
-    "Structure Overlay • Adaptive TP/SL • Weekend-Aware • "
-    "Calibrated ML • Profit Factor / EV% Backtest"
+    "Engine smart v8.2 â¢ weekend-aware skip â¢ adaptive TP/SL â¢ HTF bias â¢ structure confluence â¢ 5-fold CV ML â¢ calibrated confidence â¢ ensemble backtest (PF / EV%)"
 )
