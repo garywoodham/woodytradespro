@@ -1,18 +1,11 @@
 # app.py - Woody Trades Pro dashboard
-# Smart v8.0 UI (Performance Mode default)
+# Smart v8.1 UI
 #
-# - Keeps original layout/metrics
-# - Adds sidebar engine controls:
-#     • Weekend Mode toggle (hard skip last 48h if stale)
-#     • TP/SL Adaptivity ("Off", "Normal", "Aggressive")
-#     • Confidence Filter ("Loose", "Balanced", "Strict")
-#     • Calibration Bias toggle
-#     • Forced Trades toggle
-# - Passes those controls through to utils
-# - Shows them in captions for transparency
-# - Adds Buy/Sell marker overlays to candlestick chart
-#
-# NOTE: This expects utils.py v8.0 with matching signatures.
+# - Keeps v8.0 features
+# - Adds Structure Overlay mode (Off / Buy Dips / Breakouts / Both)
+# - Passes structure_mode to utils
+# - Plots structure markers: dip buys / breakouts / breakdowns
+# - Overlays support/resistance dashed lines
 #
 import os
 import traceback
@@ -31,14 +24,11 @@ from utils import (
     INTERVALS,
 )
 
-# ---------------------------------------------------------------------
-# Hardening: Streamlit Cloud watcher sometimes explodes with inotify.
-# We reduce watcher aggressiveness in containers with low limits.
+# Streamlit watcher hardening
 os.environ["STREAMLIT_WATCHER_TYPE"] = "poll"
 
-# General Streamlit config
 st.set_page_config(
-    page_title="Woody Trades Pro - Smart v8.0",
+    page_title="Woody Trades Pro - Smart v8.1",
     layout="wide"
 )
 
@@ -50,7 +40,6 @@ warnings.filterwarnings("ignore")
 
 st.sidebar.title("Settings")
 
-# timeframe
 interval_key = st.sidebar.selectbox(
     "Timeframe",
     options=list(INTERVALS.keys()),
@@ -59,7 +48,6 @@ interval_key = st.sidebar.selectbox(
     help="Candle timeframe used for signals, TP/SL, and backtest window.",
 )
 
-# risk profile
 risk = st.sidebar.selectbox(
     "Risk Profile",
     options=list({"Low","Medium","High"}),
@@ -68,7 +56,6 @@ risk = st.sidebar.selectbox(
     help="Controls base TP/SL ATR multiples.",
 )
 
-# main asset focus for the detail panel
 asset_choice = st.sidebar.selectbox(
     "Focus Asset",
     options=list(ASSET_SYMBOLS.keys()),
@@ -77,9 +64,8 @@ asset_choice = st.sidebar.selectbox(
     help="Used in the Detailed / Scenarios sections below.",
 )
 
-st.sidebar.caption("v8.0 engine: weekend-aware, adaptive TP/SL, HTF bias, calibrated ML")
+st.sidebar.caption("v8.1 engine: weekend-aware, adaptive TP/SL, HTF bias, calibrated ML, structure confluence")
 
-# ---- Engine Control Block ----
 st.sidebar.subheader("Engine Controls")
 
 weekend_mode = st.sidebar.checkbox(
@@ -92,7 +78,7 @@ tp_sl_mode = st.sidebar.selectbox(
     "TP/SL Adaptivity",
     options=["Off", "Normal", "Aggressive"],
     index=1,
-    help="Controls ATR scaling range for targets/stops.\nOff = fixed; Normal = 0.8–1.4x; Aggressive = 0.5–2.0x."
+    help="Controls ATR scaling range for targets/stops.\nOff = fixed; Normal = 0.8â1.4x; Aggressive = 0.5â2.0x."
 )
 
 filter_level = st.sidebar.selectbox(
@@ -114,8 +100,15 @@ forced_trades_enabled = st.sidebar.checkbox(
     help="If ON, allow low-confidence 'forced' trades in backtest to keep stats populated.\nFor production keep OFF."
 )
 
+structure_mode = st.sidebar.selectbox(
+    "Structure Overlay",
+    options=["Off", "Buy Dips", "Breakouts", "Both"],
+    index=0,
+    help="Require structure confluence (support dips / breakouts). Fewer trades but higher quality."
+)
+
 # ---------------------------------------------------------------------
-# Cached loaders (must include the engine knobs in their signatures)
+# Cached loaders
 # ---------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
@@ -127,6 +120,7 @@ def load_summary(
     filter_level: str,
     calibration_enabled: bool,
     forced_trades_enabled: bool,
+    structure_mode: str,
 ) -> pd.DataFrame:
     return summarize_assets(
         interval_key,
@@ -137,6 +131,7 @@ def load_summary(
         calibration_enabled=calibration_enabled,
         forced_trades_enabled=forced_trades_enabled,
         tp_sl_mode=tp_sl_mode,
+        structure_mode=structure_mode,
     )
 
 
@@ -150,6 +145,7 @@ def load_prediction_and_chart(
     filter_level: str,
     calibration_enabled: bool,
     forced_trades_enabled: bool,
+    structure_mode: str,
 ):
     return asset_prediction_and_backtest(
         asset,
@@ -161,6 +157,7 @@ def load_prediction_and_chart(
         calibration_enabled=calibration_enabled,
         forced_trades_enabled=forced_trades_enabled,
         tp_sl_mode=tp_sl_mode,
+        structure_mode=structure_mode,
     )
 
 
@@ -171,10 +168,9 @@ def load_price_df(
     weekend_mode: bool,
     filter_level: str,
     calibration_enabled: bool,
+    structure_mode: str,
 ):
-    # We also want signal markers for buy/sell to plot on the candle chart.
-    # The updated utils.load_asset_with_indicators now returns:
-    #   (symbol, df_with_ind, sig_points_dict)
+    # updated utils returns (symbol, df_with_ind, sig_points_dict)
     symbol, df_ind, sig_points = load_asset_with_indicators(
         asset,
         interval_key,
@@ -182,6 +178,7 @@ def load_price_df(
         filter_level=filter_level,
         weekend_mode=weekend_mode,
         calibration_enabled=calibration_enabled,
+        structure_mode=structure_mode,
     )
     return symbol, df_ind, sig_points
 
@@ -190,7 +187,7 @@ def load_price_df(
 # 1) MARKET SUMMARY SECTION
 # ---------------------------------------------------------------------
 
-st.header("📊 Market Summary")
+st.header("ð Market Summary")
 
 try:
     df_summary = load_summary(
@@ -201,19 +198,18 @@ try:
         filter_level,
         calibration_enabled,
         forced_trades_enabled,
+        structure_mode,
     )
 
     if df_summary is None or df_summary.empty:
         st.warning("No summary data available.")
     else:
-        # Show which engine settings are active right now (for clarity / A-B testing)
         st.caption(
-            f"Engine v8.0 • Weekend={'ON' if weekend_mode else 'OFF'} • TP/SL={tp_sl_mode} • "
-            f"Filter={filter_level} • Calib={'ON' if calibration_enabled else 'OFF'} • "
-            f"Forced={'ON' if forced_trades_enabled else 'OFF'}"
+            f"Engine v8.1 â¢ Weekend={'ON' if weekend_mode else 'OFF'} â¢ TP/SL={tp_sl_mode} â¢ "
+            f"Filter={filter_level} â¢ Calib={'ON' if calibration_enabled else 'OFF'} â¢ "
+            f"Forced={'ON' if forced_trades_enabled else 'OFF'} â¢ Structure={structure_mode}"
         )
 
-        # Show raw dashboard table
         st.dataframe(
             df_summary,
             width="stretch",
@@ -229,7 +225,7 @@ except Exception as e:
 # 2) DETAILED VIEW FOR ONE ASSET
 # ---------------------------------------------------------------------
 
-st.header("🔍 Detailed View")
+st.header("ð Detailed View")
 
 try:
     pred_block, df_asset_ind = load_prediction_and_chart(
@@ -241,41 +237,39 @@ try:
         filter_level,
         calibration_enabled,
         forced_trades_enabled,
+        structure_mode,
     )
 
-    # Top metrics row
     colA, colB, colC, colD = st.columns(4)
 
     if pred_block:
-        # Signal side
+        # Signal
         colA.metric(
             label="Signal",
             value=pred_block.get("side") or pred_block.get("signal") or "Hold",
-            help="Buy / Sell / Hold from blended rule+regime+HTF logic.",
+            help="Buy / Sell / Hold after HTF bias + structure confluence.",
         )
 
         # Confidence
-        prob_val = pred_block.get("probability")
-        if prob_val is None:
-            prob_val = pred_block.get("probability_calibrated")
-        if prob_val is None:
-            prob_val = pred_block.get("probability_raw")
-        if prob_val is None:
-            prob_val = 0.0
-
+        prob_val = (
+            pred_block.get("probability")
+            or pred_block.get("probability_calibrated")
+            or pred_block.get("probability_raw")
+            or 0.0
+        )
         colB.metric(
             label="Confidence",
             value=f"{(prob_val*100 if prob_val<=1 else prob_val):.2f}%",
             help="Blended rule+ML conviction (calibrated if enabled).",
         )
 
-        # Win rate (%)
+        # Win rate
         wr = pred_block.get("win_rate") or pred_block.get("winrate") or 0.0
         wr_std = pred_block.get("win_rate_std") or pred_block.get("winrate_std") or 0.0
         colC.metric(
             label="Win Rate (backtest)",
             value=f"{wr:.2f}%",
-            help=f"Mean win% across ensemble seeds. ±{wr_std:.2f} stdev.",
+            help=f"Mean win% across ensemble seeds. Â±{wr_std:.2f} stdev.",
         )
 
         # Trades
@@ -286,28 +280,28 @@ try:
             help="Avg trades simulated across ensemble runs.",
         )
 
-        # Second row with TP/SL/RR etc.
+        # TP/SL/RR etc.
         colE, colF, colG, colH = st.columns(4)
         tp_val = pred_block.get("tp")
         sl_val = pred_block.get("sl")
         rr_val = pred_block.get("rr")
-        colE.metric("TP", f"{tp_val:.4f}" if tp_val else "—")
-        colF.metric("SL", f"{sl_val:.4f}" if sl_val else "—")
-        colG.metric("R/R", f"{rr_val:.2f}" if rr_val else "—")
+        colE.metric("TP", f"{tp_val:.4f}" if tp_val else "â")
+        colF.metric("SL", f"{sl_val:.4f}" if sl_val else "â")
+        colG.metric("R/R", f"{rr_val:.2f}" if rr_val else "â")
 
         sent_val = pred_block.get("sentiment", None)
         if sent_val is None:
             sent_val = pred_block.get("Sentiment", None)
         colH.metric(
             "Sentiment",
-            f"{sent_val:.2f}" if sent_val is not None else "—",
+            f"{sent_val:.2f}" if sent_val is not None else "â",
             help="Stubbed sentiment: higher = more bullish tone.",
         )
 
-        # Third row with EV%, PF, stale flag
+        # Third row: PF / EV / Stale / Interval
         colI, colJ, colK, colL = st.columns(4)
-        pf_val = pred_block.get("profit_factor", "—")
-        ev_val = pred_block.get("ev_pct", "—")
+        pf_val = pred_block.get("profit_factor", "â")
+        ev_val = pred_block.get("ev_pct", "â")
         stale_flag = pred_block.get("stale", False)
         colI.metric(
             "Profit Factor",
@@ -316,7 +310,7 @@ try:
         )
         colJ.metric(
             "EV per Trade",
-            f"{ev_val:.4f}%" if not isinstance(ev_val, str) else "—",
+            f"{ev_val:.4f}%" if not isinstance(ev_val, str) else "â",
             help="Average % gain (or loss) per trade in backtest ensemble.",
         )
         colK.metric(
@@ -324,30 +318,31 @@ try:
             "Yes" if stale_flag else "No",
             help="Yes means recent candles were older than normal (weekend / closed market).",
         )
-
         rrisk = pred_block.get("interval", interval_key)
         colL.metric(
             "Interval",
             rrisk,
             help="Timeframe used for this prediction / backtest.",
         )
-
     else:
         st.warning("No prediction block available for this asset.")
 
-    # Price chart with EMA overlays and Buy/Sell markers
+    # ------------------------------------------
+    # Price chart (candles + EMA + markers + S/R)
+    # ------------------------------------------
     symbol_for_asset, df_asset_full, sig_points = load_price_df(
         asset_choice,
         interval_key,
         weekend_mode,
         filter_level,
         calibration_enabled,
+        structure_mode,
     )
 
     if isinstance(df_asset_full, pd.DataFrame) and not df_asset_full.empty:
         fig = go.Figure()
 
-        # Candles
+        # Candle trace
         fig.add_trace(go.Candlestick(
             x=df_asset_full.index,
             open=df_asset_full["Open"],
@@ -357,7 +352,7 @@ try:
             name="Price",
         ))
 
-        # EMA20 / EMA50
+        # EMA overlays
         if "ema20" in df_asset_full.columns:
             fig.add_trace(go.Scatter(
                 x=df_asset_full.index,
@@ -375,7 +370,28 @@ try:
                 line=dict(width=1.2),
             ))
 
-        # Buy markers
+        # Structure: support/resistance dashed lines
+        if sig_points and len(sig_points.get("time_index", [])) > 0:
+            ti = sig_points["time_index"]
+            sup = sig_points["support_series"]
+            res = sig_points["resistance_series"]
+
+            fig.add_trace(go.Scatter(
+                x=ti,
+                y=sup,
+                mode="lines",
+                name="Support",
+                line=dict(width=1, dash="dot", color="lightgray"),
+            ))
+            fig.add_trace(go.Scatter(
+                x=ti,
+                y=res,
+                mode="lines",
+                name="Resistance",
+                line=dict(width=1, dash="dot", color="darkgray"),
+            ))
+
+        # Buy/Sell markers after full confluence
         if sig_points and len(sig_points.get("buy_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["buy_times"],
@@ -390,7 +406,6 @@ try:
                 ),
             ))
 
-        # Sell markers
         if sig_points and len(sig_points.get("sell_times", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=sig_points["sell_times"],
@@ -405,13 +420,65 @@ try:
                 ),
             ))
 
+        # Dip buy markers
+        if sig_points and len(sig_points.get("dip_buy_times", [])) > 0:
+            fig.add_trace(go.Scatter(
+                x=sig_points["dip_buy_times"],
+                y=sig_points["dip_buy_prices"],
+                mode="markers",
+                name="Dip Buy",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=9,
+                    color="blue",
+                    line=dict(width=1, color="black"),
+                ),
+            ))
+
+        # Bull breakout markers
+        if sig_points and len(sig_points.get("bull_breakout_times", [])) > 0:
+            fig.add_trace(go.Scatter(
+                x=sig_points["bull_breakout_times"],
+                y=sig_points["bull_breakout_prices"],
+                mode="markers",
+                name="Bull Breakout",
+                marker=dict(
+                    symbol="diamond",
+                    size=9,
+                    color="orange",
+                    line=dict(width=1, color="black"),
+                ),
+            ))
+
+        # Bear breakdown markers
+        if sig_points and len(sig_points.get("bear_breakdown_times", [])) > 0:
+            fig.add_trace(go.Scatter(
+                x=sig_points["bear_breakdown_times"],
+                y=sig_points["bear_breakdown_prices"],
+                mode="markers",
+                name="Bear Breakdown",
+                marker=dict(
+                    symbol="x",
+                    size=9,
+                    color="purple",
+                    line=dict(width=1, color="black"),
+                ),
+            ))
+
         fig.update_layout(
             margin=dict(l=10, r=10, t=30, b=10),
             height=420,
             xaxis_title="Time",
             yaxis_title="Price",
             showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(size=10),
+            ),
         )
 
         st.plotly_chart(fig, use_container_width=False, config={"displayModeBar": False})
@@ -427,7 +494,7 @@ except Exception as e:
 # 3) RAW DATA / DEBUG
 # ---------------------------------------------------------------------
 
-st.header("🛠 Debug / Raw Data")
+st.header("ð  Debug / Raw Data")
 
 with st.expander("Show model input data / indicators / backtest inputs"):
     try:
@@ -440,5 +507,6 @@ with st.expander("Show model input data / indicators / backtest inputs"):
         st.error(f"Failed to load raw data: {e}")
         st.code(traceback.format_exc())
 
-
-st.caption("Engine smart v8.0 • weekend-aware skip • adaptive TP/SL • HTF bias • calibrated ML • ensemble backtest (PF / EV%)")
+st.caption(
+    "Engine smart v8.1 â¢ weekend-aware skip â¢ adaptive TP/SL â¢ HTF bias â¢ structure confluence â¢ calibrated ML â¢ ensemble backtest (PF / EV%)"
+)
