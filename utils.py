@@ -96,8 +96,8 @@ DATA_DIR.mkdir(exist_ok=True)
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m",  "period": "5d",  "min_rows": 150},
-    "1h":  {"interval": "60m",  "period": "2mo", "min_rows": 250},
-    "4h":  {"interval": "240m", "period": "6mo", "min_rows": 250},
+    "1h":  {"interval": "1h",   "period": "2mo", "min_rows": 250},
+    "4h":  {"interval": "4h",   "period": "6mo", "min_rows": 250},
     "1d":  {"interval": "1d",   "period": "1y",  "min_rows": 200},
     "1wk": {"interval": "1wk",  "period": "5y",  "min_rows": 150},
 }
