@@ -1,55 +1,56 @@
-import sys, importlib.util, pathlib
-from functools import lru_cache
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
+# =============================================================================
+# WoodyTrades Pro — Smart Strategy Modes Edition (v8.3.2)
+# Streamlit Frontend (Safe Local Import)
+# =============================================================================
 
-# =============================================================================
-# Force local import of utils.py (bypass site-packages "utils" modules)
-# =============================================================================
+import sys, importlib.util, pathlib
+
+# --- Force-load local utils.py (bypass any package "utils") ---
 UTILS_PATH = pathlib.Path(__file__).parent / "utils.py"
 spec = importlib.util.spec_from_file_location("utils", UTILS_PATH)
 utils = importlib.util.module_from_spec(spec)
 sys.modules["utils"] = utils
 spec.loader.exec_module(utils)
 
+# --- Confirm correct file loaded ---
+import streamlit as st
+st.set_page_config(page_title="WoodyTrades Pro Dashboard", layout="wide")
 st.write("✅ Loaded utils from:", utils.__file__)
 
 # =============================================================================
-# Streamlit Page Configuration
+# Imports
 # =============================================================================
-st.set_page_config(
-    page_title="WoodyTrades Pro Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.title("📊 WoodyTrades Pro — Smart Strategy Modes Edition")
+import pandas as pd
+import plotly.graph_objects as go
 
 # =============================================================================
-# Sidebar Controls
+# Sidebar Configuration
 # =============================================================================
 st.sidebar.header("⚙️ Configuration")
 
+# --- Interval selector ---
 interval_key = st.sidebar.selectbox(
     "Interval",
-    list(utils.INTERVALS.keys()),
+    list(utils.INTERVALS.keys()) if hasattr(utils, "INTERVALS") else ["1h", "4h", "1d", "1wk"],
     index=2,
     help="Data timeframe for signals & backtests.",
 )
 
+# --- Risk profile ---
 risk = st.sidebar.selectbox(
     "Risk Profile",
-    list(utils.RISK_MULT.keys()),
+    list(utils.RISK_MULT.keys()) if hasattr(utils, "RISK_MULT") else ["Low", "Medium", "High"],
     index=1,
 )
 
+# --- TP/SL scaling ---
 tp_sl_mode = st.sidebar.selectbox(
     "TP/SL Scaling",
-    list(utils._TP_SL_PROFILES.keys()),
-    index=1,
+    list(utils._TP_SL_PROFILES.keys()) if hasattr(utils, "_TP_SL_PROFILES") else ["Normal"],
+    index=0,
 )
 
+# --- Strategy mode ---
 structure_mode = st.sidebar.selectbox(
     "Strategy Mode",
     [
@@ -66,12 +67,14 @@ structure_mode = st.sidebar.selectbox(
     index=0,
 )
 
+# --- Filter strictness ---
 filter_level = st.sidebar.selectbox(
     "Filter Strictness",
     ["Loose", "Balanced", "Strict"],
     index=1,
 )
 
+# --- Toggles ---
 forced_trades = st.sidebar.checkbox("Force Trades (for stats only)", value=False)
 calibration_enabled = st.sidebar.checkbox("Calibration Memory", value=True)
 weekend_mode = st.sidebar.checkbox("Weekend/Stale Safe Mode", value=True)
@@ -81,12 +84,12 @@ st.sidebar.divider()
 st.sidebar.caption("v8.3.2 — Smart Strategy Modes Edition")
 
 # =============================================================================
-# Cached summary computation (prevents rate-limit hammering)
+# Cached Summary Fetch (avoid Yahoo rate-limits)
 # =============================================================================
 @st.cache_data(ttl=600)
 def get_summary(interval_key, risk, tp_sl_mode, structure_mode,
                 forced_trades, filter_level, calibration_enabled, weekend_mode):
-    df_summary = utils.summarize_assets(
+    return utils.summarize_assets(
         interval_key=interval_key,
         risk=risk,
         tp_sl_mode=tp_sl_mode,
@@ -96,11 +99,12 @@ def get_summary(interval_key, risk, tp_sl_mode, structure_mode,
         calibration_enabled=calibration_enabled,
         weekend_mode=weekend_mode,
     )
-    return df_summary
 
 # =============================================================================
 # Summary Table
 # =============================================================================
+st.title("📊 WoodyTrades Pro — Smart Strategy Modes Edition")
+
 with st.spinner("Fetching and analyzing assets..."):
     df_summary = get_summary(
         interval_key, risk, tp_sl_mode, structure_mode,
@@ -108,7 +112,7 @@ with st.spinner("Fetching and analyzing assets..."):
     )
 
 if df_summary.empty:
-    st.error("No data available. Possibly rate-limited — try again in a few minutes.")
+    st.error("No data available — possibly rate-limited. Try again in a few minutes.")
     st.stop()
 
 st.subheader("📈 Summary Overview")
@@ -140,7 +144,7 @@ if show_detailed_view:
         st.warning("No prediction available — possibly rate-limited or insufficient data.")
         st.stop()
 
-    # --- Display Key Metrics ---
+    # --- Metrics ---
     cols = st.columns(3)
     cols[0].metric("Signal", pred_block["side"])
     cols[1].metric("Confidence", f"{pred_block['probability']*100:.1f}%")
@@ -161,7 +165,7 @@ if show_detailed_view:
              f"ATR: {pred_block['atr']:.4f} | "
              f"Stale: {pred_block['stale']}")
 
-    # --- Chart Rendering ---
+    # --- Chart ---
     if not df_ind.empty:
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
@@ -171,7 +175,6 @@ if show_detailed_view:
             name="Price"
         ))
 
-        # Overlay selected points (only main types for readability)
         fig.add_trace(go.Scatter(
             x=pts["buy_x"], y=pts["buy_y"], mode="markers",
             marker_symbol="triangle-up", marker_color="green", name="Buy Signals"
