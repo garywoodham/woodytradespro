@@ -1,18 +1,22 @@
-# utils.py v8.3.1 (Smart Strategy Modes Edition, fixed globals)
+# utils.py v8.3.1 (Smart Strategy Modes Edition, Streamlit Cloud lazy-load safe)
 # ---------------------------------------------------------------------------------
-# This file is the full engine for Woody Trades Pro.
-# It includes:
-# - Strategy modes (9 styles) with structure gating
-# - Accuracy vs Performance plumbing
-# - 5-fold CV ML confidence (RandomForest + GradientBoost, KFold)
-# - Adaptive TP/SL scaling by trend & volatility
-# - Weekend/stale handling
-# - Calibration bias memory
-# - PF / EV% / WinRate ± stdev backtest stats
-# - Chart markers & overlays (support/resistance, Bollinger, range, swing pivots)
-# - Safe defaults for ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
+# This is your full engine, with all features preserved:
+# - Strategy modes (Breakout / Buy Dip / etc)
+# - Confidence gating (Loose / Balanced / Strict)
+# - 5-fold CV ML ensemble (RandomForest + GradientBoosting)
+# - Adaptive TP/SL scaling with ADX + volatility regime
+# - Weekend/stale awareness
+# - Calibration bias feedback loop
+# - PF / EV% / WinRate±Std backtest
+# - Chart overlays, structure flags, pivots, bands
+# - TP/SL, R/R, sentiment, etc.
 #
-# Public API used by app.py:
+# CRITICAL CHANGE FOR STREAMLIT CLOUD:
+# - No heavy imports or filesystem work at module import time.
+# - No network calls at module import time.
+# - All expensive work happens lazily inside functions.
+#
+# Public API expected by app.py:
 #   summarize_assets(...)
 #   asset_prediction_and_backtest(...)
 #   load_asset_with_indicators(...)
@@ -21,34 +25,28 @@
 #
 from __future__ import annotations
 
-import json, math, time
+import math
+import json
+import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
-try:
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.model_selection import KFold
-except Exception:
-    RandomForestClassifier = None
-    GradientBoostingClassifier = None
-    KFold = None
 
-try:
-    from ta.trend import EMAIndicator, MACD, ADXIndicator
-    from ta.momentum import RSIIndicator
-    from ta.volatility import AverageTrueRange, BollingerBands
-except Exception:
-    EMAIndicator = MACD = ADXIndicator = RSIIndicator = AverageTrueRange = BollingerBands = None
+# =============================================================================
+# CONSTANTS / CONFIG (pure data, safe at import)
+# =============================================================================
 
+# Streamlit Cloud: write cache + calibration into /mount/data if possible,
+# otherwise fall back to /tmp which is writable in ephemeral containers.
+# We won't mkdir here (lazy). We'll mkdir inside helper when actually used.
 DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+FALLBACK_DIR = Path("/tmp/woodytrades_cache")
 
-CALIBRATION_PATH = DATA_DIR / "calibration_cache.json"
-_CAL_HISTORY_LEN = 5  # number of historical winrate points per symbol to keep
+CALIBRATION_FILENAME = "calibration_cache.json"
+_CAL_HISTORY_LEN = 5  # calibration memory depth
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m", "period": "5d",  "min_rows": 150},
@@ -75,41 +73,41 @@ ASSET_SYMBOLS: Dict[str, str] = {
     "Bitcoin": "BTC-USD",
 }
 
-# ---------------------------------------------------------------------
 # Tunables / thresholds
-# ---------------------------------------------------------------------
-
 RSI_WINDOW = 100
 RSI_Q_LOW = 0.2
 RSI_Q_HIGH = 0.8
 
+# Base defaults (these will get dynamically recalibrated per run)
 ADX_MIN_TREND_DEFAULT = 20.0
 VOL_REGIME_MIN_ATR_PCT_DEFAULT = 0.3
 CONF_EXEC_THRESHOLD_DEFAULT = 0.6
 
-# SAFE DEFAULTS so import doesn't crash.
-# These get overwritten dynamically by _apply_filter_level() at runtime,
-# but they must exist ahead of time or Streamlit will explode on first import.
+# Globals that are mutated by _apply_filter_level() at runtime.
 ADX_MIN_TREND = ADX_MIN_TREND_DEFAULT
 VOL_REGIME_MIN_ATR_PCT = VOL_REGIME_MIN_ATR_PCT_DEFAULT
 CONF_EXEC_THRESHOLD = CONF_EXEC_THRESHOLD_DEFAULT
 
+# mapping for higher TF checks (kept for completeness, not heavily used in v8.3.1)
 HIGHER_TF_MAP = {
     "15m": "1h",
     "1h": "4h",
     "4h": "1d",
     "1d": "1wk",
-    "1wk": "1wk",  # no higher
+    "1wk": "1wk",
 }
 
+# ML config
 ML_RECENT_WINDOW = 500
 CV_FOLDS = 5
 
-FORCED_TRADE_PROB = 0.02    # chance to force a Hold into a trade in "Performance" depth
-FORCED_CONF_MIN = 0.55      # min blended conf to allow forced trade
-ATR_FLOOR_MULT = 0.0005     # fallback ATR percent if missing
-STALE_MULTIPLIER_HOURS = 48.0
+# backtest behavior knobs
+FORCED_TRADE_PROB = 0.02        # chance to force a Hold trade if performance mode
+FORCED_CONF_MIN = 0.55          # min blended conf to allow forced trade
+ATR_FLOOR_MULT = 0.0005         # fallback ATR % if missing
+STALE_MULTIPLIER_HOURS = 48.0   # if last candle older than this * frame len => stale
 
+# Adaptive TP/SL profiles
 _TP_SL_PROFILES = {
     "Off":        {"trend_min": 1.0, "trend_max": 1.0, "vol_min": 1.0, "vol_max": 1.0},
     "Normal":     {"trend_min": 0.8, "trend_max": 1.4, "vol_min": 0.8, "vol_max": 1.4},
@@ -117,14 +115,17 @@ _TP_SL_PROFILES = {
 }
 
 # Structure / price action detection params
-STRUCT_WINDOW = 20           # for support/resistance pivot windows
-SUP_PROX_PCT = 0.003         # "close enough" to support ~0.3%
+STRUCT_WINDOW = 20         # rolling support/resistance window
+SUP_PROX_PCT = 0.003       # within 0.3% of support
 RSI_DIP_THRESHOLD = 40.0
 RANGE_LOOKBACK = 50
 SWING_LOOKBACK = 5
 BB_WINDOW = 20
-BB_WIDTH_PCT_THRESH = 0.01   # narrow band -> breakout candidate
+BB_WIDTH_PCT_THRESH = 0.01  # narrow bands threshold ~1%
 
+# ---------------------------------------------------------------------
+# tiny logger
+# ---------------------------------------------------------------------
 def _log(msg: str) -> None:
     try:
         print(msg, flush=True)
@@ -133,59 +134,109 @@ def _log(msg: str) -> None:
 
 
 # =============================================================================
-# Calibration memory (per-symbol rolling performance that we feed back in)
+# Lazy helpers: safe filesystem access, heavy imports
+# =============================================================================
+
+def _get_data_dir() -> Path:
+    """
+    Streamlit Cloud can't always mkdir at import time.
+    We'll ensure a writable dir now, at call time.
+    """
+    for cand in [DATA_DIR, FALLBACK_DIR]:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            return cand
+        except Exception:
+            continue
+    # worst case: in-memory fake path (no disk persistence)
+    return Path(".")
+
+def _get_calibration_path() -> Path:
+    d = _get_data_dir()
+    return d / CALIBRATION_FILENAME
+
+def _lazy_import_ta():
+    from ta.trend import EMAIndicator, MACD, ADXIndicator
+    from ta.momentum import RSIIndicator
+    from ta.volatility import AverageTrueRange, BollingerBands
+    return EMAIndicator, MACD, ADXIndicator, RSIIndicator, AverageTrueRange, BollingerBands
+
+def _lazy_import_yf():
+    import yfinance as yf
+    return yf
+
+def _lazy_import_ml():
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.model_selection import KFold
+    return RandomForestClassifier, GradientBoostingClassifier, KFold
+
+
+# =============================================================================
+# Calibration memory
 # =============================================================================
 
 def _load_calib() -> Dict[str, Any]:
-    if not CALIBRATION_PATH.exists():
+    """
+    Load rolling winrate memory from disk.
+    Safe: if file missing or unreadable, return {}
+    """
+    path = _get_calibration_path()
+    if not path.exists():
         return {}
     try:
-        data = json.load(open(CALIBRATION_PATH, "r"))
+        data = json.load(open(path, "r"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
-
 def _save_calib(c: Dict[str, Any]) -> None:
+    """
+    Save calibration state. Ignore failures (read-only container scenario).
+    """
+    path = _get_calibration_path()
     try:
-        json.dump(c, open(CALIBRATION_PATH, "w"))
+        json.dump(c, open(path, "w"))
     except Exception:
         pass
 
-
 def _record_calib(c: Dict[str, Any], sym: str, winrate: float) -> Dict[str, Any]:
-    """Append latest winrate for symbol, clip history to _CAL_HISTORY_LEN."""
+    """
+    Append new winrate snapshot, keep last _CAL_HISTORY_LEN points.
+    """
     now_str = pd.Timestamp.utcnow().isoformat() + "Z"
     e = c.get(sym, {"winrates": [], "last_ts": now_str})
+
     hist = e.get("winrates", [])
     if not isinstance(hist, list):
         hist = []
     hist.append(float(winrate))
     hist = hist[-_CAL_HISTORY_LEN:]
+
     e["winrates"] = hist
     e["last_ts"] = now_str
     c[sym] = e
     return c
-
 
 def _symbol_wr_stats(c: Dict[str, Any], sym: str) -> Dict[str, float]:
     e = c.get(sym, {})
     hist = e.get("winrates", [])
     if not hist:
         return {"avg_wr": 50.0, "bias": 0.0}
+
     avg_wr = float(np.mean(hist))
-    bias = (avg_wr - 50.0) / 100.0  # above 50% -> bullish tilt
+    bias = (avg_wr - 50.0) / 100.0  # e.g. +0.05 means "has been decent"
     bias = max(-0.1, min(0.1, bias))
     return {"avg_wr": avg_wr, "bias": bias}
 
-
 def _calib_bias_for_symbol(c: Dict[str, Any], sym: str, enabled: bool) -> Dict[str, float]:
-    """Return multipliers to bias thresholds if calibration is enabled."""
+    """
+    Convert calibration history into multipliers for thresholds.
+    """
     if not enabled:
         return {"conf_mult": 1.0, "adx_mult": 1.0, "avg_wr": 50.0}
 
     st = _symbol_wr_stats(c, sym)
-    bias = st["bias"]  # e.g. +0.05 for good, -0.05 for bad
+    bias = st["bias"]  # +0.05, -0.02, etc
 
     conf_mult = 1.0 - bias
     adx_mult  = 1.0 - bias
@@ -193,13 +244,16 @@ def _calib_bias_for_symbol(c: Dict[str, Any], sym: str, enabled: bool) -> Dict[s
     conf_mult = max(0.8, min(1.2, conf_mult))
     adx_mult  = max(0.8, min(1.2, adx_mult))
 
-    return {"conf_mult": conf_mult, "adx_mult": adx_mult, "avg_wr": st["avg_wr"]}
-
+    return {
+        "conf_mult": conf_mult,
+        "adx_mult": adx_mult,
+        "avg_wr": st["avg_wr"],
+    }
 
 def _apply_filter_level(filter_level: str, calib_bias: Dict[str, float]):
     """
     Updates globals ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
-    based on filter level and calibration bias.
+    based on 'Loose' / 'Balanced' / 'Strict' plus calibration bias multipliers.
     """
     global ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
 
@@ -225,7 +279,7 @@ def _apply_filter_level(filter_level: str, calib_bias: Dict[str, float]):
 
 
 # =============================================================================
-# Fetch + cache + normalize
+# OHLC fetch, cache, normalize
 # =============================================================================
 
 def _cache_path(symbol: str, interval_key: str) -> Path:
@@ -235,16 +289,16 @@ def _cache_path(symbol: str, interval_key: str) -> Path:
               .replace("/", "_")
               .replace("-", "_")
     )
-    return DATA_DIR / f"{safe}_{interval_key}.csv"
-
+    d = _get_data_dir()
+    return d / f"{safe}_{interval_key}.csv"
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean Yahoo data:
-    - flatten MultiIndex columns
-    - ensure numeric Open/High/Low/Close/... columns
-    - ensure datetime index
-    - remove inf, fill NaN, drop duplicates
+    Cleanup data from yfinance:
+    - flatten multiindex cols
+    - numeric cast
+    - datetime index
+    - ffill/bfill, drop dups
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
@@ -274,8 +328,8 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     df = df[~df.index.duplicated(keep="last")]
     return df
 
-
 def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    yf = _lazy_import_yf()
     try:
         raw = yf.download(
             symbol,
@@ -285,14 +339,12 @@ def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
             threads=False,
         )
         return _normalize_ohlcv(raw)
-    except Exception:
+    except Exception as e:
+        _log(f"[yf.download fail] {symbol} {interval} {period}: {e}")
         return pd.DataFrame()
 
-
 def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    """
-    Mirror fetch via yf.Ticker(...).history() as fallback.
-    """
+    yf = _lazy_import_yf()
     try:
         tk = yf.Ticker(symbol)
         raw = tk.history(period=period, interval=interval, auto_adjust=True, prepost=False)
@@ -301,9 +353,9 @@ def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
             return df
         raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
         return _normalize_ohlcv(raw2)
-    except Exception:
+    except Exception as e:
+        _log(f"[yf.history fail] {symbol} {interval} {period}: {e}")
         return pd.DataFrame()
-
 
 def fetch_data(
     symbol: str,
@@ -313,11 +365,8 @@ def fetch_data(
     backoff_range: Tuple[float, float] = (2.5, 6.0),
 ) -> pd.DataFrame:
     """
-    Unified fetch with caching.
-    1. Try cache, if enough rows → return
-    2. Retry live download
-    3. Fallback mirror
-    4. Cache result
+    Full fetch pipeline w/ caching, retry, fallback.
+    SAFE to call lazily from Streamlit (not on import).
     """
     if interval_key not in INTERVALS:
         raise KeyError(f"Bad interval_key {interval_key}")
@@ -329,16 +378,18 @@ def fetch_data(
 
     cache_fp = _cache_path(symbol, interval_key)
 
+    # try cache first
     if use_cache and cache_fp.exists():
         try:
             cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
             cached = _normalize_ohlcv(cached)
             if len(cached) >= min_rows:
                 return cached
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"[cache read fail] {cache_fp}: {e}")
 
-    for _ in range(max_retries):
+    # live retries
+    for _attempt in range(max_retries):
         df_live = _yahoo_download(symbol, interval, period)
         if not df_live.empty and len(df_live) >= min_rows:
             try:
@@ -348,6 +399,7 @@ def fetch_data(
             return df_live
         time.sleep(np.random.uniform(*backoff_range))
 
+    # fallback mirror
     df_mirror = _yahoo_history(symbol, interval, period)
     if not df_mirror.empty and len(df_mirror) >= min_rows:
         try:
@@ -373,11 +425,10 @@ def _interval_hours(interval_key: str) -> float:
     }
     return mapping.get(interval_key, 1.0)
 
-
 def _is_stale(df: pd.DataFrame, symbol: str, interval_key: str) -> bool:
     """
-    True if market is "stale" (e.g. weekend for FX / indices), defined as:
-    last candle older than ~48 * candle_len hours. BTC exempt.
+    Check age of last candle vs ~48x candle duration.
+    BTC is exempt.
     """
     if df is None or df.empty:
         return True
@@ -400,12 +451,11 @@ def _is_stale(df: pd.DataFrame, symbol: str, interval_key: str) -> bool:
 
 
 # =============================================================================
-# Indicators & derived fields
+# Indicator / feature engineering
 # =============================================================================
 
 def _ema_fallback(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
-
 
 def _rsi_fallback(close: pd.Series, window: int = 14) -> pd.Series:
     d = close.diff()
@@ -413,7 +463,6 @@ def _rsi_fallback(close: pd.Series, window: int = 14) -> pd.Series:
     loss = -d.clip(upper=0).rolling(window).mean()
     rs = gain / (loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
-
 
 def _macd_fallback(close: pd.Series):
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -423,29 +472,25 @@ def _macd_fallback(close: pd.Series):
     hist = macd_line - signal
     return macd_line, signal, hist
 
-
-def _atr_fallback(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    tr1 = (high - low).abs()
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
+def _atr_fallback(h, l, c, window: int = 14) -> pd.Series:
+    tr1 = (h - l).abs()
+    tr2 = (h - c.shift(1)).abs()
+    tr3 = (l - c.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(window).mean()
 
-
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add:
-    - EMA20/EMA50
-    - RSI
-    - MACD line/signal/hist
-    - ATR (points + atr_pct)
-    - ADX
-    - Bollinger Bands (+ width)
-    - rolling support/resistance
-    - range hi/lo
-    - swing points
-    - RSI dynamic bands
-    - slopes
+    Adds:
+      ema20, ema50
+      RSI, RSI slope + dynamic bands
+      MACD + slope
+      ATR + atr_pct
+      ADX
+      Bollinger bands + width
+      rolling support/resistance
+      range hi/lo
+      swing pivots
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -464,10 +509,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     h = df["High"]
     l = df["Low"]
 
-    # EMA
+    EMAIndicator, MACD, ADXIndicator, RSIIndicator, AverageTrueRange, BollingerBands = _lazy_import_ta()
+
+    # EMA20 / EMA50
     try:
-        if EMAIndicator is None:
-            raise RuntimeError
         df["ema20"] = EMAIndicator(close=c, window=20).ema_indicator()
         df["ema50"] = EMAIndicator(close=c, window=50).ema_indicator()
     except Exception:
@@ -476,8 +521,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # RSI
     try:
-        if RSIIndicator is None:
-            raise RuntimeError
         df["RSI"] = RSIIndicator(close=c, window=14).rsi()
     except Exception:
         df["RSI"] = _rsi_fallback(c, 14)
@@ -485,40 +528,32 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # MACD
     try:
-        if MACD is None:
-            raise RuntimeError
         macd_obj = MACD(close=c)
         df["macd"] = macd_obj.macd()
         df["macd_signal"] = macd_obj.macd_signal()
         df["macd_hist"] = macd_obj.macd_diff()
     except Exception:
-        macd_line, sig, hist = _macd_fallback(c)
-        df["macd"] = macd_line
+        line, sig, hist = _macd_fallback(c)
+        df["macd"] = line
         df["macd_signal"] = sig
         df["macd_hist"] = hist
 
     # ATR
     try:
-        if AverageTrueRange is None:
-            raise RuntimeError
         atr_calc = AverageTrueRange(high=h, low=l, close=c, window=14)
         df["atr"] = atr_calc.average_true_range()
     except Exception:
         df["atr"] = _atr_fallback(h, l, c, 14)
 
-    # ADX trend strength
+    # ADX
     try:
-        if ADXIndicator is None:
-            raise RuntimeError
         adx_obj = ADXIndicator(high=h, low=l, close=c, window=14)
         df["adx"] = adx_obj.adx()
     except Exception:
         df["adx"] = np.nan
 
-    # Bollinger bands / width
+    # Bollinger Bands / width
     try:
-        if BollingerBands is None:
-            raise RuntimeError
         bb = BollingerBands(close=c, window=BB_WINDOW, window_dev=2)
         df["bb_mid"] = bb.bollinger_mavg()
         df["bb_upper"] = bb.bollinger_hband()
@@ -530,29 +565,30 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_lower"] = np.nan
         df["bb_width"] = np.nan
 
-    # rolling support/resistance
+    # rolling support / resistance
     df["support_level"] = df["Low"].rolling(STRUCT_WINDOW, min_periods=3).min()
     df["resistance_level"] = df["High"].rolling(STRUCT_WINDOW, min_periods=3).max()
 
-    # range hi/lo
+    # range bounds
     df["range_low"]  = df["Low"].rolling(RANGE_LOOKBACK, min_periods=5).min()
     df["range_high"] = df["High"].rolling(RANGE_LOOKBACK, min_periods=5).max()
 
-    # swing pivot series (very rough)
+    # swing pivots
     swing_low = (
-        (df["Low"].shift(1).rolling(SWING_LOOKBACK).min() == df["Low"].shift(1)) &
-        (df["Low"].shift(1) < df["Low"]) &
-        (df["Low"].shift(1) < df["Low"].shift(2))
+        (df["Low"].shift(1).rolling(SWING_LOOKBACK).min() == df["Low"].shift(1))
+        & (df["Low"].shift(1) < df["Low"])
+        & (df["Low"].shift(1) < df["Low"].shift(2))
     )
     swing_high = (
-        (df["High"].shift(1).rolling(SWING_LOOKBACK).max() == df["High"].shift(1)) &
-        (df["High"].shift(1) > df["High"]) &
-        (df["High"].shift(1) > df["High"].shift(2))
+        (df["High"].shift(1).rolling(SWING_LOOKBACK).max() == df["High"].shift(1))
+        & (df["High"].shift(1) > df["High"])
+        & (df["High"].shift(1) > df["High"].shift(2))
     )
+
     df["swing_low_series"] = np.where(swing_low.shift(-1), df["Low"], np.nan)
     df["swing_high_series"] = np.where(swing_high.shift(-1), df["High"], np.nan)
 
-    # RSI adaptive bands
+    # RSI adaptive quantile bands
     rsi_roll = df["RSI"].rolling(RSI_WINDOW, min_periods=10)
     df["rsi_low_band"] = rsi_roll.quantile(RSI_Q_LOW)
     df["rsi_high_band"] = rsi_roll.quantile(RSI_Q_HIGH)
@@ -572,11 +608,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# Strategy / structure flags
+# Strategy flags / structure mode tagging
 # =============================================================================
 
 def _flag_buy_dip(row: pd.Series) -> bool:
-    # bullish trend, price near support, RSI oversold-ish
     if row["ema20"] > row["ema50"]:
         if row["support_level"] and row["support_level"] > 0:
             prox = (row["Close"] - row["support_level"]) / row["support_level"]
@@ -585,75 +620,57 @@ def _flag_buy_dip(row: pd.Series) -> bool:
                     return True
     return False
 
-
 def _flag_breakout_long(row: pd.Series) -> bool:
-    # uptrend + momentum up + break resistance
     if row["ema20"] > row["ema50"] and row["macd_slope"] > 0:
         if not math.isnan(row.get("resistance_level", np.nan)):
             if row["Close"] > row["resistance_level"]:
                 return True
     return False
 
-
 def _flag_breakout_short(row: pd.Series) -> bool:
-    # downtrend + momentum down + break support
     if row["ema20"] < row["ema50"] and row["macd_slope"] < 0:
         if not math.isnan(row.get("support_level", np.nan)):
             if row["Close"] < row["support_level"]:
                 return True
     return False
 
-
-def _flag_mean_rev_long(row: pd.Series) -> bool:
-    # weak trend, oversold RSI, price under ema20 (buy bounce)
-    if row["adx"] < ADX_MIN_TREND:
+def _flag_mean_rev_long(row: pd.Series, adx_cutoff: float) -> bool:
+    if row["adx"] < adx_cutoff:
         if row["RSI"] < min(row.get("rsi_low_band", 100), 40):
             if row["Close"] < row["ema20"]:
                 return True
     return False
 
-
-def _flag_mean_rev_short(row: pd.Series) -> bool:
-    # weak trend, overbought RSI, price above ema20 (short fade)
-    if row["adx"] < ADX_MIN_TREND:
+def _flag_mean_rev_short(row: pd.Series, adx_cutoff: float) -> bool:
+    if row["adx"] < adx_cutoff:
         if row["RSI"] > max(row.get("rsi_high_band", 0), 60):
             if row["Close"] > row["ema20"]:
                 return True
     return False
 
-
-def _flag_trend_cont_long(row: pd.Series) -> bool:
-    # strong bullish trend continuation
-    if row["ema20"] > row["ema50"] and row["adx"] >= ADX_MIN_TREND and row["RSI"] > 50:
+def _flag_trend_cont_long(row: pd.Series, adx_cutoff: float) -> bool:
+    if row["ema20"] > row["ema50"] and row["adx"] >= adx_cutoff and row["RSI"] > 50:
         return True
     return False
 
-
-def _flag_trend_cont_short(row: pd.Series) -> bool:
-    # strong bearish trend continuation
-    if row["ema20"] < row["ema50"] and row["adx"] >= ADX_MIN_TREND and row["RSI"] < 50:
+def _flag_trend_cont_short(row: pd.Series, adx_cutoff: float) -> bool:
+    if row["ema20"] < row["ema50"] and row["adx"] >= adx_cutoff and row["RSI"] < 50:
         return True
     return False
-
 
 def _flag_volexp_long(row: pd.Series) -> bool:
-    # quiet band + bullish expansion above bb_upper in uptrend
     if row.get("bb_width", np.nan) <= BB_WIDTH_PCT_THRESH and row["ema20"] > row["ema50"]:
         if row["Close"] > row.get("bb_upper", np.nan):
             return True
     return False
 
-
 def _flag_volexp_short(row: pd.Series) -> bool:
-    # quiet band + bearish expansion below bb_lower in downtrend
     if row.get("bb_width", np.nan) <= BB_WIDTH_PCT_THRESH and row["ema20"] < row["ema50"]:
         if row["Close"] < row.get("bb_lower", np.nan):
             return True
     return False
 
-
 def _flag_range_rev_long(row: pd.Series) -> bool:
-    # Buy near range_low bounce with RSI curling up
     rl = row.get("range_low", np.nan)
     rh = row.get("range_high", np.nan)
     if not math.isnan(rl) and not math.isnan(rh):
@@ -664,9 +681,7 @@ def _flag_range_rev_long(row: pd.Series) -> bool:
                 return True
     return False
 
-
 def _flag_range_rev_short(row: pd.Series) -> bool:
-    # Short near range_high rejection with RSI rolling down
     rl = row.get("range_low", np.nan)
     rh = row.get("range_high", np.nan)
     if not math.isnan(rl) and not math.isnan(rh):
@@ -677,38 +692,35 @@ def _flag_range_rev_short(row: pd.Series) -> bool:
                 return True
     return False
 
-
 def _flag_swing_long(row: pd.Series, prev_low: float, prev_prev_low: float) -> bool:
-    # higher low confirmation + bullish momentum
     if not math.isnan(prev_low) and not math.isnan(prev_prev_low):
         if prev_low > prev_prev_low and row["macd_slope"] > 0:
             return True
     return False
 
-
 def _flag_swing_short(row: pd.Series, prev_high: float, prev_prev_high: float) -> bool:
-    # lower high confirmation + bearish momentum
     if not math.isnan(prev_high) and not math.isnan(prev_prev_high):
         if prev_high < prev_prev_high and row["macd_slope"] < 0:
             return True
     return False
 
-
 def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
-    For each row in df:
-    - identify different structures and mark True/False columns:
-      dip_buy_flag, bull_breakout_flag, bear_breakdown_flag,
-      mr_long_flag, mr_short_flag,
-      trend_cont_long_flag, trend_cont_short_flag,
-      volexp_long_flag, volexp_short_flag,
-      range_rev_long_flag, range_rev_short_flag,
-      swing_long_flag, swing_short_flag.
+    Adds boolean columns that say "this candle is a dip buy", "this is breakout",
+    "this is mean reversion long", etc.
+    We'll use those to gate trades when structure_mode != Off.
     """
     if df is None or df.empty:
         return df
+
     df = df.copy()
 
+    global ADX_MIN_TREND  # ensure we use the currently active threshold
+    adx_cutoff = ADX_MIN_TREND
+
+    dip_flag = []
+    bo_long = []
+    bo_short = []
     mr_long = []
     mr_short = []
     tc_long = []
@@ -719,9 +731,6 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
     rr_short = []
     sw_long = []
     sw_short = []
-    dip_flag = []
-    bo_long = []
-    bo_short = []
 
     prev_low = np.nan
     prev_prev_low = np.nan
@@ -729,7 +738,7 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
     prev_prev_high = np.nan
 
     for _, row in df.iterrows():
-        # update last 2 swing lows/highs
+        # update rolling swing memory
         if not math.isnan(row.get("swing_low_series", np.nan)):
             prev_prev_low = prev_low
             prev_low = row["swing_low_series"]
@@ -741,11 +750,11 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
         bo_long.append(_flag_breakout_long(row))
         bo_short.append(_flag_breakout_short(row))
 
-        mr_long.append(_flag_mean_rev_long(row))
-        mr_short.append(_flag_mean_rev_short(row))
+        mr_long.append(_flag_mean_rev_long(row, adx_cutoff))
+        mr_short.append(_flag_mean_rev_short(row, adx_cutoff))
 
-        tc_long.append(_flag_trend_cont_long(row))
-        tc_short.append(_flag_trend_cont_short(row))
+        tc_long.append(_flag_trend_cont_long(row, adx_cutoff))
+        tc_short.append(_flag_trend_cont_short(row, adx_cutoff))
 
         ve_long.append(_flag_volexp_long(row))
         ve_short.append(_flag_volexp_short(row))
@@ -759,19 +768,14 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
     df["dip_buy_flag"] = dip_flag
     df["bull_breakout_flag"] = bo_long
     df["bear_breakdown_flag"] = bo_short
-
     df["mr_long_flag"] = mr_long
     df["mr_short_flag"] = mr_short
-
     df["trend_cont_long_flag"] = tc_long
     df["trend_cont_short_flag"] = tc_short
-
     df["volexp_long_flag"] = ve_long
     df["volexp_short_flag"] = ve_short
-
     df["range_rev_long_flag"] = rr_long
     df["range_rev_short_flag"] = rr_short
-
     df["swing_long_flag"] = sw_long
     df["swing_short_flag"] = sw_short
 
@@ -779,22 +783,18 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# Core rule-based signal engine (unfiltered)
+# Core rule-based signal (pre-filter)
 # =============================================================================
 
 def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    Returns (side, conf) where side in {"Buy","Sell","Hold"}
-    and conf in [0..1] (rule-based confidence).
-    Uses:
-      - EMA20/EMA50 trend
-      - RSI extremes
-      - MACD cross
+    ("Buy"|"Sell"|"Hold", confidence 0..1)
+    Based on EMA trend, RSI extremes, and MACD cross.
     """
     score = 0.0
     votes = 0
 
-    # EMA trend
+    # EMA20 vs EMA50
     if pd.notna(row.get("ema20")) and pd.notna(row.get("ema50")):
         votes += 1
         if row["ema20"] > row["ema50"]:
@@ -811,7 +811,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
         elif rsi_val > 70:
             score -= 1.0
 
-    # MACD cross
+    # MACD bullish/bearish cross
     a1 = row.get("macd")
     b1 = row.get("macd_signal")
     a0 = prev_row.get("macd")
@@ -832,11 +832,12 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
     elif score <= -0.67 * votes:
         return "Sell", conf
     else:
+        # Treat as Hold, with inverse confidence
         return "Hold", 1.0 - conf
 
 
 # =============================================================================
-# Adaptive TP/SL
+# Adaptive TP/SL calculation
 # =============================================================================
 
 def _calc_tp_sl(
@@ -846,13 +847,14 @@ def _calc_tp_sl(
     risk: str,
     tp_sl_mode: str,
     adx: float,
-    atr_pct: float
+    atr_pct: float,
 ) -> Tuple[float, float]:
     """
-    Creates TP and SL around current price using:
-    - base ATR multiples from risk setting
-    - scaling from trend strength (ADX) + vol regime (atr_pct)
-    - mode profile (Normal/Aggressive/Off)
+    ATR-based TP/SL with scaling from:
+    - ADX (trend strength)
+    - volatility regime (atr_pct)
+    - chosen aggressiveness
+    - risk profile
     """
     base = RISK_MULT.get(risk, RISK_MULT["Medium"])
     tp_k = float(base["tp_atr"])
@@ -862,8 +864,8 @@ def _calc_tp_sl(
 
     trend_scale = np.interp(adx, [0, 40], [prof["trend_min"], prof["trend_max"]])
     vol_scale   = np.interp(atr_pct, [0, 2], [prof["vol_min"], prof["vol_max"]])
-    scale = (trend_scale + vol_scale) / 2.0
 
+    scale = (trend_scale + vol_scale) / 2.0
     tp_k *= scale
     sl_k *= scale
 
@@ -878,13 +880,13 @@ def _calc_tp_sl(
 
 
 # =============================================================================
-# ML confidence (5-fold CV ensemble of RF + GB)
+# ML layer: blended rule+model confidence
 # =============================================================================
 
 def _prepare_ml_df(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> Optional[pd.DataFrame]:
     """
-    Build supervised dataset where target is next_close_up (Close[t+1] > Close[t] ?)
-    Using last few hundred bars (rolling).
+    Builds supervised dataset for 'next bar up?' classification.
+    Uses technical features + rolling winrate hint.
     """
     if df is None or df.empty or len(df) < 60:
         return None
@@ -909,14 +911,13 @@ def _prepare_ml_df(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> Optiona
 
     return work
 
-
 def _ml_confidence_raw(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> float:
     """
-    Returns out-of-fold predicted probability that price will go UP next bar,
-    blended RF+GB, clipped to 5%-95%.
+    Cross-validated probability that next candle closes UP.
+    Uses RF + GB ensemble.
+    Clipped to [0.05, 0.95].
     """
-    if RandomForestClassifier is None or KFold is None:
-        return 0.5
+    RandomForestClassifier, GradientBoostingClassifier, KFold = _lazy_import_ml()
 
     work = _prepare_ml_df(df, recent_wr_hint)
     if work is None:
@@ -947,10 +948,9 @@ def _ml_confidence_raw(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> flo
         rf.fit(Xtr, ytr)
         probs_rf.extend(rf.predict_proba(Xte)[:, 1])
 
-        if GradientBoostingClassifier is not None:
-            gb = GradientBoostingClassifier(random_state=42)
-            gb.fit(Xtr, ytr)
-            probs_gb.extend(gb.predict_proba(Xte)[:, 1])
+        gb = GradientBoostingClassifier(random_state=42)
+        gb.fit(Xtr, ytr)
+        probs_gb.extend(gb.predict_proba(Xte)[:, 1])
 
     rf_avg = float(np.mean(probs_rf)) if probs_rf else 0.5
     gb_avg = float(np.mean(probs_gb)) if probs_gb else rf_avg
@@ -960,16 +960,17 @@ def _ml_confidence_raw(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> flo
 
 
 # =============================================================================
-# Structure gating ("strategy mode") filter
+# Structure gating (strategy mode)
 # =============================================================================
 
 def _structure_allows(side: str, row: pd.Series, mode: str) -> bool:
     """
-    Whether this candle supports the requested trading style.
-    If mode is not "Off", we gate Buy/Sell recommendations to matching setup.
+    Enforces strategy mode filters like 'Buy Dips', 'Breakouts', etc.
+    If mode != "Off" and we get a Buy/Sell that doesn't match the structure
+    pattern, we turn it into Hold.
     """
     if side not in ("Buy", "Sell"):
-        # "Hold" only allowed if mode is Off. Otherwise we don't really 'take' Hold.
+        # "Hold" only matters if mode is Off. Otherwise we don't 'take' Hold.
         return (mode == "Off")
 
     if mode == "Off":
@@ -1009,7 +1010,7 @@ def _structure_allows(side: str, row: pd.Series, mode: str) -> bool:
 
 
 # =============================================================================
-# Build latest_prediction snapshot (for the UI)
+# Build latest_prediction snapshot
 # =============================================================================
 
 def latest_prediction(
@@ -1022,17 +1023,17 @@ def latest_prediction(
     calibration_enabled: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns a dictionary like:
-      {
-        "side": "Buy"/"Sell"/"Hold",
-        "probability": 0.xx,
-        "price": last_close,
-        "tp": ...,
-        "sl": ...,
-        "rr": reward/risk ratio,
-        "atr": ...,
-        "adx": ...,
-      }
+    Produces the live signal block for Detailed View:
+    {
+      "side": "Buy"/"Sell"/"Hold",
+      "probability": 0.xx,
+      "price": last_close,
+      "tp": ...,
+      "sl": ...,
+      "rr": ...,
+      "atr": ...,
+      "adx": ...,
+    }
     """
 
     if df_raw is None or df_raw.empty or len(df_raw) < 60:
@@ -1043,7 +1044,7 @@ def latest_prediction(
     if df.empty or len(df) < 60:
         return None
 
-    # calibration-aware thresholds
+    # Pull calibration → filter thresholds
     calib = _load_calib()
     bias = _calib_bias_for_symbol(calib, "", calibration_enabled)
     _apply_filter_level(filter_level, bias)
@@ -1051,15 +1052,15 @@ def latest_prediction(
     prev_row = df.iloc[-2]
     row_now  = df.iloc[-1]
 
-    # rule side
+    # Baseline rule engine
     side, rule_conf = compute_signal_row(prev_row, row_now)
 
-    # ML layer (cross-validated)
+    # ML blended confidence
     ml_conf = _ml_confidence_raw(df, bias.get("avg_wr", 50.0) / 100.0)
     blended = 0.5 * rule_conf + 0.5 * ml_conf
     blended = max(0.05, min(0.95, blended))
 
-    # structure gating
+    # Apply structure gating
     allowed = _structure_allows(side, row_now, structure_mode)
     if not allowed:
         side = "Hold"
@@ -1071,7 +1072,7 @@ def latest_prediction(
 
     if side == "Hold":
         return {
-            "side": "Hold",
+            "side": side,
             "probability": round(blended, 2),
             "price": last_price,
             "tp": None,
@@ -1081,7 +1082,6 @@ def latest_prediction(
             "adx": adx_now,
         }
 
-    # Build TP/SL
     tp, sl = _calc_tp_sl(last_price, atr_now, side, risk, tp_sl_mode, adx_now, atr_pct)
 
     if side == "Buy":
@@ -1106,16 +1106,22 @@ def latest_prediction(
 
 
 # =============================================================================
-# Backtest / performance stats
+# Backtest
 # =============================================================================
 
-def _simulate_trade_path(df: pd.DataFrame, i: int, side: str, risk: str, tp_sl_mode: str, horizon: int = 10):
+def _simulate_trade_path(
+    df: pd.DataFrame,
+    i: int,
+    side: str,
+    risk: str,
+    tp_sl_mode: str,
+    horizon: int = 10,
+) -> Tuple[float, bool]:
     """
-    Simulate a single trade forward horizon bars:
-    - +1% if TP first
-    - -1% if SL first
-    - 0 otherwise
-    Returns (pnl%, winBool)
+    Simulate a single hypothetical trade:
+    - +1% if TP hit first
+    - -1% if SL hit first
+    - 0% otherwise after horizon bars
     """
     row = df.iloc[i]
     px0 = float(row["Close"])
@@ -1145,7 +1151,6 @@ def _simulate_trade_path(df: pd.DataFrame, i: int, side: str, risk: str, tp_sl_m
 
     return 0.0, False
 
-
 def backtest_signals(
     df_raw: pd.DataFrame,
     risk: str,
@@ -1157,18 +1162,14 @@ def backtest_signals(
     tp_sl_mode: str,
 ) -> Dict[str, Any]:
     """
-    Relaxed walk-forward backtest that:
-     - runs compute_signal_row() for each bar
-     - blends with ML confidence
-     - applies CONF_EXEC_THRESHOLD from filter_level
-     - applies structure gating
-     - may force a trade if in "Performance" mode (forced_trades_enabled)
-
-    Returns stats:
-     winrate, winrate stddev, trades, return, maxdd, sharpe-like,
-     PF (profit factor), EV%/trade
+    Walkthrough:
+    - For each bar, compute signal+confidence
+    - Apply confidence filter (Loose/Balanced/Strict)
+    - Apply structure mode gating
+    - Optionally force extra trades in performance mode
+    - Simulate TP/SL path
+    Returns PF, EV/trade, WinRate, WinRate std, etc.
     """
-
     out = {
         "winrate": 0.0,
         "trades": 0,
@@ -1188,6 +1189,7 @@ def backtest_signals(
     if df.empty or len(df) < 60:
         return out
 
+    # calibration-aware filters
     calib = _load_calib()
     bias = _calib_bias_for_symbol(calib, "", calibration_enabled)
     _apply_filter_level(filter_level, bias)
@@ -1209,20 +1211,19 @@ def backtest_signals(
         blended = 0.5 * rule_conf + 0.5 * ml_conf
         blended = max(0.05, min(0.95, blended))
 
-        # Confidence threshold
+        # confidence gate
         if blended < CONF_EXEC_THRESHOLD:
             if not forced_trades_enabled or blended < FORCED_CONF_MIN:
-                # skip this bar entirely
                 continue
-            # if we're in "performance" mode, maybe force a trade
             if side == "Hold":
+                # if we force, pick a random direction just to get stats coverage
                 side = np.random.choice(["Buy", "Sell"])
 
-        # Structure / style gating
+        # structure gate
         if not _structure_allows(side, cur, structure_mode):
             if not forced_trades_enabled:
                 continue
-            # if forced mode, we still skip if structure doesn't match
+            # even in performance mode we skip if structure doesn't qualify
             continue
 
         pnl, won = _simulate_trade_path(df, i, side, risk, tp_sl_mode, horizon)
@@ -1248,10 +1249,7 @@ def backtest_signals(
 
         pnl_w = [p for p in pnl_list if p > 0]
         pnl_l = [-p for p in pnl_list if p < 0]
-        if pnl_l:
-            pf_val = (np.sum(pnl_w) / np.sum(pnl_l))
-        else:
-            pf_val = float("inf")
+        pf_val = (np.sum(pnl_w) / np.sum(pnl_l)) if pnl_l else float("inf")
 
         ev_per_trade = float(np.mean(pnl_list)) * 100.0
         wr_std = float(np.std([1.0 if p > 0 else 0.0 for p in pnl_list])) * 100.0
@@ -1267,7 +1265,7 @@ def backtest_signals(
             "wr_std": round(wr_std, 2),
         })
 
-    # update calibration memory (symbol "" = aggregate/anonymous)
+    # update calibration memory
     calib = _record_calib(calib, "", out["winrate"] if trades > 0 else 50.0)
     _save_calib(calib)
 
@@ -1275,13 +1273,12 @@ def backtest_signals(
 
 
 # =============================================================================
-# sentiment stub
+# Sentiment stub
 # =============================================================================
 
 def compute_sentiment_stub(symbol: str) -> float:
     """
-    Clunky but stable: BTC > stocks > oil > baseline.
-    Keeps a bullish-ish tilt for risk assets for UI meter.
+    Lightweight bullishness hint.
     """
     bias_map = {
         "BTC-USD": 0.65,
@@ -1293,7 +1290,7 @@ def compute_sentiment_stub(symbol: str) -> float:
 
 
 # =============================================================================
-# analyze_asset (single asset snapshot for summary table)
+# Analyze a single asset (used for summary table)
 # =============================================================================
 
 def analyze_asset(
@@ -1308,12 +1305,7 @@ def analyze_asset(
     weekend_mode: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    High level wrapper:
-    - fetch data
-    - mark stale
-    - latest_prediction
-    - relaxed backtest
-    - bundle stats
+    Fetch, mark stale, run prediction + backtest, bundle it all.
     """
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=True)
     if df_raw.empty:
@@ -1321,7 +1313,7 @@ def analyze_asset(
 
     stale_flag = _is_stale(df_raw, symbol, interval_key)
     if weekend_mode and stale_flag:
-        # We don't block the signal entirely, but we mark it stale for UI
+        # we *don't* kill it, just flag for UI
         pass
 
     pred = latest_prediction(
@@ -1407,15 +1399,15 @@ def analyze_asset(
 
 
 # =============================================================================
-# Chart helper: generate plot marker points, overlays, etc.
+# Chart helper: build plot markers & overlays
 # =============================================================================
 
 def generate_signal_points(df: pd.DataFrame, structure_mode: str) -> Dict[str, Any]:
     """
-    Precompute coordinates for:
-    - Buy / Sell markers
-    - structure-specific markers (dip buy, breakouts, etc.)
-    - overlays (support/resistance, range hi/lo, bb bands, swing pivots)
+    Produce x/y arrays for each overlay layer in the plot:
+     - buy/sell markers
+     - each structure mode's markers
+     - support/resistance lines, bb bands, range bounds, swing pivots
     """
     out = {
         "buy_x": [], "buy_y": [],
@@ -1456,31 +1448,35 @@ def generate_signal_points(df: pd.DataFrame, structure_mode: str) -> Dict[str, A
         idx = row.name
         px = row["Close"]
 
-        # primary buy/sell markers
+        # buy/sell
         if side == "Buy":
             out["buy_x"].append(idx); out["buy_y"].append(px)
         elif side == "Sell":
             out["sell_x"].append(idx); out["sell_y"].append(px)
 
-        # structure markers
+        # structure tags
         if row.get("dip_buy_flag", False):
             out["dip_x"].append(idx); out["dip_y"].append(px)
         if row.get("bull_breakout_flag", False):
             out["bo_long_x"].append(idx); out["bo_long_y"].append(px)
         if row.get("bear_breakdown_flag", False):
             out["bo_short_x"].append(idx); out["bo_short_y"].append(px)
+
         if row.get("mr_long_flag", False):
             out["mr_long_x"].append(idx); out["mr_long_y"].append(px)
         if row.get("mr_short_flag", False):
             out["mr_short_x"].append(idx); out["mr_short_y"].append(px)
+
         if row.get("trend_cont_long_flag", False):
             out["tc_long_x"].append(idx); out["tc_long_y"].append(px)
         if row.get("trend_cont_short_flag", False):
             out["tc_short_x"].append(idx); out["tc_short_y"].append(px)
+
         if row.get("volexp_long_flag", False):
             out["ve_long_x"].append(idx); out["ve_long_y"].append(px)
         if row.get("volexp_short_flag", False):
             out["ve_short_x"].append(idx); out["ve_short_y"].append(px)
+
         if row.get("range_rev_long_flag", False):
             out["rr_long_x"].append(idx); out["rr_long_y"].append(px)
         if row.get("range_rev_short_flag", False):
@@ -1519,7 +1515,7 @@ def generate_signal_points(df: pd.DataFrame, structure_mode: str) -> Dict[str, A
 
 
 # =============================================================================
-# Public wrappers for Streamlit
+# Streamlit-facing wrappers
 # =============================================================================
 
 def summarize_assets(
@@ -1533,7 +1529,7 @@ def summarize_assets(
     weekend_mode: bool = True,
 ) -> pd.DataFrame:
     """
-    Loop over ASSET_SYMBOLS and build a dashboard summary row for each.
+    High-level summary of all assets for the dashboard table.
     """
     rows = []
     for asset_name, symbol in ASSET_SYMBOLS.items():
@@ -1550,7 +1546,7 @@ def summarize_assets(
                 weekend_mode,
             )
         except Exception as e:
-            _log(f"Error analyzing {asset_name}: {e}")
+            _log(f"[analyze_asset fail] {asset_name}: {e}")
             res = None
 
         if not res:
@@ -1580,9 +1576,7 @@ def summarize_assets(
 
     if not rows:
         return pd.DataFrame()
-
     return pd.DataFrame(rows)
-
 
 def load_asset_with_indicators(
     asset: str,
@@ -1593,20 +1587,18 @@ def load_asset_with_indicators(
     calibration_enabled: bool = True,
 ):
     """
-    For Debug/Raw view.
-    Returns:
-      symbol, df_with_indicators+flags, pts (plot coords)
+    For debug/raw tab.
+    Returns (symbol, enriched_df, pts)
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
-    symbol = ASSET_SYMBOLS[asset]
 
+    symbol = ASSET_SYMBOLS[asset]
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=True)
     df_ind = add_indicators(df_raw)
     df_ind = _add_strategy_flags(df_ind)
     pts = generate_signal_points(df_ind, structure_mode)
     return symbol, df_ind, pts
-
 
 def asset_prediction_and_backtest(
     asset: str,
@@ -1620,11 +1612,11 @@ def asset_prediction_and_backtest(
     weekend_mode: bool,
 ):
     """
-    Used in Detailed View to show:
-      - live signal snapshot
-      - backtest metrics
-      - indicator dataframe (df_ind)
-      - plotting points (pts)
+    Used by the Detailed View panel:
+    - prediction snapshot (latest_prediction)
+    - backtest stats (backtest_signals)
+    - df for chart/indicators
+    - pts for overlays
     """
     if asset not in ASSET_SYMBOLS:
         return None, pd.DataFrame(), {}
@@ -1664,7 +1656,7 @@ def asset_prediction_and_backtest(
     stale_flag = _is_stale(df_raw, symbol, interval_key)
 
     if pred is None:
-        fallback = {
+        block = {
             "asset": asset,
             "symbol": symbol,
             "interval": interval_key,
@@ -1687,9 +1679,9 @@ def asset_prediction_and_backtest(
             "maxdd": bt["maxdd"],
             "sharpe": bt["sharpe"],
         }
-        return fallback, df_ind, pts
+        return block, df_ind, pts
 
-    enriched = {
+    block = {
         "asset": asset,
         "symbol": symbol,
         "interval": interval_key,
@@ -1712,4 +1704,4 @@ def asset_prediction_and_backtest(
         "maxdd": bt["maxdd"],
         "sharpe": bt["sharpe"],
     }
-    return enriched, df_ind, pts
+    return block, df_ind, pts
