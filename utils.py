@@ -1,4 +1,3 @@
-
 # utils_full_v8_3_2.py
 # WoodyTradesPro / Forecast Engine v8.3.2
 # Smart Strategy Modes Edition, Streamlit Cloud lazy-load safe + rate-limit safe
@@ -336,7 +335,45 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+import warnings
+from datetime import datetime, timedelta
+
+_last_rate_limit = {"ts": None}
+
 def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """Primary yfinance download path with stronger rate-limit handling."""
+    import yfinance as yf
+    global _last_rate_limit
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    # cooldown if rate-limited recently
+    now = datetime.utcnow()
+    if _last_rate_limit["ts"] and (now - _last_rate_limit["ts"]) < timedelta(minutes=10):
+        _log(f"[rate-limit cooldown] Serving stale cache for {symbol}")
+        return pd.DataFrame()
+
+    try:
+        raw = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            threads=False,
+            auto_adjust=True,
+        )
+        if raw is None or raw.empty:
+            raise ValueError("Empty download")
+        return _normalize_ohlcv(raw)
+    except Exception as e:
+        msg = str(e)
+        if "Rate limited" in msg or "Too Many Requests" in msg:
+            _last_rate_limit["ts"] = now
+            _log(f"⚠️ Rate-limit detected for {symbol}, entering cooldown.")
+        else:
+            _log(f"[yf.download fail] {symbol} {interval} {period}: {e}")
+        return pd.DataFrame()
+
     """Primary yfinance download path."""
     yf = _lazy_import_yf()
     try:
@@ -431,7 +468,9 @@ def fetch_data(
 
             _log(f"⚠️ Retry {attempt} failed for {symbol} "
                  f"({len(df_live) if isinstance(df_live, pd.DataFrame) else 'N/A'} rows).")
-            time.sleep(random.uniform(*backoff_range))
+            # exponential backoff
+        sleep_for = random.uniform(*backoff_range) * attempt
+        time.sleep(sleep_for)
 
         # 3. mirror fallback
         _log(f"🪞 Mirror fetch for {symbol}...")
