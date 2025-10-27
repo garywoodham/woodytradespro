@@ -1,16 +1,18 @@
-# app.py v8.3.1 - Woody Trades Pro Dashboard
+# app.py v8.3.1 (lazy-load safe version for Streamlit Cloud)
 # ---------------------------------------------------------------------------------
-# - Strategy Mode selector (9 modes)
-# - Engine Depth (Accuracy vs Performance)
+# Keeps ALL dashboard behavior:
+# - Timeframe / Risk / TP-SL adaptivity
+# - Strategy Mode (structure gating)
 # - Confidence Filter (Loose / Balanced / Strict)
-# - Adaptive TP/SL controls
-# - Calibration bias toggle
-# - Weekend/stale awareness
-# - Full chart overlay: EMAs, support/resistance, BB, range, swing pivots,
-#   and signal markers (Buy/Sell/structure flags)
+# - Calibration toggle
+# - Weekend stale flagging
+# - Engine Depth (Accuracy vs Performance)
+# - Backtest stats: PF, EV/trade, WinRate ± std
+# - Candlestick chart with overlays + markers
 #
-# This file expects utils.py v8.3.1 exactly as provided.
-# ---------------------------------------------------------------------------------
+# Key change for Streamlit Cloud:
+#   No heavy work at the top-level except import & layout config. The heavy stuff
+#   only runs when Streamlit calls our cached functions.
 
 import traceback
 import warnings
@@ -29,14 +31,15 @@ from utils import (
 
 warnings.filterwarnings("ignore")
 
+# Streamlit page config
 st.set_page_config(
     page_title="Woody Trades Pro - Smart v8.3.1",
     layout="wide"
 )
 
-# ---------------------------------------------------------------------
-# Sidebar controls
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# SIDEBAR CONTROLS
+# -----------------------------------------------------------------------------
 
 st.sidebar.title("Settings")
 
@@ -94,14 +97,14 @@ calibration_enabled = st.sidebar.checkbox(
     "Calibration Bias Enabled",
     value=True,
     key="sidebar_calibration_enabled",
-    help="Reinforces/penalizes signals based on rolling historical per-asset win rate.",
+    help="Reinforces/penalizes signals based on rolling historical performance.",
 )
 
 weekend_mode = st.sidebar.checkbox(
     "Skip Stale (Weekend Mode)",
     value=True,
     key="sidebar_weekend_mode",
-    help="Flags symbols whose last candle is too old for this interval (e.g. market closed). BTC exempt.",
+    help="Flags symbols with stale last candle (e.g. weekend, market closed). BTC exempt.",
 )
 
 engine_depth = st.sidebar.selectbox(
@@ -110,8 +113,8 @@ engine_depth = st.sidebar.selectbox(
     index=0,
     key="sidebar_engine_depth",
     help=(
-        "Accuracy = require high confidence, do NOT force trades.\n"
-        "Performance = allow low-conf 'forced' trades to increase sample size in backtest."
+        "Accuracy = require confidence and structure, do NOT force trades.\n"
+        "Performance = allow low-conf 'forced' trades to increase backtest sample size."
     ),
 )
 
@@ -129,9 +132,9 @@ st.sidebar.caption(
 )
 
 
-# ---------------------------------------------------------------------
-# Cache wrappers so Streamlit doesn't refetch nonstop
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# CACHING LAYERS
+# -----------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
 def load_summary_cached(
@@ -200,9 +203,9 @@ def load_price_df_cached(
     )
 
 
-# ---------------------------------------------------------------------
-# 1) MARKET SUMMARY TABLE
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1) MARKET SUMMARY
+# -----------------------------------------------------------------------------
 
 st.header("📊 Market Summary")
 
@@ -215,7 +218,7 @@ try:
         forced_trades_enabled,
         filter_level,
         calibration_enabled,
-        weekend_mode
+        weekend_mode,
     )
 
     if df_summary is None or df_summary.empty:
@@ -226,15 +229,14 @@ try:
             width="stretch",
             hide_index=True,
         )
-
 except Exception as e:
     st.error(f"Error loading summary: {e}")
     st.code(traceback.format_exc())
 
 
-# ---------------------------------------------------------------------
-# 2) DETAILED VIEW FOR ONE ASSET
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 2) DETAILED VIEW
+# -----------------------------------------------------------------------------
 
 st.header("🔍 Detailed View")
 
@@ -251,18 +253,18 @@ try:
         weekend_mode,
     )
 
-    # Top row of metrics
+    # Metric row 1
     colA, colB, colC, colD = st.columns(4)
 
     if pred_block:
-        # Signal / side (Buy / Sell / Hold)
+        # current signal
         colA.metric(
             label="Signal",
             value=pred_block.get("side", "Hold"),
             help="Buy / Sell / Hold AFTER structure-mode gating and confidence filter.",
         )
 
-        # Blended model confidence
+        # model confidence
         prob_val = pred_block.get("probability", 0.0)
         if prob_val <= 1:
             conf_str = f"{prob_val * 100:.2f}%"
@@ -274,16 +276,16 @@ try:
             help="Blended rule+ML conviction (5-fold CV); clipped 5%-95%.",
         )
 
-        # Win rate (backtest)
+        # win rate (± std)
         wr_val = pred_block.get("win_rate", 0.0)
         wr_std_val = pred_block.get("win_rate_std", 0.0)
         colC.metric(
             label="Win Rate (backtest)",
             value=f"{wr_val:.2f}% ±{wr_std_val:.2f}",
-            help="Relaxed horizon backtest hit-rate with variability (std dev).",
+            help="Relaxed horizon backtest hit-rate and variability.",
         )
 
-        # Trades count
+        # trades taken
         tr_val = pred_block.get("trades", 0)
         colD.metric(
             label="Trades (backtest)",
@@ -291,7 +293,7 @@ try:
             help="Number of simulated trades under current filters.",
         )
 
-        # Row 2: TP/SL/RR/Sentiment
+        # Metric row 2: TP / SL / RR / Sentiment
         colE, colF, colG, colH = st.columns(4)
 
         tp_val = pred_block.get("tp")
@@ -301,12 +303,12 @@ try:
         colE.metric(
             "TP",
             f"{tp_val:.4f}" if tp_val else "—",
-            help="Adaptive Take Profit level from ATR/ADX/vol regime."
+            help="Adaptive Take Profit from ATR/ADX/vol regime."
         )
         colF.metric(
             "SL",
             f"{sl_val:.4f}" if sl_val else "—",
-            help="Adaptive Stop Loss level from ATR/ADX/vol regime."
+            help="Adaptive Stop Loss from ATR/ADX/vol regime."
         )
         colG.metric(
             "R/R",
@@ -321,13 +323,13 @@ try:
             help="Stub sentiment: higher = more bullish tone.",
         )
 
-        # Row 3: PF / EV / Return / Drawdown
+        # Metric row 3: PF / EV / Return / Drawdown
         colI, colJ, colK, colL = st.columns(4)
 
         colI.metric(
             "Profit Factor",
             f"{pred_block.get('profit_factor', '—')}",
-            help="Sum of wins / sum of losses in the backtest. >1 is generally good."
+            help="Sum wins / sum losses in backtest. >1 is typically good."
         )
         colJ.metric(
             "EV% / Trade",
@@ -337,22 +339,22 @@ try:
         colK.metric(
             "Total Return (bt)",
             f"{pred_block.get('backtest_return_pct', '—')}%",
-            help="Naive compounding of +/-1% stub PnL outcomes."
+            help="Naive compounding of +/-1% outcomes."
         )
         colL.metric(
             "Max DD (bt)",
             f"{pred_block.get('maxdd', '—')}%",
-            help="Largest drawdown experienced in simulated equity curve.",
+            help="Worst peak-to-trough drawdown in the simulated path.",
         )
 
     else:
         st.warning("No prediction block available for this asset.")
 
-    # Chart section
+    # Price chart + overlays
     if isinstance(df_asset_ind, pd.DataFrame) and not df_asset_ind.empty:
         fig = go.Figure()
 
-        # Candles
+        # Candle
         fig.add_trace(go.Candlestick(
             x=df_asset_ind.index,
             open=df_asset_ind["Open"],
@@ -362,7 +364,7 @@ try:
             name="Price",
         ))
 
-        # EMA20 / EMA50
+        # EMA20/EMA50
         if "ema20" in df_asset_ind.columns:
             fig.add_trace(go.Scatter(
                 x=df_asset_ind.index,
@@ -380,7 +382,7 @@ try:
                 line=dict(width=1),
             ))
 
-        # Support / Resistance
+        # Support / Resistance bands
         if len(pts.get("sup_x", [])) > 0:
             fig.add_trace(go.Scatter(
                 x=pts["sup_x"],
@@ -398,7 +400,7 @@ try:
                 line=dict(width=1, dash="dot"),
             ))
 
-        # Volatility Expansion mode: show Bollinger
+        # If we're specifically in Volatility Expansion mode, overlay BB channels
         if structure_mode == "Volatility Expansion":
             fig.add_trace(go.Scatter(
                 x=pts["bb_upper_x"],
@@ -415,7 +417,7 @@ try:
                 line=dict(width=1, dash="dash"),
             ))
 
-        # Range Reversal mode: show range high/low
+        # If we're specifically in Range Reversal mode, overlay range bounds
         if structure_mode == "Range Reversal":
             fig.add_trace(go.Scatter(
                 x=pts["range_hi_x"],
@@ -432,7 +434,7 @@ try:
                 line=dict(width=1, dash="dot"),
             ))
 
-        # Swing Structure mode: show swing pivots
+        # If we're specifically in Swing Structure mode, overlay swing pivots
         if structure_mode == "Swing Structure":
             fig.add_trace(go.Scatter(
                 x=pts["swing_high_x"],
@@ -465,7 +467,7 @@ try:
             marker=dict(symbol="triangle-down", size=9),
         ))
 
-        # Structure markers
+        # Structure markers for context
         fig.add_trace(go.Scatter(
             x=pts["dip_x"], y=pts["dip_y"],
             mode="markers",
@@ -548,7 +550,6 @@ try:
         )
 
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
     else:
         st.info("No chart data available for this asset/timeframe.")
 
@@ -557,9 +558,9 @@ except Exception as e:
     st.code(traceback.format_exc())
 
 
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 3) RAW DATA / DEBUG
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 st.header("🛠 Debug / Raw Data")
 
@@ -573,11 +574,13 @@ with st.expander("Show model input data / indicators / backtest inputs"):
             filter_level,
             calibration_enabled,
         )
+
         st.write(f"Symbol: {symbol_for_asset}")
         st.dataframe(
             df_asset_full.tail(200),
             width="stretch",
         )
+
     except Exception as e:
         st.error(f"Failed to load raw data: {e}")
         st.code(traceback.format_exc())
