@@ -8,6 +8,18 @@
 # Prevents "Session already connected" hangs on reloads.
 # =============================================================================
 
+import os, shutil
+
+# On fresh run, clean any stale Streamlit session locks
+try:
+    cache_dir = os.path.expanduser("~/.streamlit/cache")
+    sess_dir = os.path.expanduser("~/.streamlit/sessions")
+    for d in (cache_dir, sess_dir):
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
+except Exception:
+    pass
+
 import os
 
 # Run Streamlit headlessly and drop inactive sessions quickly
