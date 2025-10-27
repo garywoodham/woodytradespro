@@ -3,6 +3,21 @@
 # Streamlit Frontend (Safe Local Import)
 # =============================================================================
 
+# =============================================================================
+# WoodyTrades Pro — Streamlit Session Safety Patch
+# Prevents "Session already connected" hangs on reloads.
+# =============================================================================
+
+import os
+
+# Run Streamlit headlessly and drop inactive sessions quickly
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_RUNTIME_SESSION_TIMEOUT"] = "60"       # seconds
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"  # optional privacy
+
+# Optional: ensure clean cache start on new deployment
+os.environ["STREAMLIT_CACHE_PERSIST"] = "false"
+
 import sys, importlib.util, pathlib
 
 # --- Force-load local utils.py (bypass any package "utils") ---
