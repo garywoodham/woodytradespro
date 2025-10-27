@@ -1,52 +1,64 @@
-# utils.py v8.3.1 (Smart Strategy Modes Edition, Streamlit Cloud lazy-load safe)
+# utils.py v8.3.2 (Smart Strategy Modes Edition, Streamlit Cloud lazy-load safe + rate-limit safe)
 # ---------------------------------------------------------------------------------
 # This is your full engine, with all features preserved:
-# - Strategy modes (Breakout / Buy Dip / etc)
+# - Strategy modes (Breakout / Buy Dips / Mean Reversion / Trend Continuation / etc)
 # - Confidence gating (Loose / Balanced / Strict)
 # - 5-fold CV ML ensemble (RandomForest + GradientBoosting)
 # - Adaptive TP/SL scaling with ADX + volatility regime
-# - Weekend/stale awareness
-# - Calibration bias feedback loop
-# - PF / EV% / WinRate±Std backtest
-# - Chart overlays, structure flags, pivots, bands
-# - TP/SL, R/R, sentiment, etc.
+# - Weekend/stale awareness for non-24/7 symbols
+# - Calibration bias feedback loop: adjusts thresholds based on recent “winrate memory”
+# - PF / EV% / WinRate±Std backtest (simulated trades using TP/SL rules)
+# - Chart overlays, swing pivots, structure flags, support/resistance bands
+# - TP/SL, R/R, sentiment stub
 #
-# CRITICAL CHANGE FOR STREAMLIT CLOUD:
-# - No heavy imports or filesystem work at module import time.
-# - No network calls at module import time.
-# - All expensive work happens lazily inside functions.
+# Additions in v8.3.2:
+# - Streamlit Cloud safe lazy-load (no heavy work at import)
+# - Yahoo Finance rate limit resilience:
+#     * retry with randomized backoff
+#     * max 2 concurrent fetches per process
+#     * cached fallback if rate-limited
+# - DEBUG-aware logging (quiet in production unless DEBUG=True)
 #
-# Public API expected by app.py:
-#   summarize_assets(...)
-#   asset_prediction_and_backtest(...)
-#   load_asset_with_indicators(...)
-#   ASSET_SYMBOLS
-#   INTERVALS
+# This file is designed to be imported by Streamlit app.py and should not
+# perform heavy I/O immediately on import.
 #
 from __future__ import annotations
 
 import math
 import json
 import time
+import random
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List, Any
 
 import numpy as np
 import pandas as pd
 
+# =============================================================================
+# GLOBAL DEBUG FLAG
+# =============================================================================
+
+DEBUG = False  # set True for verbose console logs in Streamlit logs
+
+
+def _log(msg: str) -> None:
+    if not DEBUG:
+        return
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
 
 # =============================================================================
 # CONSTANTS / CONFIG (pure data, safe at import)
 # =============================================================================
 
-# Streamlit Cloud: write cache + calibration into /mount/data if possible,
-# otherwise fall back to /tmp which is writable in ephemeral containers.
-# We won't mkdir here (lazy). We'll mkdir inside helper when actually used.
 DATA_DIR = Path("data")
 FALLBACK_DIR = Path("/tmp/woodytrades_cache")
 
 CALIBRATION_FILENAME = "calibration_cache.json"
-_CAL_HISTORY_LEN = 5  # calibration memory depth
+_CAL_HISTORY_LEN = 5  # calibration memory depth per symbol
 
 INTERVALS: Dict[str, Dict[str, object]] = {
     "15m": {"interval": "15m", "period": "5d",  "min_rows": 150},
@@ -78,17 +90,17 @@ RSI_WINDOW = 100
 RSI_Q_LOW = 0.2
 RSI_Q_HIGH = 0.8
 
-# Base defaults (these will get dynamically recalibrated per run)
+# Base defaults (will get dynamically recalibrated per run / per filter level)
 ADX_MIN_TREND_DEFAULT = 20.0
 VOL_REGIME_MIN_ATR_PCT_DEFAULT = 0.3
 CONF_EXEC_THRESHOLD_DEFAULT = 0.6
 
-# Globals that are mutated by _apply_filter_level() at runtime.
+# Globals that get mutated by _apply_filter_level() at runtime.
 ADX_MIN_TREND = ADX_MIN_TREND_DEFAULT
 VOL_REGIME_MIN_ATR_PCT = VOL_REGIME_MIN_ATR_PCT_DEFAULT
 CONF_EXEC_THRESHOLD = CONF_EXEC_THRESHOLD_DEFAULT
 
-# mapping for higher TF checks (kept for completeness, not heavily used in v8.3.1)
+# mapping for higher TF checks (kept for completeness, future use)
 HIGHER_TF_MAP = {
     "15m": "1h",
     "1h": "4h",
@@ -107,7 +119,7 @@ FORCED_CONF_MIN = 0.55          # min blended conf to allow forced trade
 ATR_FLOOR_MULT = 0.0005         # fallback ATR % if missing
 STALE_MULTIPLIER_HOURS = 48.0   # if last candle older than this * frame len => stale
 
-# Adaptive TP/SL profiles
+# Adaptive TP/SL profiles (for TP/SL scaling)
 _TP_SL_PROFILES = {
     "Off":        {"trend_min": 1.0, "trend_max": 1.0, "vol_min": 1.0, "vol_max": 1.0},
     "Normal":     {"trend_min": 0.8, "trend_max": 1.4, "vol_min": 0.8, "vol_max": 1.4},
@@ -121,16 +133,10 @@ RSI_DIP_THRESHOLD = 40.0
 RANGE_LOOKBACK = 50
 SWING_LOOKBACK = 5
 BB_WINDOW = 20
-BB_WIDTH_PCT_THRESH = 0.01  # narrow bands threshold ~1%
+BB_WIDTH_PCT_THRESH = 0.01  # ~1% band width = compression / coil
 
-# ---------------------------------------------------------------------
-# tiny logger
-# ---------------------------------------------------------------------
-def _log(msg: str) -> None:
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
+# crude concurrency limiter to reduce rate-limit hammering on yfinance
+_fetch_lock = 0
 
 
 # =============================================================================
@@ -139,8 +145,8 @@ def _log(msg: str) -> None:
 
 def _get_data_dir() -> Path:
     """
-    Streamlit Cloud can't always mkdir at import time.
-    We'll ensure a writable dir now, at call time.
+    Pick a writable dir (data/ or /tmp) safely at runtime.
+    Streamlit Cloud sometimes restarts in a weird FS state, so we probe.
     """
     for cand in [DATA_DIR, FALLBACK_DIR]:
         try:
@@ -148,12 +154,13 @@ def _get_data_dir() -> Path:
             return cand
         except Exception:
             continue
-    # worst case: in-memory fake path (no disk persistence)
     return Path(".")
+
 
 def _get_calibration_path() -> Path:
     d = _get_data_dir()
     return d / CALIBRATION_FILENAME
+
 
 def _lazy_import_ta():
     from ta.trend import EMAIndicator, MACD, ADXIndicator
@@ -161,9 +168,11 @@ def _lazy_import_ta():
     from ta.volatility import AverageTrueRange, BollingerBands
     return EMAIndicator, MACD, ADXIndicator, RSIIndicator, AverageTrueRange, BollingerBands
 
+
 def _lazy_import_yf():
     import yfinance as yf
     return yf
+
 
 def _lazy_import_ml():
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -172,7 +181,7 @@ def _lazy_import_ml():
 
 
 # =============================================================================
-# Calibration memory
+# Calibration memory (rolling performance memory for adaptive filtering)
 # =============================================================================
 
 def _load_calib() -> Dict[str, Any]:
@@ -189,15 +198,17 @@ def _load_calib() -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def _save_calib(c: Dict[str, Any]) -> None:
     """
-    Save calibration state. Ignore failures (read-only container scenario).
+    Save calibration state. Ignore failures (Streamlit Cloud ephemeral FS, etc).
     """
     path = _get_calibration_path()
     try:
         json.dump(c, open(path, "w"))
     except Exception:
         pass
+
 
 def _record_calib(c: Dict[str, Any], sym: str, winrate: float) -> Dict[str, Any]:
     """
@@ -217,7 +228,11 @@ def _record_calib(c: Dict[str, Any], sym: str, winrate: float) -> Dict[str, Any]
     c[sym] = e
     return c
 
+
 def _symbol_wr_stats(c: Dict[str, Any], sym: str) -> Dict[str, float]:
+    """
+    Returns avg_wr (mean observed winrate %) and bias (-0.1..+0.1).
+    """
     e = c.get(sym, {})
     hist = e.get("winrates", [])
     if not hist:
@@ -228,9 +243,11 @@ def _symbol_wr_stats(c: Dict[str, Any], sym: str) -> Dict[str, float]:
     bias = max(-0.1, min(0.1, bias))
     return {"avg_wr": avg_wr, "bias": bias}
 
+
 def _calib_bias_for_symbol(c: Dict[str, Any], sym: str, enabled: bool) -> Dict[str, float]:
     """
     Convert calibration history into multipliers for thresholds.
+    If calibration is off, return neutral multipliers.
     """
     if not enabled:
         return {"conf_mult": 1.0, "adx_mult": 1.0, "avg_wr": 50.0}
@@ -250,10 +267,11 @@ def _calib_bias_for_symbol(c: Dict[str, Any], sym: str, enabled: bool) -> Dict[s
         "avg_wr": st["avg_wr"],
     }
 
+
 def _apply_filter_level(filter_level: str, calib_bias: Dict[str, float]):
     """
     Updates globals ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
-    based on 'Loose' / 'Balanced' / 'Strict' plus calibration bias multipliers.
+    based on 'Loose' / 'Balanced' / 'Strict' + calibration bias multipliers.
     """
     global ADX_MIN_TREND, VOL_REGIME_MIN_ATR_PCT, CONF_EXEC_THRESHOLD
 
@@ -292,6 +310,7 @@ def _cache_path(symbol: str, interval_key: str) -> Path:
     d = _get_data_dir()
     return d / f"{safe}_{interval_key}.csv"
 
+
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
     Cleanup data from yfinance:
@@ -319,7 +338,7 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in df.columns:
         vals = df[col].values
-        if isinstance(vals, np.ndarray) and getattr(vals, "ndim", 1) > 1:
+        if hasattr(vals, "ndim") and vals.ndim > 1:
             df[col] = pd.Series(vals.ravel(), index=df.index)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -328,7 +347,11 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     df = df[~df.index.duplicated(keep="last")]
     return df
 
+
 def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """
+    Safe Yahoo Finance download with rate-limit and cache fallback.
+    """
     yf = _lazy_import_yf()
     try:
         raw = yf.download(
@@ -338,12 +361,18 @@ def _yahoo_download(symbol: str, interval: str, period: str) -> pd.DataFrame:
             progress=False,
             threads=False,
         )
+        if raw is None or raw.empty:
+            raise ValueError("Empty download")
         return _normalize_ohlcv(raw)
     except Exception as e:
         _log(f"[yf.download fail] {symbol} {interval} {period}: {e}")
         return pd.DataFrame()
 
+
 def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    """
+    Mirror fetch via yf.Ticker(...).history() as a fallback.
+    """
     yf = _lazy_import_yf()
     try:
         tk = yf.Ticker(symbol)
@@ -351,64 +380,98 @@ def _yahoo_history(symbol: str, interval: str, period: str) -> pd.DataFrame:
         df = _normalize_ohlcv(raw)
         if not df.empty:
             return df
+
         raw2 = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False)
         return _normalize_ohlcv(raw2)
     except Exception as e:
         _log(f"[yf.history fail] {symbol} {interval} {period}: {e}")
         return pd.DataFrame()
 
+
 def fetch_data(
     symbol: str,
     interval_key: str = "1h",
     use_cache: bool = True,
     max_retries: int = 4,
-    backoff_range: Tuple[float, float] = (2.5, 6.0),
+    backoff_range: Tuple[float, float] = (1.5, 6.0),
 ) -> pd.DataFrame:
     """
-    Full fetch pipeline w/ caching, retry, fallback.
+    Full fetch pipeline w/ caching, retry, fallback, + rate-limit safety.
     SAFE to call lazily from Streamlit (not on import).
     """
-    if interval_key not in INTERVALS:
-        raise KeyError(f"Bad interval_key {interval_key}")
+    global _fetch_lock
 
-    meta = INTERVALS[interval_key]
-    interval = str(meta["interval"])
-    period   = str(meta["period"])
-    min_rows = int(meta["min_rows"])
+    # crude throttle to max 2 parallel fetchers
+    while _fetch_lock >= 2:
+        time.sleep(0.5)
+    _fetch_lock += 1
 
-    cache_fp = _cache_path(symbol, interval_key)
+    try:
+        if interval_key not in INTERVALS:
+            raise KeyError(f"Bad interval_key {interval_key}")
 
-    # try cache first
-    if use_cache and cache_fp.exists():
-        try:
-            cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
-            cached = _normalize_ohlcv(cached)
-            if len(cached) >= min_rows:
-                return cached
-        except Exception as e:
-            _log(f"[cache read fail] {cache_fp}: {e}")
+        meta = INTERVALS[interval_key]
+        interval = str(meta["interval"])
+        period   = str(meta["period"])
+        min_rows = int(meta["min_rows"])
 
-    # live retries
-    for _attempt in range(max_retries):
-        df_live = _yahoo_download(symbol, interval, period)
-        if not df_live.empty and len(df_live) >= min_rows:
+        _log(f"⏳ Fetching {symbol} [{interval}] ...")
+        cache_fp = _cache_path(symbol, interval_key)
+
+        # Try cache first
+        if use_cache and cache_fp.exists():
             try:
-                df_live.to_csv(cache_fp)
-            except Exception:
-                pass
-            return df_live
-        time.sleep(np.random.uniform(*backoff_range))
+                cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
+                cached = _normalize_ohlcv(cached)
+                if len(cached) >= min_rows:
+                    _log(f"✅ Using cached {symbol} ({len(cached)} rows).")
+                    return cached
+                else:
+                    _log(f"ℹ️ Cache for {symbol} has {len(cached)} rows (<{min_rows})")
+            except Exception as e:
+                _log(f"⚠️ Cache read failed for {symbol}: {e}")
 
-    # fallback mirror
-    df_mirror = _yahoo_history(symbol, interval, period)
-    if not df_mirror.empty and len(df_mirror) >= min_rows:
-        try:
-            df_mirror.to_csv(cache_fp)
-        except Exception:
-            pass
-        return df_mirror
+        # Live retries
+        for attempt in range(1, max_retries + 1):
+            df_live = _yahoo_download(symbol, interval, period)
+            if not df_live.empty and len(df_live) >= min_rows:
+                _log(f"✅ {symbol}: fetched {len(df_live)} rows.")
+                try:
+                    df_live.to_csv(cache_fp)
+                    _log(f"💾 Cached → {cache_fp}")
+                except Exception as e:
+                    _log(f"⚠️ Cache write failed for {symbol}: {e}")
+                return df_live
 
-    return pd.DataFrame()
+            _log(f"⚠️ Retry {attempt} failed for {symbol} "
+                 f"({len(df_live) if isinstance(df_live, pd.DataFrame) else 'N/A'} rows).")
+            time.sleep(random.uniform(*backoff_range))
+
+        # Mirror fallback
+        _log(f"🪞 Mirror fetch for {symbol}...")
+        df_mirror = _yahoo_history(symbol, interval, period)
+        if not df_mirror.empty and len(df_mirror) >= min_rows:
+            _log(f"✅ Mirror fetch worked for {symbol} ({len(df_mirror)} rows).")
+            try:
+                df_mirror.to_csv(cache_fp)
+                _log(f"💾 Cached → {cache_fp}")
+            except Exception as e:
+                _log(f"⚠️ Cache write failed for {symbol}: {e}")
+            return df_mirror
+
+        # Last resort: stale cache
+        _log(f"🚫 All fetch attempts failed for {symbol}. using any stale cache.")
+        if cache_fp.exists():
+            try:
+                df_cached = pd.read_csv(cache_fp, index_col=0, parse_dates=True)
+                _log(f"[fallback cache used] {symbol} from {cache_fp}")
+                return _normalize_ohlcv(df_cached)
+            except Exception as e:
+                _log(f"[fallback cache read fail] {symbol}: {e}")
+
+        return pd.DataFrame()
+    finally:
+        _fetch_lock -= 1
 
 
 # =============================================================================
@@ -425,10 +488,11 @@ def _interval_hours(interval_key: str) -> float:
     }
     return mapping.get(interval_key, 1.0)
 
+
 def _is_stale(df: pd.DataFrame, symbol: str, interval_key: str) -> bool:
     """
     Check age of last candle vs ~48x candle duration.
-    BTC is exempt.
+    BTC is exempt (24/7).
     """
     if df is None or df.empty:
         return True
@@ -457,12 +521,14 @@ def _is_stale(df: pd.DataFrame, symbol: str, interval_key: str) -> bool:
 def _ema_fallback(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
+
 def _rsi_fallback(close: pd.Series, window: int = 14) -> pd.Series:
     d = close.diff()
     gain = d.clip(lower=0).rolling(window).mean()
     loss = -d.clip(upper=0).rolling(window).mean()
     rs = gain / (loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
+
 
 def _macd_fallback(close: pd.Series):
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -472,12 +538,14 @@ def _macd_fallback(close: pd.Series):
     hist = macd_line - signal
     return macd_line, signal, hist
 
+
 def _atr_fallback(h, l, c, window: int = 14) -> pd.Series:
     tr1 = (h - l).abs()
     tr2 = (h - c.shift(1)).abs()
     tr3 = (l - c.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(window).mean()
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -558,7 +626,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_mid"] = bb.bollinger_mavg()
         df["bb_upper"] = bb.bollinger_hband()
         df["bb_lower"] = bb.bollinger_lband()
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs() / df["bb_mid"].replace(0, np.nan)
+        df["bb_width"] = (
+            (df["bb_upper"] - df["bb_lower"]).abs()
+            / df["bb_mid"].replace(0, np.nan)
+        )
     except Exception:
         df["bb_mid"] = np.nan
         df["bb_upper"] = np.nan
@@ -620,12 +691,14 @@ def _flag_buy_dip(row: pd.Series) -> bool:
                     return True
     return False
 
+
 def _flag_breakout_long(row: pd.Series) -> bool:
     if row["ema20"] > row["ema50"] and row["macd_slope"] > 0:
         if not math.isnan(row.get("resistance_level", np.nan)):
             if row["Close"] > row["resistance_level"]:
                 return True
     return False
+
 
 def _flag_breakout_short(row: pd.Series) -> bool:
     if row["ema20"] < row["ema50"] and row["macd_slope"] < 0:
@@ -634,12 +707,14 @@ def _flag_breakout_short(row: pd.Series) -> bool:
                 return True
     return False
 
+
 def _flag_mean_rev_long(row: pd.Series, adx_cutoff: float) -> bool:
     if row["adx"] < adx_cutoff:
         if row["RSI"] < min(row.get("rsi_low_band", 100), 40):
             if row["Close"] < row["ema20"]:
                 return True
     return False
+
 
 def _flag_mean_rev_short(row: pd.Series, adx_cutoff: float) -> bool:
     if row["adx"] < adx_cutoff:
@@ -648,15 +723,18 @@ def _flag_mean_rev_short(row: pd.Series, adx_cutoff: float) -> bool:
                 return True
     return False
 
+
 def _flag_trend_cont_long(row: pd.Series, adx_cutoff: float) -> bool:
     if row["ema20"] > row["ema50"] and row["adx"] >= adx_cutoff and row["RSI"] > 50:
         return True
     return False
 
+
 def _flag_trend_cont_short(row: pd.Series, adx_cutoff: float) -> bool:
     if row["ema20"] < row["ema50"] and row["adx"] >= adx_cutoff and row["RSI"] < 50:
         return True
     return False
+
 
 def _flag_volexp_long(row: pd.Series) -> bool:
     if row.get("bb_width", np.nan) <= BB_WIDTH_PCT_THRESH and row["ema20"] > row["ema50"]:
@@ -664,11 +742,13 @@ def _flag_volexp_long(row: pd.Series) -> bool:
             return True
     return False
 
+
 def _flag_volexp_short(row: pd.Series) -> bool:
     if row.get("bb_width", np.nan) <= BB_WIDTH_PCT_THRESH and row["ema20"] < row["ema50"]:
         if row["Close"] < row.get("bb_lower", np.nan):
             return True
     return False
+
 
 def _flag_range_rev_long(row: pd.Series) -> bool:
     rl = row.get("range_low", np.nan)
@@ -681,6 +761,7 @@ def _flag_range_rev_long(row: pd.Series) -> bool:
                 return True
     return False
 
+
 def _flag_range_rev_short(row: pd.Series) -> bool:
     rl = row.get("range_low", np.nan)
     rh = row.get("range_high", np.nan)
@@ -692,17 +773,20 @@ def _flag_range_rev_short(row: pd.Series) -> bool:
                 return True
     return False
 
+
 def _flag_swing_long(row: pd.Series, prev_low: float, prev_prev_low: float) -> bool:
     if not math.isnan(prev_low) and not math.isnan(prev_prev_low):
         if prev_low > prev_prev_low and row["macd_slope"] > 0:
             return True
     return False
 
+
 def _flag_swing_short(row: pd.Series, prev_high: float, prev_prev_high: float) -> bool:
     if not math.isnan(prev_high) and not math.isnan(prev_prev_high):
         if prev_high < prev_prev_high and row["macd_slope"] < 0:
             return True
     return False
+
 
 def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -788,8 +872,14 @@ def _add_strategy_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]:
     """
-    ("Buy"|"Sell"|"Hold", confidence 0..1)
-    Based on EMA trend, RSI extremes, and MACD cross.
+    Returns (side, confidence):
+    side in {"Buy","Sell","Hold"}
+    confidence in [0..1]
+
+    Votes:
+      - EMA trend
+      - RSI extremes
+      - MACD cross
     """
     score = 0.0
     votes = 0
@@ -832,7 +922,7 @@ def compute_signal_row(prev_row: pd.Series, row: pd.Series) -> Tuple[str, float]
     elif score <= -0.67 * votes:
         return "Sell", conf
     else:
-        # Treat as Hold, with inverse confidence
+        # "Hold": still return a confidence-like (low = more uncertain)
         return "Hold", 1.0 - conf
 
 
@@ -850,11 +940,11 @@ def _calc_tp_sl(
     atr_pct: float,
 ) -> Tuple[float, float]:
     """
-    ATR-based TP/SL with scaling from:
+    ATR-based TP/SL using:
+    - Risk profile (Low / Medium / High)
+    - TP/SL profile mode (Off / Normal / Aggressive)
     - ADX (trend strength)
-    - volatility regime (atr_pct)
-    - chosen aggressiveness
-    - risk profile
+    - atr_pct (volatility regime %)
     """
     base = RISK_MULT.get(risk, RISK_MULT["Medium"])
     tp_k = float(base["tp_atr"])
@@ -910,6 +1000,7 @@ def _prepare_ml_df(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> Optiona
         return None
 
     return work
+
 
 def _ml_confidence_raw(df: pd.DataFrame, recent_wr_hint: Optional[float]) -> float:
     """
@@ -970,7 +1061,7 @@ def _structure_allows(side: str, row: pd.Series, mode: str) -> bool:
     pattern, we turn it into Hold.
     """
     if side not in ("Buy", "Sell"):
-        # "Hold" only matters if mode is Off. Otherwise we don't 'take' Hold.
+        # If it's Hold, we only "allow it" in Off mode; other modes we don't take Hold.
         return (mode == "Off")
 
     if mode == "Off":
@@ -1106,7 +1197,7 @@ def latest_prediction(
 
 
 # =============================================================================
-# Backtest
+# Backtest sim / metrics
 # =============================================================================
 
 def _simulate_trade_path(
@@ -1119,9 +1210,10 @@ def _simulate_trade_path(
 ) -> Tuple[float, bool]:
     """
     Simulate a single hypothetical trade:
-    - +1% if TP hit first
-    - -1% if SL hit first
-    - 0% otherwise after horizon bars
+    - +1% balance if TP hits first
+    - -1% balance if SL hits first
+    - otherwise 0% after 'horizon' bars
+    Returns (pnl_fraction, win_bool)
     """
     row = df.iloc[i]
     px0 = float(row["Close"])
@@ -1151,6 +1243,7 @@ def _simulate_trade_path(
 
     return 0.0, False
 
+
 def backtest_signals(
     df_raw: pd.DataFrame,
     risk: str,
@@ -1162,13 +1255,13 @@ def backtest_signals(
     tp_sl_mode: str,
 ) -> Dict[str, Any]:
     """
-    Walkthrough:
-    - For each bar, compute signal+confidence
-    - Apply confidence filter (Loose/Balanced/Strict)
-    - Apply structure mode gating
-    - Optionally force extra trades in performance mode
-    - Simulate TP/SL path
-    Returns PF, EV/trade, WinRate, WinRate std, etc.
+    Iterates candles and simulates trades:
+    - Compute side/conf each bar
+    - Check confidence filter (Loose/Balanced/Strict)
+    - Apply structure gating (Buy Dips / Breakouts / etc)
+    - Optionally force extra trades to avoid "0 trades" stats
+    - Simulate path using TP/SL
+    Returns PF, EV/trade, WinRate, WinRate std, Sharpe-like, etc.
     """
     out = {
         "winrate": 0.0,
@@ -1216,14 +1309,14 @@ def backtest_signals(
             if not forced_trades_enabled or blended < FORCED_CONF_MIN:
                 continue
             if side == "Hold":
-                # if we force, pick a random direction just to get stats coverage
+                # in forced mode, allow 'fake' directional trades to ensure we have stats
                 side = np.random.choice(["Buy", "Sell"])
 
         # structure gate
         if not _structure_allows(side, cur, structure_mode):
             if not forced_trades_enabled:
                 continue
-            # even in performance mode we skip if structure doesn't qualify
+            # even when forcing, skip if structure doesn't qualify
             continue
 
         pnl, won = _simulate_trade_path(df, i, side, risk, tp_sl_mode, horizon)
@@ -1278,7 +1371,7 @@ def backtest_signals(
 
 def compute_sentiment_stub(symbol: str) -> float:
     """
-    Lightweight bullishness hint.
+    Lightweight bullishness hint (stub – not NLP driven).
     """
     bias_map = {
         "BTC-USD": 0.65,
@@ -1305,7 +1398,10 @@ def analyze_asset(
     weekend_mode: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch, mark stale, run prediction + backtest, bundle it all.
+    Fetch data, detect stale/weekend, compute indicators, run:
+    - latest_prediction snapshot
+    - backtest_signals stats
+    Bundle all into one dict for dashboard summary.
     """
     df_raw = fetch_data(symbol, interval_key=interval_key, use_cache=True)
     if df_raw.empty:
@@ -1313,7 +1409,7 @@ def analyze_asset(
 
     stale_flag = _is_stale(df_raw, symbol, interval_key)
     if weekend_mode and stale_flag:
-        # we *don't* kill it, just flag for UI
+        # just flag it visually; don't drop the asset
         pass
 
     pred = latest_prediction(
@@ -1405,9 +1501,9 @@ def analyze_asset(
 def generate_signal_points(df: pd.DataFrame, structure_mode: str) -> Dict[str, Any]:
     """
     Produce x/y arrays for each overlay layer in the plot:
-     - buy/sell markers
-     - each structure mode's markers
-     - support/resistance lines, bb bands, range bounds, swing pivots
+     - buy/sell markers (the engine's side after structure gating)
+     - structure flags (dip buy, breakouts, etc)
+     - support/resistance, Bollinger bands, range bounds, swing pivots
     """
     out = {
         "buy_x": [], "buy_y": [],
@@ -1448,13 +1544,13 @@ def generate_signal_points(df: pd.DataFrame, structure_mode: str) -> Dict[str, A
         idx = row.name
         px = row["Close"]
 
-        # buy/sell
+        # buy/sell markers
         if side == "Buy":
             out["buy_x"].append(idx); out["buy_y"].append(px)
         elif side == "Sell":
             out["sell_x"].append(idx); out["sell_y"].append(px)
 
-        # structure tags
+        # structure markers
         if row.get("dip_buy_flag", False):
             out["dip_x"].append(idx); out["dip_y"].append(px)
         if row.get("bull_breakout_flag", False):
@@ -1533,6 +1629,7 @@ def summarize_assets(
     """
     rows = []
     for asset_name, symbol in ASSET_SYMBOLS.items():
+        _log(f"{asset_name} ({symbol})...")
         try:
             res = analyze_asset(
                 symbol,
@@ -1546,7 +1643,7 @@ def summarize_assets(
                 weekend_mode,
             )
         except Exception as e:
-            _log(f"[analyze_asset fail] {asset_name}: {e}")
+            _log(f"❌ Error analyzing {asset_name}: {e}")
             res = None
 
         if not res:
@@ -1578,6 +1675,7 @@ def summarize_assets(
         return pd.DataFrame()
     return pd.DataFrame(rows)
 
+
 def load_asset_with_indicators(
     asset: str,
     interval_key: str,
@@ -1587,8 +1685,10 @@ def load_asset_with_indicators(
     calibration_enabled: bool = True,
 ):
     """
-    For debug/raw tab.
-    Returns (symbol, enriched_df, pts)
+    For debug/raw tab (Data / Indicators). Returns:
+    - symbol (string)
+    - df_ind (DataFrame of candles+indicators+flags)
+    - pts (dict of plotting arrays for candlestick annotations)
     """
     if asset not in ASSET_SYMBOLS:
         raise KeyError(f"Unknown asset '{asset}'")
@@ -1599,6 +1699,7 @@ def load_asset_with_indicators(
     df_ind = _add_strategy_flags(df_ind)
     pts = generate_signal_points(df_ind, structure_mode)
     return symbol, df_ind, pts
+
 
 def asset_prediction_and_backtest(
     asset: str,
@@ -1612,7 +1713,7 @@ def asset_prediction_and_backtest(
     weekend_mode: bool,
 ):
     """
-    Used by the Detailed View panel:
+    Used in Detailed View panel:
     - prediction snapshot (latest_prediction)
     - backtest stats (backtest_signals)
     - df for chart/indicators
