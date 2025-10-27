@@ -1,16 +1,18 @@
 # =============================================================================
-# WoodyTrades Pro — Smart Strategy Modes Edition (v8.3.2)
-# Streamlit Frontend (Safe Local Import)
+# WoodyTrades Pro — Smart Strategy Modes Edition (v8.3.3)
+# Streamlit Frontend (session-safe, rate-limit hardened)
 # =============================================================================
 
-# =============================================================================
-# WoodyTrades Pro — Streamlit Session Safety Patch
-# Prevents "Session already connected" hangs on reloads.
-# =============================================================================
-
+# --- Environment/session safety ---------------------------------------------
 import os, shutil
 
-# On fresh run, clean any stale Streamlit session locks
+# Run Streamlit headlessly and drop inactive sessions quickly
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_RUNTIME_SESSION_TIMEOUT"] = "60"       # seconds
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_CACHE_PERSIST"] = "false"
+
+# Clean any stale Streamlit cache/session locks on startup
 try:
     cache_dir = os.path.expanduser("~/.streamlit/cache")
     sess_dir = os.path.expanduser("~/.streamlit/sessions")
@@ -20,42 +22,27 @@ try:
 except Exception:
     pass
 
-import os
-
-# Run Streamlit headlessly and drop inactive sessions quickly
-os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
-os.environ["STREAMLIT_RUNTIME_SESSION_TIMEOUT"] = "60"       # seconds
-os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"  # optional privacy
-
-# Optional: ensure clean cache start on new deployment
-os.environ["STREAMLIT_CACHE_PERSIST"] = "false"
-
+# --- Force-load local utils.py (bypass any installed 'utils' package) ---------
 import sys, importlib.util, pathlib
-
-# --- Force-load local utils.py (bypass any package "utils") ---
 UTILS_PATH = pathlib.Path(__file__).parent / "utils.py"
 spec = importlib.util.spec_from_file_location("utils", UTILS_PATH)
 utils = importlib.util.module_from_spec(spec)
 sys.modules["utils"] = utils
 spec.loader.exec_module(utils)
 
-# --- Confirm correct file loaded ---
+# --- Confirm correct file loaded --------------------------------------------
 import streamlit as st
 st.set_page_config(page_title="WoodyTrades Pro Dashboard", layout="wide")
 st.write("✅ Loaded utils from:", utils.__file__)
 
-# =============================================================================
-# Imports
-# =============================================================================
 import pandas as pd
 import plotly.graph_objects as go
 
 # =============================================================================
-# Sidebar Configuration
+# Sidebar configuration
 # =============================================================================
 st.sidebar.header("⚙️ Configuration")
 
-# --- Interval selector ---
 interval_key = st.sidebar.selectbox(
     "Interval",
     list(utils.INTERVALS.keys()) if hasattr(utils, "INTERVALS") else ["1h", "4h", "1d", "1wk"],
@@ -63,21 +50,18 @@ interval_key = st.sidebar.selectbox(
     help="Data timeframe for signals & backtests.",
 )
 
-# --- Risk profile ---
 risk = st.sidebar.selectbox(
     "Risk Profile",
     list(utils.RISK_MULT.keys()) if hasattr(utils, "RISK_MULT") else ["Low", "Medium", "High"],
     index=1,
 )
 
-# --- TP/SL scaling ---
 tp_sl_mode = st.sidebar.selectbox(
     "TP/SL Scaling",
     list(utils._TP_SL_PROFILES.keys()) if hasattr(utils, "_TP_SL_PROFILES") else ["Normal"],
     index=0,
 )
 
-# --- Strategy mode ---
 structure_mode = st.sidebar.selectbox(
     "Strategy Mode",
     [
@@ -94,24 +78,22 @@ structure_mode = st.sidebar.selectbox(
     index=0,
 )
 
-# --- Filter strictness ---
 filter_level = st.sidebar.selectbox(
     "Filter Strictness",
     ["Loose", "Balanced", "Strict"],
     index=1,
 )
 
-# --- Toggles ---
 forced_trades = st.sidebar.checkbox("Force Trades (for stats only)", value=False)
 calibration_enabled = st.sidebar.checkbox("Calibration Memory", value=True)
 weekend_mode = st.sidebar.checkbox("Weekend/Stale Safe Mode", value=True)
 show_detailed_view = st.sidebar.checkbox("Show Detailed View", value=True)
 
 st.sidebar.divider()
-st.sidebar.caption("v8.3.2 — Smart Strategy Modes Edition")
+st.sidebar.caption("v8.3.3 — Smart Strategy Modes Edition")
 
 # =============================================================================
-# Cached Summary Fetch (avoid Yahoo rate-limits)
+# Cached summary fetch (prevents rate-limit hammering)
 # =============================================================================
 @st.cache_data(ttl=600)
 def get_summary(interval_key, risk, tp_sl_mode, structure_mode,
@@ -128,7 +110,7 @@ def get_summary(interval_key, risk, tp_sl_mode, structure_mode,
     )
 
 # =============================================================================
-# Summary Table
+# Summary table
 # =============================================================================
 st.title("📊 WoodyTrades Pro — Smart Strategy Modes Edition")
 
@@ -201,7 +183,6 @@ if show_detailed_view:
             low=df_ind["Low"], close=df_ind["Close"],
             name="Price"
         ))
-
         fig.add_trace(go.Scatter(
             x=pts["buy_x"], y=pts["buy_y"], mode="markers",
             marker_symbol="triangle-up", marker_color="green", name="Buy Signals"
@@ -210,7 +191,6 @@ if show_detailed_view:
             x=pts["sell_x"], y=pts["sell_y"], mode="markers",
             marker_symbol="triangle-down", marker_color="red", name="Sell Signals"
         ))
-
         fig.update_layout(
             height=600,
             title=f"{selected_asset} — {interval_key} Chart",
