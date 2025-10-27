@@ -1,9 +1,9 @@
 """
-app.py v8.3.2
+app.py v8.3.2 (Local Import Safe)
 Streamlit front-end for WoodyTradesPro Smart Strategy Modes engine.
 
-Compatible with utils.py v8.3.2
-Run:
+Ensures we always load the local utils.py v8.3.2 (not a pip package called utils).
+Run with:
     streamlit run app.py
 """
 
@@ -11,8 +11,18 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import importlib.util, sys, pathlib
 
-import utils  # local engine v8.3.2
+# ---------------------------------------------------------------------
+# Force import local utils.py regardless of environment conflicts
+# ---------------------------------------------------------------------
+UTILS_PATH = pathlib.Path(__file__).parent / "utils.py"
+spec = importlib.util.spec_from_file_location("utils", UTILS_PATH)
+utils = importlib.util.module_from_spec(spec)
+sys.modules["utils"] = utils
+spec.loader.exec_module(utils)
+
+st.write("✅ Loaded utils from:", utils.__file__)
 
 # ---------------------------------------------------------------------
 # Page setup
@@ -156,7 +166,7 @@ if "ema20" in df_ind.columns:
 if "ema50" in df_ind.columns:
     fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind["ema50"], name="EMA50", line=dict(width=1)))
 
-# Support/resistance & overlays
+# Support/resistance overlays
 for key, color in [
     ("sup_y", "rgba(0,200,0,0.3)"),
     ("res_y", "rgba(200,0,0,0.3)"),
@@ -174,10 +184,14 @@ for key, color in [
 
 # Buy/sell markers
 fig.add_trace(go.Scatter(
-    x=pts["buy_x"], y=pts["buy_y"], mode="markers", marker=dict(symbol="triangle-up", color="green", size=8), name="Buy"
+    x=pts["buy_x"], y=pts["buy_y"], mode="markers",
+    marker=dict(symbol="triangle-up", color="green", size=8),
+    name="Buy"
 ))
 fig.add_trace(go.Scatter(
-    x=pts["sell_x"], y=pts["sell_y"], mode="markers", marker=dict(symbol="triangle-down", color="red", size=8), name="Sell"
+    x=pts["sell_x"], y=pts["sell_y"], mode="markers",
+    marker=dict(symbol="triangle-down", color="red", size=8),
+    name="Sell"
 ))
 
 fig.update_layout(height=600, margin=dict(l=0, r=0, t=30, b=0), xaxis_rangeslider_visible=False)
@@ -197,6 +211,7 @@ with st.expander("Engine output block"):
     st.json(block, expanded=False)
 
 st.caption(
+    "✅ Local import ensures the correct utils.py v8.3.2 is used.\n"
     "✅ Cached data & randomized backoff prevent Yahoo rate-limit issues.\n"
     "✅ 'Stale' rows = market closed / weekend (handled safely)."
 )
