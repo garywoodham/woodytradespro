@@ -68,6 +68,17 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 DEFAULT_PERIOD = "5y"
 DEFAULT_INTERVAL = "1d"
 
+# ---------------------------------------------------------------------
+# Interval definitions for data fetch and summary (restored)
+# ---------------------------------------------------------------------
+INTERVALS = {
+    "15m": {"interval": "15m", "period": "5d", "min_rows": 150},
+    "1h":  {"interval": "1h",  "period": "2mo", "min_rows": 250},
+    "4h":  {"interval": "4h",  "period": "6mo", "min_rows": 250},
+    "1d":  {"interval": "1d",  "period": "1y",  "min_rows": 200},
+    "1wk": {"interval": "1wk", "period": "5y",  "min_rows": 150},
+}
+
 # YFinance throttle handling
 YF_MAX_RETRIES = 5
 YF_BACKOFF_SECONDS = 2  # exponential backoff base
