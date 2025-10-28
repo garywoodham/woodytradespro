@@ -21,7 +21,7 @@ import datetime as dt
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import utils_full_v8_3_12 as utils  # rename to utils after you copy over
+import utils as utils  # rename to utils after you copy over
 
 st.set_page_config(
     page_title="WoodyTradesPro — Smart Strategy Modes",
