@@ -1463,3 +1463,4 @@ def asset_prediction_and_backtest(
         "sharpe": bt["sharpe"],
     }
     return block, df_ind, pts
+    
