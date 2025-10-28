@@ -1,79 +1,75 @@
 """
-app.py — WoodyTradesPro / Forecast Dashboard
-Version 8.3.11 (Offline Cache + Progress Edition)
+app_v8_3_12.py
+WoodyTradesPro / Forecast Dashboard — Persistent Cache Edition
 
-Key changes:
-- "Refresh All Data" button to bulk download & cache data (yfinance)
-- Daily auto-refresh safety hook
-- Analysis runs OFFLINE from cache for speed + rate-limit immunity
-- Live progress bar during analysis using summarize_assets(progress_callback=...)
+This app:
+- Lets you refresh + cache all assets once using yfinance (with retry).
+- Stores candles in ./data_cache next to the code (persistent).
+- Then runs all analytics in offline mode (no more freeze / rate limit).
+- Shows progress so you can tell it's still running, not dead.
+
+It preserves:
+- Interval choice
+- Risk profile
+- TP/SL scaling
+- Structure mode
+- Filter level
+- Detailed View with TP/SL, RR, PF, WinRate, Sharpe-like, etc.
 """
-
-import streamlit as st
+import time
+import datetime as dt
 import pandas as pd
 import plotly.graph_objects as go
-import datetime as dt
-import time
-import utils
+import streamlit as st
+import utils as utils  # rename to utils after you copy over
 
 st.set_page_config(
-    page_title="WoodyTrades Pro — Smart Strategy Modes Edition",
+    page_title="WoodyTradesPro — Smart Strategy Modes",
     layout="wide"
 )
 
 # -----------------------------------------------------------------------------
-# Sidebar: Data cache management
+# Sidebar: Cache + configuration
 # -----------------------------------------------------------------------------
 st.sidebar.header("📦 Data Cache Control")
 
-# We'll maintain a once-per-day auto-refresh to avoid stale data.
 today = dt.date.today()
 if "last_refresh_date" not in st.session_state:
+    st.session_state["last_refresh_date"] = None
+
+needs_refresh = st.session_state["last_refresh_date"] != today
+
+def sidebar_progress_hook(cur, total, asset_name, symbol, status_msg):
+    st.sidebar.write(f"{cur}/{total} {asset_name} ({symbol}) {status_msg}")
+    st.sidebar.progress(cur / total)
+
+if st.sidebar.button("🔄 Refresh All Data (1h)"):
+    st.sidebar.info("Refreshing all assets from Yahoo Finance…")
+    utils.refresh_all_data(interval_key="1h", progress_hook=sidebar_progress_hook)
     st.session_state["last_refresh_date"] = today
-
-auto_refresh_needed = (st.session_state["last_refresh_date"] != today)
-
-# Manual refresh button
-if st.sidebar.button("🔄 Refresh All Data (1h cache)"):
-    st.sidebar.info("Refreshing data for all assets — please wait...")
-
-    prog_txt = st.sidebar.empty()
-    prog_bar = st.sidebar.progress(0.0)
-
-    def sidebar_progress(cur, total, asset_name, symbol):
-        pct = cur / total
-        prog_txt.info(f"Downloading {asset_name} ({symbol})... {int(pct*100)}%")
-        prog_bar.progress(pct)
-        time.sleep(0.05)
-
-    utils.refresh_all_data(interval_key="1h", progress_hook=sidebar_progress)
-    st.session_state["last_refresh_date"] = today
-    st.sidebar.success("✅ Cache updated")
-    st.sidebar.write("You can now run analysis offline (fast).")
+    st.sidebar.success("✅ Cache updated and saved to ./data_cache")
     st.stop()
 
-# Auto-refresh once per day if wanted
-if auto_refresh_needed:
-    st.sidebar.warning("⚠ Data not refreshed today.")
-    st.sidebar.caption("Tip: tap 'Refresh All Data' for latest candles.")
+if needs_refresh:
+    st.sidebar.warning("⚠ Data not refreshed today.\nClick 'Refresh All Data' to update.")
 else:
     st.sidebar.caption(f"Cache last refreshed: {st.session_state['last_refresh_date']}")
 
 st.sidebar.markdown("---")
-
-# -----------------------------------------------------------------------------
-# Sidebar: Analysis configuration
-# -----------------------------------------------------------------------------
 st.sidebar.header("⚙️ Analysis Configuration")
 
 interval_key = st.sidebar.selectbox(
     "Interval",
     list(utils.INTERVALS.keys()),
     index=2,
-    help="Data timeframe for signals & backtests. Cache currently refreshes 1h.",
+    help="Backtest / signal timeframe. Cache 'Refresh All Data' currently targets 1h by default.",
 )
 
-risk = st.sidebar.selectbox("Risk Profile", list(utils.RISK_MULT.keys()), index=1)
+risk = st.sidebar.selectbox(
+    "Risk Profile",
+    list(utils.RISK_MULT.keys()),
+    index=1,
+)
 
 tp_sl_mode = st.sidebar.selectbox(
     "TP/SL Scaling",
@@ -103,38 +99,36 @@ filter_level = st.sidebar.selectbox(
     index=1,
 )
 
-forced_trades = st.sidebar.checkbox("Force Trades (avoid empty backtests)", False)
+forced_trades = st.sidebar.checkbox("Force Trades (avoid 0-trade backtests)", False)
 calibration_enabled = st.sidebar.checkbox("Calibration Memory Enabled", True)
 weekend_mode = st.sidebar.checkbox("Allow Weekend/Closed Markets", True)
 
+st.sidebar.caption("WoodyTradesPro v8.3.12 — Persistent Cache Edition")
 st.sidebar.markdown("---")
-st.sidebar.caption("WoodyTradesPro v8.3.11 — Offline Optimized")
 
 
 # -----------------------------------------------------------------------------
 # Main Header
 # -----------------------------------------------------------------------------
-st.title("📊 WoodyTrades Pro — Smart Strategy Modes Edition")
+st.title("📊 WoodyTradesPro — Smart Strategy Modes Edition")
 
 
 # -----------------------------------------------------------------------------
-# Summary Section (offline analysis from cached data)
+# Summary Section
 # -----------------------------------------------------------------------------
-
 status_placeholder = st.empty()
 progress_bar = st.progress(0.0)
 
 def progress_callback(current, total, asset_name, symbol):
-    progress = current / total
+    pct = current / total
     status_placeholder.info(
-        f"Analysing {asset_name} ({symbol}) from cache... {int(progress*100)}%"
+        f"Analysing {asset_name} ({symbol}) from cache… {int(pct*100)}%"
     )
-    progress_bar.progress(progress)
+    progress_bar.progress(pct)
     time.sleep(0.05)
 
-with st.spinner("Computing signals and performance metrics from cached data..."):
+with st.spinner("Computing signals and performance metrics from cached data…"):
     try:
-        # offline=True means: do NOT hit Yahoo. Use cached OHLC only.
         df_summary = utils.summarize_assets(
             interval_key=interval_key,
             risk=risk,
@@ -145,20 +139,17 @@ with st.spinner("Computing signals and performance metrics from cached data...")
             calibration_enabled=calibration_enabled,
             weekend_mode=weekend_mode,
             progress_callback=progress_callback,
-            offline=True,  # <-- CRITICAL: analyse purely from cache
+            offline=True,  # <-- IMPORTANT: stay offline for live UI
         )
     except Exception as e:
-        st.error(f"Error during summary analysis: {e}")
+        st.error(f"Summary analysis error: {e}")
         df_summary = pd.DataFrame()
 
 progress_bar.progress(1.0)
-status_placeholder.success("✅ All assets analysed (offline cache)")
+status_placeholder.success("✅ All assets analysed from cache")
 
-# -----------------------------------------------------------------------------
-# Summary Table
-# -----------------------------------------------------------------------------
 if df_summary.empty:
-    st.warning("No cached data available for any asset yet. Hit 'Refresh All Data' in the sidebar.")
+    st.warning("No cached data yet. Use 'Refresh All Data' in the sidebar first.")
 else:
     st.subheader("📈 Summary Overview")
     st.dataframe(
@@ -188,6 +179,7 @@ else:
         height=480,
     )
 
+
 # -----------------------------------------------------------------------------
 # Detailed View
 # -----------------------------------------------------------------------------
@@ -197,7 +189,7 @@ st.header("🔍 Detailed View")
 asset_choice = st.selectbox("Select Asset", list(utils.ASSET_SYMBOLS.keys()), index=0)
 
 if st.button("Run Detailed Analysis (offline)"):
-    with st.spinner(f"Running detailed analysis for {asset_choice} from cached data..."):
+    with st.spinner(f"Running detailed analysis for {asset_choice} from cache…"):
         block, df_ind, pts = utils.asset_prediction_and_backtest(
             asset=asset_choice,
             interval_key=interval_key,
@@ -208,16 +200,17 @@ if st.button("Run Detailed Analysis (offline)"):
             filter_level=filter_level,
             calibration_enabled=calibration_enabled,
             weekend_mode=weekend_mode,
-            offline=True,  # <-- we stay offline here as well
+            offline=True,  # offline analysis
         )
 
         if block is None or df_ind.empty:
-            st.error("Analysis failed or no cached data available for that asset.")
+            st.error("No cached data for that asset yet. Refresh first.")
         else:
             st.subheader(
                 f"🪙 {asset_choice} — {block['side']} "
                 f"({block['probability']*100:.1f}%)"
             )
+
             st.caption(
                 f"Last price: {block['price']:.2f} | "
                 f"ATR: {block['atr']:.4f if block['atr'] is not None else 'n/a'} | "
@@ -241,7 +234,6 @@ if st.button("Run Detailed Analysis (offline)"):
             # Plot price + overlays
             fig = go.Figure()
 
-            # Candles
             fig.add_trace(
                 go.Candlestick(
                     x=df_ind.index,
@@ -253,7 +245,6 @@ if st.button("Run Detailed Analysis (offline)"):
                 )
             )
 
-            # EMA20 / EMA50 overlays (if present)
             if "ema20" in df_ind.columns:
                 fig.add_trace(
                     go.Scatter(
@@ -273,7 +264,6 @@ if st.button("Run Detailed Analysis (offline)"):
                     )
                 )
 
-            # Buy markers
             if pts["buy_x"]:
                 fig.add_trace(
                     go.Scatter(
@@ -285,7 +275,6 @@ if st.button("Run Detailed Analysis (offline)"):
                     )
                 )
 
-            # Sell markers
             if pts["sell_x"]:
                 fig.add_trace(
                     go.Scatter(
@@ -307,4 +296,4 @@ if st.button("Run Detailed Analysis (offline)"):
             st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("WoodyTradesPro © Forecast Project 2025 — Offline-Optimized Edition")
+st.caption("WoodyTradesPro © Forecast Project 2025 — Persistent Cache Edition")
