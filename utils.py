@@ -65,7 +65,7 @@ def _log(msg: str) -> None:
 # 🔁 IMPORTANT: set this to your GitHub repo raw URL where data_cache lives.
 # Example:
 # GITHUB_RAW_BASE = "https://raw.githubusercontent.com/YourUser/woodytradespro/main/data_cache"
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/<your-username>/<repo-name>/main/data_cache"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/garywoodham/woodytradespro/main/data_cache"
 
 
 BASE_DIR = Path(__file__).resolve().parent
